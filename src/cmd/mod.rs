@@ -1,0 +1,154 @@
+pub mod account;
+pub mod dev;
+pub mod doctor;
+
+use crate::project::Component;
+use crate::{Error, Result};
+use account::PasswordSource;
+
+pub const USAGE: &str = "\
+lyracore — local LyraCore development
+
+USAGE:
+  lyracore doctor                              check prerequisites for `dev up`
+  lyracore dev up                              start (or reuse) the local single-realm stack
+  lyracore dev status                          report each component's state
+  lyracore dev logs [spacetime|gateway]        show a component's log file
+  lyracore dev down [--forget]                 stop the processes this CLI started
+  lyracore account create USER [--password-stdin]
+                                               provision an account's SRP6 credentials
+
+The password is read from stdin with --password-stdin, otherwise from a hidden terminal
+prompt. It is never passed as a command-line argument.";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    Doctor,
+    DevUp,
+    DevStatus,
+    DevLogs(Option<Component>),
+    DevDown { forget: bool },
+    AccountCreate { user: String, source: PasswordSource },
+    Help,
+}
+
+impl Command {
+    pub fn parse(args: &[String]) -> Result<Self> {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match args.as_slice() {
+            [] => Ok(Command::Help),
+            ["-h"] | ["--help"] | ["help"] => Ok(Command::Help),
+
+            ["doctor"] => Ok(Command::Doctor),
+
+            ["dev", "up"] => Ok(Command::DevUp),
+            ["dev", "status"] => Ok(Command::DevStatus),
+            ["dev", "down"] => Ok(Command::DevDown { forget: false }),
+            ["dev", "down", "--forget"] => Ok(Command::DevDown { forget: true }),
+            ["dev", "logs"] => Ok(Command::DevLogs(None)),
+            ["dev", "logs", name] => Component::parse(name).map(|c| Command::DevLogs(Some(c))).ok_or_else(|| {
+                Error::Usage(format!(
+                    "unknown component '{name}' — expected one of: spacetime, gateway"
+                ))
+            }),
+            ["dev"] => Err(Error::Usage(
+                "`dev` needs a subcommand: up, status, logs, down".to_string(),
+            )),
+            ["dev", other, ..] => Err(Error::Usage(format!(
+                "unknown `dev` subcommand '{other}' — expected up, status, logs, or down"
+            ))),
+
+            ["account", "create", user] => Ok(Command::AccountCreate {
+                user: (*user).to_string(),
+                source: PasswordSource::Tty,
+            }),
+            ["account", "create", user, "--password-stdin"] => Ok(Command::AccountCreate {
+                user: (*user).to_string(),
+                source: PasswordSource::Stdin,
+            }),
+            ["account", "create"] => Err(Error::Usage(
+                "`account create` needs a username".to_string(),
+            )),
+            ["account", ..] => Err(Error::Usage(
+                "`account` supports: create USER [--password-stdin]".to_string(),
+            )),
+
+            [other, ..] => Err(Error::Usage(format!("unknown command '{other}'"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(line: &str) -> Result<Command> {
+        let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+        Command::parse(&args)
+    }
+
+    #[test]
+    fn the_documented_surface_parses() {
+        assert_eq!(parse("doctor").unwrap(), Command::Doctor);
+        assert_eq!(parse("dev up").unwrap(), Command::DevUp);
+        assert_eq!(parse("dev status").unwrap(), Command::DevStatus);
+        assert_eq!(parse("dev logs").unwrap(), Command::DevLogs(None));
+        assert_eq!(parse("dev down").unwrap(), Command::DevDown { forget: false });
+        assert_eq!(
+            parse("account create TEST --password-stdin").unwrap(),
+            Command::AccountCreate {
+                user: "TEST".to_string(),
+                source: PasswordSource::Stdin,
+            }
+        );
+    }
+
+    #[test]
+    fn account_create_without_the_flag_prompts_instead() {
+        assert_eq!(
+            parse("account create TEST").unwrap(),
+            Command::AccountCreate {
+                user: "TEST".to_string(),
+                source: PasswordSource::Tty,
+            }
+        );
+    }
+
+    #[test]
+    fn logs_can_name_a_component() {
+        assert_eq!(
+            parse("dev logs gateway").unwrap(),
+            Command::DevLogs(Some(Component::Gateway))
+        );
+        assert!(parse("dev logs realm-core").is_err());
+    }
+
+    #[test]
+    fn down_takes_forget() {
+        assert_eq!(parse("dev down --forget").unwrap(), Command::DevDown { forget: true });
+    }
+
+    #[test]
+    fn no_arguments_shows_help_rather_than_failing() {
+        assert_eq!(parse("").unwrap(), Command::Help);
+    }
+
+    #[test]
+    fn unknown_commands_are_usage_errors() {
+        for line in ["nonsense", "dev", "dev sideways", "account", "account create"] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(
+                error.exit_code(),
+                crate::error::EXIT_USAGE,
+                "`{line}` should be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_password_argument_is_refused() {
+        // The old `gateway provision USER PASSWORD` shape must not be silently accepted here,
+        // or the password would land in argv again.
+        assert!(parse("account create TEST hunter2").is_err());
+    }
+}
