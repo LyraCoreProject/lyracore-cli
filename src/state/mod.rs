@@ -96,7 +96,7 @@ mod tests {
         // The acceptance contract: nothing secret is ever persisted. State holds PIDs and
         // identities only, so a leak would have to be a new field — which this catches.
         let mut state = RuntimeState {
-            database: "spacetime-core".to_string(),
+            database: "lyracore".to_string(),
             ..Default::default()
         };
         state.set(

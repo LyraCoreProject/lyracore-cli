@@ -58,12 +58,12 @@ fn provision_command(project: &ProjectLayout, user: &str) -> CommandSpec {
         .arg("provision")
         .arg(user)
         .arg("--password-stdin")
-        .env("GW_MODULE", ProjectLayout::DATABASE)
-        .env("GW_STDB_URI", ProjectLayout::stdb_uri())
-        .env_remove("GW_SHARD_MAP")
-        .env_remove("GW_SHARD_MAP_FILE")
-        .env_remove("GW_REALM_CORE")
-        .env_remove("GW_REGION_SHARDS")
+        .env("LYRACORE_DATABASE", ProjectLayout::DATABASE)
+        .env("LYRACORE_SPACETIMEDB_URL", ProjectLayout::stdb_uri())
+        .env_remove("LYRACORE_SHARD_MAP")
+        .env_remove("LYRACORE_SHARD_MAP_FILE")
+        .env_remove("LYRACORE_REALM_CORE")
+        .env_remove("LYRACORE_REGION_SHARDS")
 }
 
 fn validate(password: &[u8]) -> Result<()> {
