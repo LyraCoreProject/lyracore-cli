@@ -1,0 +1,27 @@
+# Standalone package: this crate also lives in the LyraCore workspace, so the values that were
+# inherited there (`edition`, `license`, `rust-version`) are spelled out here.
+[workspace]
+
+[package]
+name = "lyracore-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "Source-first developer CLI for LyraCore"
+repository = "https://github.com/LyraCoreProject/lyracore-cli"
+publish = false
+
+[[bin]]
+name = "lyracore"
+path = "src/bin/main.rs"
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Same pin as the gateway: the provisioning password is held in a wiped buffer end to end.
+zeroize = "=1.8.1"
+
+[dev-dependencies]
+tempfile = "3"
