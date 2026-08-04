@@ -1,8 +1,12 @@
-//! The ONE adapter holding this repo's internal package, database, script, and bind names.
+//! The ONE adapter holding the server project's internal package, database, script, and bind names.
 //!
-//! #241 renames the internals (`spacetime-core` → LyraCore names). Everything the public
-//! `lyracore` command contract touches routes through the constants below, so that rename is
-//! a single-file edit and no command surface moves with it.
+//! Everything the public `lyracore` command contract touches routes through the constants below, so
+//! renaming the server's internals is a single-file edit here and no command surface moves with it.
+//!
+//! That is not theoretical: LyraCore#241 renamed the database (`spacetime-core` → `lyracore`), the
+//! gateway package and binary, and every `GW_*` environment variable to `LYRACORE_*`. Absorbing it
+//! meant editing these constants and the environment names in `cmd/dev.rs` — no command, flag, exit
+//! code, or output format changed.
 
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
@@ -47,11 +51,11 @@ impl ProjectLayout {
     // ---- the #241 rename seam: internal names live here and nowhere else ----
 
     /// The single seeded database the local fixture publishes and talks to.
-    pub const DATABASE: &'static str = "spacetime-core";
+    pub const DATABASE: &'static str = "lyracore";
     /// The SpacetimeDB server alias. `publish-module.sh` pins `-s local`; we never re-select it.
     pub const STDB_SERVER: &'static str = "local";
-    pub const GATEWAY_PACKAGE: &'static str = "spacetime-core-gateway";
-    pub const GATEWAY_BIN: &'static str = "target/debug/gateway";
+    pub const GATEWAY_PACKAGE: &'static str = "lyracore-gateway";
+    pub const GATEWAY_BIN: &'static str = "target/debug/lyracore-gateway";
     pub const PUBLISH_SCRIPT: &'static str = "scripts/publish-module.sh";
 
     // Loopback-only binds. The fixture is a contributor's own machine, never a LAN listener

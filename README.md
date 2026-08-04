@@ -39,10 +39,10 @@ missing part.
 ### One database, on purpose
 
 This fixture is a **single-database** stack. The multi-database production topology is not
-reproduced here, and `GW_SHARD_MAP`, `GW_SHARD_MAP_FILE`, `GW_REALM_CORE`, and `GW_REGION_SHARDS`
+reproduced here, and `LYRACORE_SHARD_MAP`, `LYRACORE_SHARD_MAP_FILE`, `LYRACORE_REALM_CORE`, and `LYRACORE_REGION_SHARDS`
 are *actively unset* for the child gateway — so a contributor who has the production recipe exported
 in their shell still gets the fixture, not a multi-database gateway pointed at databases this CLI
-never published. An unconfigured shard map collapses every lookup to `GW_MODULE`, making the result
+never published. An unconfigured shard map collapses every lookup to `LYRACORE_DATABASE`, making the result
 equivalent to a single-database build.
 
 A gateway already serving the world port is **refused, never adopted** — its build and topology are
@@ -61,7 +61,7 @@ without signalling.
 ## Passwords
 
 `account create` reads the password from a hidden terminal prompt, or from one bounded stdin line
-with `--password-stdin`. It is handed to `gateway provision USER --password-stdin` over the child's
+with `--password-stdin`. It is handed to `lyracore-gateway provision USER --password-stdin` over the child's
 stdin and never becomes a command-line argument, so `ps` shows only the username. It is held in a
 zeroized buffer and is absent from rendered commands, logs, error messages, and `state.json`.
 
