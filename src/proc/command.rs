@@ -95,12 +95,12 @@ mod tests {
     #[test]
     fn a_removed_variable_is_not_also_set() {
         // Guards the fixture invariant: whatever the contributor exported, the child does not
-        // see GW_SHARD_MAP.
+        // see LYRACORE_SHARD_MAP.
         let cmd = CommandSpec::new("gateway")
-            .env("GW_MODULE", "spacetime-core")
-            .env_remove("GW_SHARD_MAP");
-        assert!(!cmd.render().contains("GW_SHARD_MAP"));
-        assert_eq!(cmd.env_value("GW_SHARD_MAP"), None);
-        assert!(cmd.removes_env("GW_SHARD_MAP"));
+            .env("LYRACORE_DATABASE", "lyracore")
+            .env_remove("LYRACORE_SHARD_MAP");
+        assert!(!cmd.render().contains("LYRACORE_SHARD_MAP"));
+        assert_eq!(cmd.env_value("LYRACORE_SHARD_MAP"), None);
+        assert!(cmd.removes_env("LYRACORE_SHARD_MAP"));
     }
 }

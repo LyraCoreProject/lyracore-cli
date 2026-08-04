@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 /// Variables that would turn the single-database fixture into a multi-shard gateway. A
 /// contributor who has the production recipe exported must still get the fixture.
 const PRODUCTION_TOPOLOGY_VARS: [&str; 4] = [
-    "GW_SHARD_MAP",
-    "GW_SHARD_MAP_FILE",
-    "GW_REALM_CORE",
-    "GW_REGION_SHARDS",
+    "LYRACORE_SHARD_MAP",
+    "LYRACORE_SHARD_MAP_FILE",
+    "LYRACORE_REALM_CORE",
+    "LYRACORE_REGION_SHARDS",
 ];
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -381,15 +381,15 @@ impl DevManager {
     }
 }
 
-/// The single-database fixture gateway. Only `GW_MODULE` is configured, which — per
+/// The single-database fixture gateway. Only `LYRACORE_DATABASE` is configured, which — per
 /// `gateway/src/config.rs` — collapses routing to that one database.
 fn gateway_command(project: &ProjectLayout) -> CommandSpec {
     let mut cmd = CommandSpec::new(project.gateway_bin().to_string_lossy().to_string())
-        .env("GW_MODULE", ProjectLayout::DATABASE)
-        .env("GW_STDB_URI", ProjectLayout::stdb_uri())
-        .env("GW_LOGON_BIND", ProjectLayout::logon_bind())
-        .env("GW_WORLD_BIND", ProjectLayout::world_bind())
-        .env("GW_AOI", "1")
+        .env("LYRACORE_DATABASE", ProjectLayout::DATABASE)
+        .env("LYRACORE_SPACETIMEDB_URL", ProjectLayout::stdb_uri())
+        .env("LYRACORE_LOGON_BIND", ProjectLayout::logon_bind())
+        .env("LYRACORE_WORLD_BIND", ProjectLayout::world_bind())
+        .env("LYRACORE_AOI", "1")
         .env("MALLOC_ARENA_MAX", "2")
         .env("RUST_LOG", "info");
     for var in PRODUCTION_TOPOLOGY_VARS {
@@ -565,7 +565,7 @@ mod tests {
     fn the_gateway_runs_against_exactly_one_database() {
         let tmp = TempDir::new().unwrap();
         let cmd = gateway_command(&project(&tmp));
-        assert_eq!(cmd.env_value("GW_MODULE"), Some(ProjectLayout::DATABASE));
+        assert_eq!(cmd.env_value("LYRACORE_DATABASE"), Some(ProjectLayout::DATABASE));
         for var in PRODUCTION_TOPOLOGY_VARS {
             assert_eq!(cmd.env_value(var), None, "{var} must not be set");
             assert!(
@@ -579,7 +579,7 @@ mod tests {
     fn the_gateway_binds_loopback_only() {
         let tmp = TempDir::new().unwrap();
         let cmd = gateway_command(&project(&tmp));
-        for var in ["GW_LOGON_BIND", "GW_WORLD_BIND"] {
+        for var in ["LYRACORE_LOGON_BIND", "LYRACORE_WORLD_BIND"] {
             let bind = cmd.env_value(var).unwrap();
             assert!(bind.starts_with("127.0.0.1:"), "{var} must be loopback, got {bind}");
         }
