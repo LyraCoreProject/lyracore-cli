@@ -1,3 +1,5 @@
+<p align="center"><img src="./lyracore-icon.svg" alt="LyraCore" width="120"></p>
+
 # lyracore-cli
 
 Source-first developer CLI for LyraCore. It drives the local, single-database developer fixture:
