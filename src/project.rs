@@ -136,6 +136,14 @@ impl ProjectLayout {
     pub const RUST_TOOLCHAIN: &'static str = "rust-toolchain.toml";
     pub const SCRIPTS_DIR: &'static str = "scripts";
 
+    /// The world-import ETL, which lives with the importer it drives rather than in the server
+    /// repo's private `scripts/`. These four are the shipped, documented tooling `lyracore import`
+    /// is a façade over — see the header of each one for what it does and what it needs.
+    pub const IMPORTER_SCRIPTS_DIR: &'static str = "importer/scripts";
+    pub const PULL_CLASSIC_DB_SCRIPT: &'static str = "importer/scripts/pull-classic-db.sh";
+    pub const IMPORT_WORLD_SCRIPT: &'static str = "importer/scripts/import-world.sh";
+    pub const IMPORT_CLASS_SPELLS_SCRIPT: &'static str = "importer/scripts/import-class-spells.sh";
+
     /// The pinned wire-harness release this checkout consumes (#246).
     pub const WIRE_HARNESS_PIN: &'static str = ".wire-harness-rev";
     /// Paths INSIDE a harness checkout. `dev smoke` drives the generic login smoke through the
@@ -254,6 +262,22 @@ impl ProjectLayout {
 
     pub fn scripts_dir(&self) -> PathBuf {
         self.root.join(Self::SCRIPTS_DIR)
+    }
+
+    pub fn importer_scripts_dir(&self) -> PathBuf {
+        self.root.join(Self::IMPORTER_SCRIPTS_DIR)
+    }
+
+    pub fn pull_classic_db_script(&self) -> PathBuf {
+        self.root.join(Self::PULL_CLASSIC_DB_SCRIPT)
+    }
+
+    pub fn import_world_script(&self) -> PathBuf {
+        self.root.join(Self::IMPORT_WORLD_SCRIPT)
+    }
+
+    pub fn import_class_spells_script(&self) -> PathBuf {
+        self.root.join(Self::IMPORT_CLASS_SPELLS_SCRIPT)
     }
 
     pub fn wire_harness_pin(&self) -> PathBuf {

@@ -68,6 +68,13 @@ fn run(args: &[String]) -> Result<i32> {
             let mut dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
             dev.down(&runner, &inspector, forget).map(|_| EXIT_OK)
         }
+        Command::Import(options) => cmd::import::run(
+            &ProjectLayout::discover()?,
+            &runner,
+            &cmd::import::TtyPrompt,
+            &options,
+        )
+        .map(|_| EXIT_OK),
         Command::AccountCreate { user, source } => {
             let project = ProjectLayout::discover()?;
             cmd::account::create(&project, &user, source, &runner).map(|_| EXIT_OK)
