@@ -46,9 +46,13 @@ pub fn create(
     }
 
     // `provision_account` is `require_operator`-gated, and the operator is the identity that
-    // claimed it during `dev up` — the `spacetime` CLI's. An anonymous coordinator is a different
-    // identity, so without this the reducer refuses the write.
-    let token = crate::token::resolve(runner)?;
+    // claimed it during `dev up`. An anonymous coordinator is a different identity, so without
+    // this the reducer refuses the write.
+    //
+    // The ladder here deliberately stops short of MINTING one (`resolve_existing`, not
+    // `resolve_or_mint`): a freshly minted identity has claimed nothing, so it would be refused by
+    // the module — after the password had already been read. `dev up` is what mints and claims.
+    let credential = crate::token::resolve_existing(runner, &project.token_file())?;
 
     let password = match source {
         PasswordSource::Stdin => read_line_secret(&mut std::io::stdin().lock())?,
@@ -56,7 +60,10 @@ pub fn create(
     };
     validate(&password)?;
 
-    runner.run_with_secret_stdin(&provision_command(project, user, &token), &password)?;
+    runner.run_with_secret_stdin(
+        &provision_command(project, user, credential.token()),
+        &password,
+    )?;
     println!("✓ provisioned account '{}'.", user.to_uppercase());
     Ok(())
 }
@@ -221,13 +228,15 @@ mod tests {
     }
 
     #[test]
-    fn a_logged_out_cli_fails_before_the_password_is_ever_sent() {
+    fn a_host_with_no_credential_at_all_fails_before_the_password_is_ever_sent() {
         let tmp = TempDir::new().unwrap();
         let project = project_with_gateway(&tmp);
         let stack = FakeStack::new().fail_on("login show", "You are not logged in");
 
         let error = create(&project, "TEST", PasswordSource::Stdin, &stack.runner()).unwrap_err();
-        assert!(error.to_string().contains("spacetime login"), "{error}");
+        // Not "run `spacetime login`" (#297: on a fresh host that is a spacetimedb.com signup) —
+        // `dev up` is what mints a local identity and claims it as the operator.
+        assert!(error.to_string().contains("lyracore dev up"), "{error}");
         assert!(
             !stack
                 .calls()
@@ -235,6 +244,30 @@ mod tests {
                 .any(|c| matches!(c, Call::SecretStdin { .. })),
             "the password must not be handed to a child that is going to be refused anyway"
         );
+    }
+
+    #[test]
+    fn the_identity_dev_up_minted_is_the_one_that_provisions() {
+        // The pair that must match: `dev up` claimed the operator as the persisted server-issued
+        // identity, so `account create` has to provision as that same identity — not as whatever
+        // `spacetime login` says, and not as a fresh mint.
+        use crate::http::fake::{FakeHttp, MINTED_TOKEN};
+        let tmp = TempDir::new().unwrap();
+        let project = project_with_gateway(&tmp);
+        crate::token::resolve_or_mint(
+            &FakeStack::new().fail_on("login show", "no").runner(),
+            &FakeHttp::new(),
+            &project.token_file(),
+            "http://127.0.0.1:3000",
+        )
+        .unwrap();
+
+        let credential =
+            crate::token::resolve_existing(&FakeStack::new().runner(), &project.token_file())
+                .unwrap();
+        let cmd = provision_command(&project, "TEST", credential.token());
+        assert_eq!(cmd.env_value(crate::token::TOKEN_VAR), Some(MINTED_TOKEN));
+        assert!(!cmd.render().contains(MINTED_TOKEN), "{}", cmd.render());
     }
 
     #[test]

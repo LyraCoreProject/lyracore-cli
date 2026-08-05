@@ -1,5 +1,6 @@
 use lyracore_cli::cmd::{self, Command};
 use lyracore_cli::error::{EXIT_FAILURE, EXIT_OK};
+use lyracore_cli::http::LoopbackHttpClient;
 use lyracore_cli::proc::{RealProcessInspector, RealProcessRunner};
 use lyracore_cli::project::ProjectLayout;
 use lyracore_cli::Result;
@@ -19,6 +20,8 @@ fn run(args: &[String]) -> Result<i32> {
     let command = Command::parse(args)?;
     let runner = RealProcessRunner;
     let inspector = RealProcessInspector;
+    // Only ever pointed at the loopback node: minting an identity and claiming the operator as it.
+    let http = LoopbackHttpClient;
 
     match command {
         Command::Help => {
@@ -34,7 +37,7 @@ fn run(args: &[String]) -> Result<i32> {
         }
         Command::DevUp { bind } => {
             let mut dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
-            dev.up(&runner, &inspector, bind).map(|_| EXIT_OK)
+            dev.up(&runner, &inspector, &http, bind).map(|_| EXIT_OK)
         }
         Command::DevStatus => {
             let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
