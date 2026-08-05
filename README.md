@@ -32,7 +32,25 @@ processes the CLI started, and `logs/{spacetime,gateway}.log`.
    `-s local`, and the refusal to forward a `-c` wipe. No path here invokes `spacetime publish`
    directly, clears a database, or re-selects the SpacetimeDB server.
 4. Calls `claim_operator` (idempotent for the same identity, so repeating `dev up` is not an error).
-5. Starts the gateway bound to loopback.
+5. Reads the `spacetime` CLI's auth token (`spacetime login show --token`) and starts the gateway
+   with it, bound to loopback.
+
+### The coordinator token
+
+Step 5 is not optional plumbing. `game_account` and `game_session` are **private** module tables and
+`provision_account` is operator-gated, so the gateway's coordinator connection has to authenticate
+as the identity that published the module and claimed the operator — which, here, is the
+`spacetime` CLI's own identity. Without it the gateway starts, warns, and dies ~15 seconds later on
+`coordinator subscriptions not applied within 15s`, which reads like a broken node rather than a
+missing credential; `account create` would fail as "operator only" for the same reason.
+
+So `dev up` and `account create` both resolve the token first and **refuse to start anything** if
+they cannot, telling you to run `spacetime login`. The token is asked of the CLI rather than parsed
+out of `cli.toml`, because that file's location is the CLI's business and differs per platform.
+
+It reaches the child as an **environment variable, never an argument** (`ps` shows nothing), and
+`CommandSpec` renders program and arguments only — so it cannot reach a log line, an error message,
+or `state.json`.
 
 Re-running `dev up` on a healthy stack does nothing; on a partially-up stack it starts only the
 missing part.

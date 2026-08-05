@@ -34,12 +34,9 @@ pub fn create(
         ));
     }
 
-    let password = match source {
-        PasswordSource::Stdin => read_line_secret(&mut std::io::stdin().lock())?,
-        PasswordSource::Tty => read_password_from_tty()?,
-    };
-    validate(&password)?;
-
+    // Everything that can fail WITHOUT the password happens first, so a prompt is only ever shown
+    // for a provisioning that has a chance of succeeding — and a secret is never read into memory
+    // for a command that was going to be refused anyway.
     let gateway = project.gateway_bin();
     if !gateway.exists() {
         return Err(Error::PrerequisiteMissing(format!(
@@ -48,18 +45,30 @@ pub fn create(
         )));
     }
 
-    runner.run_with_secret_stdin(&provision_command(project, user), &password)?;
+    // `provision_account` is `require_operator`-gated, and the operator is the identity that
+    // claimed it during `dev up` — the `spacetime` CLI's. An anonymous coordinator is a different
+    // identity, so without this the reducer refuses the write.
+    let token = crate::token::resolve(runner)?;
+
+    let password = match source {
+        PasswordSource::Stdin => read_line_secret(&mut std::io::stdin().lock())?,
+        PasswordSource::Tty => read_password_from_tty()?,
+    };
+    validate(&password)?;
+
+    runner.run_with_secret_stdin(&provision_command(project, user, &token), &password)?;
     println!("✓ provisioned account '{}'.", user.to_uppercase());
     Ok(())
 }
 
 /// The provisioning invocation. `user` is an argument; the password is not, and cannot be —
 /// `CommandSpec` has no way to carry one.
-fn provision_command(project: &ProjectLayout, user: &str) -> CommandSpec {
+fn provision_command(project: &ProjectLayout, user: &str, token: &str) -> CommandSpec {
     CommandSpec::new(project.gateway_bin().to_string_lossy().to_string())
         .arg("provision")
         .arg(user)
         .arg("--password-stdin")
+        .env(crate::token::TOKEN_VAR, token)
         .env("LYRACORE_DATABASE", ProjectLayout::DATABASE)
         .env("LYRACORE_SPACETIMEDB_URL", ProjectLayout::stdb_uri())
         .env_remove("LYRACORE_SHARD_MAP")
@@ -168,7 +177,7 @@ fn first_line(input: &str) -> Zeroizing<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proc::fake::{Call, FakeStack};
+    use crate::proc::fake::{Call, FakeStack, FAKE_TOKEN};
     use tempfile::TempDir;
 
     const SECRET: &str = "hunter2";
@@ -186,7 +195,7 @@ mod tests {
     #[test]
     fn the_password_is_never_a_command_argument() {
         let tmp = TempDir::new().unwrap();
-        let cmd = provision_command(&project_with_gateway(&tmp), "TEST");
+        let cmd = provision_command(&project_with_gateway(&tmp), "TEST", FAKE_TOKEN);
 
         assert!(cmd.args().contains(&"--password-stdin".to_string()));
         assert!(
@@ -201,6 +210,34 @@ mod tests {
     }
 
     #[test]
+    fn provisioning_carries_the_operator_token_out_of_sight() {
+        // `provision_account` is `require_operator`-gated: an anonymous coordinator is a different
+        // identity and the reducer refuses the write. The token must be there — in the
+        // environment, not in argv, and not in anything rendered.
+        let tmp = TempDir::new().unwrap();
+        let cmd = provision_command(&project_with_gateway(&tmp), "TEST", FAKE_TOKEN);
+        assert_eq!(cmd.env_value(crate::token::TOKEN_VAR), Some(FAKE_TOKEN));
+        assert!(!cmd.render().contains(FAKE_TOKEN), "{}", cmd.render());
+    }
+
+    #[test]
+    fn a_logged_out_cli_fails_before_the_password_is_ever_sent() {
+        let tmp = TempDir::new().unwrap();
+        let project = project_with_gateway(&tmp);
+        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
+
+        let error = create(&project, "TEST", PasswordSource::Stdin, &stack.runner()).unwrap_err();
+        assert!(error.to_string().contains("spacetime login"), "{error}");
+        assert!(
+            !stack
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::SecretStdin { .. })),
+            "the password must not be handed to a child that is going to be refused anyway"
+        );
+    }
+
+    #[test]
     fn the_password_reaches_the_child_only_over_stdin() {
         let tmp = TempDir::new().unwrap();
         let project = project_with_gateway(&tmp);
@@ -208,7 +245,10 @@ mod tests {
 
         stack
             .runner()
-            .run_with_secret_stdin(&provision_command(&project, "TEST"), SECRET.as_bytes())
+            .run_with_secret_stdin(
+                &provision_command(&project, "TEST", FAKE_TOKEN),
+                SECRET.as_bytes(),
+            )
             .unwrap();
 
         match stack.calls().as_slice() {
@@ -238,7 +278,10 @@ mod tests {
 
         let error = stack
             .runner()
-            .run_with_secret_stdin(&provision_command(&project, "TEST"), SECRET.as_bytes())
+            .run_with_secret_stdin(
+                &provision_command(&project, "TEST", FAKE_TOKEN),
+                SECRET.as_bytes(),
+            )
             .unwrap_err();
 
         assert!(

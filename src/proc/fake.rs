@@ -155,10 +155,27 @@ fn endpoint_for(cmd: &CommandSpec) -> Option<String> {
     None
 }
 
+/// The auth token a `FakeStack`'s `spacetime` CLI hands out. A distinctive literal, so a test can
+/// assert it is absent from everything rendered, logged or serialized.
+pub const FAKE_TOKEN: &str = "eyJmYWtl.TOKEN-must-never-be-rendered.SIG";
+
+/// Canned stdout for the commands this CLI actually reads output from.
+///
+/// A `FakeStack` models a machine whose `spacetime` CLI is logged in, because that is the ordinary
+/// case; `fail_on("login show", …)` models the other one.
+fn canned_stdout(render: &str) -> String {
+    if render.contains("login show") {
+        format!("You are logged in as fake-identity\nYour auth token (don't share this!) is {FAKE_TOKEN}\n")
+    } else {
+        String::new()
+    }
+}
+
 impl ProcessRunner for FakeProcessRunner {
     fn run_and_wait(&self, cmd: &CommandSpec) -> Result<String> {
-        self.record(Call::Wait(cmd.clone()), &cmd.render())?;
-        Ok(String::new())
+        let render = cmd.render();
+        self.record(Call::Wait(cmd.clone()), &render)?;
+        Ok(canned_stdout(&render))
     }
 
     fn run_streaming(&self, cmd: &CommandSpec) -> Result<()> {
