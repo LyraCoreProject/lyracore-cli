@@ -35,6 +35,19 @@ fn run(args: &[String]) -> Result<i32> {
             let blocking = cmd::doctor::report(&checks);
             Ok(if blocking { EXIT_FAILURE } else { EXIT_OK })
         }
+        Command::Preflight => {
+            cmd::preflight::run(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
+        }
+        Command::Publish {
+            databases,
+            skip_preflight,
+        } => cmd::publish::run(
+            &ProjectLayout::discover()?,
+            &runner,
+            &databases,
+            skip_preflight,
+        )
+        .map(|_| EXIT_OK),
         Command::DevUp { bind } => {
             let mut dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
             dev.up(&runner, &inspector, &http, bind).map(|_| EXIT_OK)

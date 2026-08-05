@@ -5,9 +5,11 @@
 
 pub mod cmd;
 pub mod error;
+pub mod harness;
 pub mod http;
 pub mod proc;
 pub mod project;
+pub mod rls;
 pub mod state;
 pub mod token;
 

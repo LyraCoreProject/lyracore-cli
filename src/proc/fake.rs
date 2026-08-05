@@ -35,6 +35,8 @@ struct Inner {
     listeners: HashMap<u32, String>,
     next_pid: u32,
     failures: HashMap<String, String>,
+    /// Canned stdout, keyed by a substring of the rendered command. Overrides the defaults below.
+    stdouts: HashMap<String, String>,
 }
 
 /// A fake machine: which processes exist, which ports answer, and what was run.
@@ -71,6 +73,16 @@ impl FakeStack {
             .unwrap()
             .endpoints
             .insert(format!("{host}:{port}"));
+        self
+    }
+
+    /// Answer any command whose rendered form contains `needle` with this stdout.
+    pub fn with_stdout(self, needle: &str, stdout: &str) -> Self {
+        self.0
+            .lock()
+            .unwrap()
+            .stdouts
+            .insert(needle.to_string(), stdout.to_string());
         self
     }
 
@@ -159,23 +171,79 @@ fn endpoint_for(cmd: &CommandSpec) -> Option<String> {
 /// assert it is absent from everything rendered, logged or serialized.
 pub const FAKE_TOKEN: &str = "eyJmYWtl.TOKEN-must-never-be-rendered.SIG";
 
+/// The versions a `FakeStack`'s toolchain reports. A fixture checkout that pins these is a machine
+/// whose tools match — the ordinary case; a fixture pinning anything else models the drift that
+/// `lyracore preflight`'s check 0 exists to catch.
+pub const FAKE_RUST_VERSION: &str = "1.93.0";
+pub const FAKE_SPACETIME_VERSION: &str = "2.5.0";
+
 /// Canned stdout for the commands this CLI actually reads output from.
 ///
-/// A `FakeStack` models a machine whose `spacetime` CLI is logged in, because that is the ordinary
-/// case; `fail_on("login show", …)` models the other one.
+/// A `FakeStack` models a machine whose `spacetime` CLI is logged in and whose toolchain matches
+/// the checkout, because that is the ordinary case; `fail_on(…)` and `with_stdout(…)` model the
+/// others.
 fn canned_stdout(render: &str) -> String {
     if render.contains("login show") {
         format!("You are logged in as fake-identity\nYour auth token (don't share this!) is {FAKE_TOKEN}\n")
+    } else if render.starts_with("rustc --version") {
+        format!("rustc {FAKE_RUST_VERSION} (0000000 2026-01-01)\n")
+    } else if render.starts_with("spacetime --version") {
+        format!(
+            "spacetimedb tool version {FAKE_SPACETIME_VERSION}; spacetime-lib version \
+             {FAKE_SPACETIME_VERSION}\n"
+        )
     } else {
         String::new()
     }
+}
+
+/// `spacetime generate` writes a module's bindings into its `--out-dir`. A fake that only recorded
+/// the call would leave the RLS-identifier check (which READS those bindings) unexercisable.
+fn materialize_generated_bindings(cmd: &CommandSpec) {
+    let args = cmd.args();
+    let Some(index) = args.iter().position(|a| a == "--out-dir") else {
+        return;
+    };
+    let Some(out) = args.get(index + 1) else {
+        return;
+    };
+    let out = Path::new(out);
+    if std::fs::create_dir_all(out).is_err() {
+        return;
+    }
+    let _ = std::fs::write(
+        out.join("game_character_table.rs"),
+        "use super::character_type::Character;\n\
+         /// Table handle for the table `game_character`.\n",
+    );
+    let _ = std::fs::write(
+        out.join("character_type.rs"),
+        "pub struct Character {\n    pub guid: u64,\n    pub owner_identity: Identity,\n}\n",
+    );
 }
 
 impl ProcessRunner for FakeProcessRunner {
     fn run_and_wait(&self, cmd: &CommandSpec) -> Result<String> {
         let render = cmd.render();
         self.record(Call::Wait(cmd.clone()), &render)?;
-        Ok(canned_stdout(&render))
+        if render.contains("spacetime generate") {
+            materialize_generated_bindings(cmd);
+        }
+        let canned = {
+            let inner = self.0.lock().unwrap();
+            inner
+                .stdouts
+                .iter()
+                .find(|(needle, _)| render.contains(needle.as_str()))
+                .map(|(_, stdout)| stdout.clone())
+        };
+        Ok(canned.unwrap_or_else(|| canned_stdout(&render)))
+    }
+
+    fn run_capturing_stderr(&self, cmd: &CommandSpec) -> Result<String> {
+        // A fake has one output stream; which of a real tool's two a banner lands on is exactly
+        // what the real runner's separate implementation exists to paper over.
+        self.run_and_wait(cmd)
     }
 
     fn run_streaming(&self, cmd: &CommandSpec) -> Result<()> {

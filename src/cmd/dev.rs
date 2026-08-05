@@ -4,6 +4,8 @@
 //! `docs/danger-zones.md` §3 is deliberately not reproduced here, and the variables that would
 //! enable it are actively unset for the child gateway.
 
+use crate::cmd::{preflight, publish};
+use crate::harness::{self, Harness};
 use crate::http::HttpClient;
 use crate::proc::{CommandSpec, ProcessInspector, ProcessRunner};
 use crate::project::{ClientBind, Component, ProjectLayout};
@@ -234,22 +236,22 @@ impl DevManager {
         Ok(())
     }
 
+    /// The offline deploy gate, then the one correct publish.
+    ///
+    /// Both are this CLI's own (`lyracore preflight` / `lyracore publish`) rather than a shell-out
+    /// to the server repo's `scripts/`: the guarantees — `--features=debug_reducers`, `--yes`,
+    /// `-s local`, and the unreachability of a `-c` wipe — are properties of
+    /// `publish::publish_command`, which is the ONLY way a publish is rendered anywhere in this
+    /// CLI. The multi-shard note `lyracore publish` prints is deliberately absent: this fixture is
+    /// a single database on purpose.
     fn publish(&self, runner: &dyn ProcessRunner) -> Result<()> {
-        let script = self.project.publish_script();
-        if !script.exists() {
-            return Err(Error::ProjectLayout(format!(
-                "{} is missing — this does not look like a full checkout",
-                ProjectLayout::PUBLISH_SCRIPT
-            )));
-        }
+        println!("· preflight (offline: build, schema, visibility filters)...");
+        preflight::run(&self.project, runner)?;
         println!("· publishing {}...", ProjectLayout::DATABASE);
-        // Always through the authoritative script: it is what guarantees --features=debug_reducers,
-        // --yes, `-s local`, and the refusal to forward a `-c` wipe.
-        runner.run_and_wait(
-            &CommandSpec::new("bash")
-                .arg(script.to_string_lossy().to_string())
-                .arg(ProjectLayout::DATABASE),
-        )?;
+        runner.run_streaming(&publish::publish_command(
+            &self.project,
+            ProjectLayout::DATABASE,
+        )?)?;
         Ok(())
     }
 
@@ -445,22 +447,17 @@ impl DevManager {
     /// Hand off to the pinned wire harness's generic login smoke (#246): logon → world handshake →
     /// character enumerate → enter world, against the running fixture.
     ///
-    /// This CLI deliberately owns none of that. The harness is a separate, server-agnostic
-    /// repository pinned by `.wire-harness-rev`, and the checkout's own
-    /// `adapters/lyracore/run-suite.sh` is the seam that resolves it — including the
-    /// `LYRACORE_WIRE_HARNESS_DIR` override, which reaches it through the inherited environment.
+    /// The harness is a separate, server-agnostic repository consumed as the RELEASE pinned in
+    /// `.wire-harness-rev`, and everything below the seam — the fixtures, the scenarios, the
+    /// assertions — belongs to it. What changed with the CLI absorbing the lifecycle scripts is
+    /// only WHERE the seam is resolved from: the pinned harness checkout in `.lyracore/`, not a
+    /// `adapters/` directory in the server repo. The server repo's copy was the last thing making
+    /// `dev smoke` depend on a directory the public mirror does not carry.
     pub fn smoke(
         &self,
         runner: &dyn ProcessRunner,
         inspector: &dyn ProcessInspector,
     ) -> Result<()> {
-        let script = self.project.suite_script();
-        if !script.exists() {
-            return Err(Error::ProjectLayout(format!(
-                "{} is missing — this does not look like a full checkout",
-                ProjectLayout::SUITE_SCRIPT
-            )));
-        }
         for component in Component::ALL {
             match self.status_for(component, inspector) {
                 ComponentStatus::Healthy | ComponentStatus::External => {}
@@ -480,9 +477,20 @@ impl DevManager {
             }
         }
 
+        // Resolved AFTER the stack check, so a `dev smoke` against a stopped stack does not clone
+        // a harness release to tell you to run `dev up`.
+        let harness = harness::resolve(
+            &self.project,
+            runner,
+            harness::override_from_env().as_deref(),
+            &harness::remote_from_env(),
+        )?;
+        println!("· building the wire client from the pinned harness...");
+        runner.run_and_wait(&client_build_command(&harness))?;
+
         println!("· running the pinned wire harness's login smoke...");
         runner
-            .run_streaming(&smoke_command(&self.project, &self.bind))
+            .run_streaming(&smoke_command(&self.project, &harness, &self.bind))
             .map_err(|e| {
                 Error::Process(format!(
                 "{e}\n  The smoke test signs in as the fixture account. If it failed to log in, \
@@ -638,17 +646,47 @@ fn describe_command() -> CommandSpec {
         .arg(ProjectLayout::DATABASE)
 }
 
-/// `dev smoke` — the checkout's own harness seam, told which database and gateway this fixture is
+/// Build the harness's wire client from ITS manifest, never from this checkout's workspace —
+/// `--manifest-path` so the cwd cannot decide which `Cargo.toml` wins.
+fn client_build_command(harness: &Harness) -> CommandSpec {
+    CommandSpec::new("cargo")
+        .arg("build")
+        .arg("-q")
+        .arg("--manifest-path")
+        .arg(harness.manifest().to_string_lossy().to_string())
+        .arg("--bin")
+        .arg(ProjectLayout::HARNESS_CLIENT_BIN)
+}
+
+/// `dev smoke` — the pinned harness's own seam, told which database and gateway this fixture is
 /// and (in LAN mode) which host to connect to. Everything below it belongs to the harness.
-fn smoke_command(project: &ProjectLayout, bind: &ClientBind) -> CommandSpec {
-    CommandSpec::new("bash")
-        .arg(project.suite_script().to_string_lossy().to_string())
-        .arg("--smoke")
-        .arg("--database")
-        .arg(ProjectLayout::DATABASE)
-        .arg("--gateway")
-        .arg(project.gateway_bin().to_string_lossy().to_string())
-        .env("WIRE_HOST", bind.host())
+///
+/// A release that carries its own suite entrypoint is driven through that; otherwise the generic
+/// login smoke is driven straight through the adapter seam, which is precisely what the server
+/// repo's `run-suite.sh --smoke` did with the flags it was given.
+fn smoke_command(project: &ProjectLayout, harness: &Harness, bind: &ClientBind) -> CommandSpec {
+    let base = match harness.suite_script() {
+        Some(suite) => CommandSpec::new("bash")
+            .arg(suite.to_string_lossy().to_string())
+            .arg("--smoke")
+            .arg("--database")
+            .arg(ProjectLayout::DATABASE)
+            .arg("--gateway")
+            .arg(project.gateway_bin().to_string_lossy().to_string()),
+        None => CommandSpec::new("bash")
+            .arg(harness.smoke_seam().to_string_lossy().to_string())
+            .arg(ProjectLayout::SMOKE_ACCOUNT)
+            .arg(ProjectLayout::SMOKE_CHARACTER),
+    };
+    base.env(
+        "WIRE_BIN",
+        harness.client_bin().to_string_lossy().to_string(),
+    )
+    .env("WIRE_HOST", bind.host())
+    // The harness resolves TWO roots and this is the one it cannot guess from its own
+    // location: it now lives under `.lyracore/`, not inside the checkout it is testing.
+    .env("LYRACORE_DIR", project.root.to_string_lossy().to_string())
+    .env("DB", ProjectLayout::DATABASE)
 }
 
 fn classify(
@@ -688,15 +726,34 @@ mod tests {
         }
     }
 
+    const HARNESS_SHA: &str = "30e18083c8df705a484f157bd16a3f12b1aeb5ba";
+
+    /// A checkout the internal preflight passes, so `up` tests exercise `up`.
     fn project(tmp: &TempDir) -> ProjectLayout {
-        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
-        std::fs::create_dir_all(tmp.path().join("scripts")).unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(
-            tmp.path().join(ProjectLayout::PUBLISH_SCRIPT),
-            "#!/bin/sh\n",
+            root.join(ProjectLayout::RUST_TOOLCHAIN),
+            format!(
+                "[toolchain]\nchannel = \"{}\"\n",
+                crate::proc::fake::FAKE_RUST_VERSION
+            ),
         )
         .unwrap();
-        ProjectLayout::from_root(tmp.path()).unwrap()
+        std::fs::create_dir_all(root.join("module/src")).unwrap();
+        std::fs::write(
+            root.join("module/Cargo.toml"),
+            "spacetimedb = { version = \"=2.5.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("module/src/lib.rs"),
+            "#[client_visibility_filter]\nconst RLS: Filter =\n    \
+             Filter::Sql(\"SELECT * FROM game_character WHERE owner_identity = :sender\");\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        ProjectLayout::from_root(root).unwrap()
     }
 
     // ---- the stop-safety contract ----
@@ -944,18 +1001,43 @@ mod tests {
 
     // ---- smoke ----
 
-    fn project_with_suite(tmp: &TempDir) -> ProjectLayout {
+    /// A checkout with a harness pin, and that pinned release already in the `.lyracore/` cache.
+    fn project_with_harness(tmp: &TempDir) -> ProjectLayout {
         let layout = project(tmp);
-        std::fs::create_dir_all(tmp.path().join("adapters/lyracore")).unwrap();
-        std::fs::write(tmp.path().join(ProjectLayout::SUITE_SCRIPT), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            layout.wire_harness_pin(),
+            format!("v0.1.0-alpha.2 {HARNESS_SHA}\n"),
+        )
+        .unwrap();
+        let cached = layout.harness_cache().join(HARNESS_SHA);
+        std::fs::create_dir_all(cached.join(".git")).unwrap();
+        std::fs::create_dir_all(cached.join("src")).unwrap();
+        std::fs::create_dir_all(cached.join("adapters/lyracore")).unwrap();
+        std::fs::write(cached.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(
+            cached.join(ProjectLayout::HARNESS_SMOKE_SEAM),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
         layout
     }
 
+    /// A stack whose `git rev-parse` answers the pinned sha, so harness resolution succeeds.
+    fn harness_stack() -> FakeStack {
+        FakeStack::new().with_stdout("rev-parse HEAD", HARNESS_SHA)
+    }
+
+    fn resolved_harness(project: &ProjectLayout, stack: &FakeStack) -> Harness {
+        harness::resolve(project, &stack.runner(), None, harness::DEFAULT_REMOTE).unwrap()
+    }
+
     #[test]
-    fn smoke_hands_off_to_the_checkouts_pinned_harness_seam() {
+    fn smoke_runs_the_seam_out_of_the_pinned_harness_checkout_not_the_server_repo() {
+        // #246 + the mirror: `adapters/` is not a directory the published repository carries, so
+        // resolving the seam relative to the checkout would make `dev smoke` unrunnable there.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_suite(&tmp)).unwrap();
-        let stack = FakeStack::new();
+        let mut dev = DevManager::new(project_with_harness(&tmp)).unwrap();
+        let stack = harness_stack();
         dev.up(
             &stack.runner(),
             &stack.inspector(),
@@ -970,72 +1052,54 @@ mod tests {
             .calls()
             .into_iter()
             .filter_map(|call| match call {
-                Call::Stream(spec) => Some(spec),
+                Call::Stream(spec) if spec.render().contains("adapters/lyracore") => Some(spec),
                 _ => None,
             })
             .collect();
         assert_eq!(smoke.len(), 1, "exactly one harness run: {smoke:?}");
         let rendered = smoke[0].render();
         assert!(
-            rendered.contains(ProjectLayout::SUITE_SCRIPT) && rendered.contains("--smoke"),
-            "smoke must go through the checkout's harness seam, not a client this CLI owns: \
-             {rendered}"
+            rendered.contains(&format!("wire-harness/{HARNESS_SHA}")),
+            "the seam must come from the pinned cache: {rendered}"
         );
-        // The harness resolves the PIN itself (.wire-harness-rev) and honours
-        // LYRACORE_WIRE_HARNESS_DIR from the inherited environment — this CLI must not second-guess
-        // either, so it pins nothing and unsets nothing.
-        assert_eq!(smoke[0].env_value("LYRACORE_WIRE_HARNESS_DIR"), None);
-        assert!(!smoke[0].removes_env("LYRACORE_WIRE_HARNESS_DIR"));
+        assert!(
+            rendered.contains(ProjectLayout::HARNESS_SMOKE_SEAM),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.starts_with(&tmp.path().join("adapters").display().to_string()),
+            "nothing may be resolved out of the server repo's adapters/: {rendered}"
+        );
         assert_eq!(smoke[0].env_value("WIRE_HOST"), Some("127.0.0.1"));
-    }
-
-    #[test]
-    fn smoke_in_lan_mode_connects_to_the_lan_address() {
-        let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_suite(&tmp)).unwrap();
-        let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
-            .unwrap();
-
-        dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
         assert_eq!(
-            smoke_command(&dev.project, &dev.bind).env_value("WIRE_HOST"),
-            Some("192.168.1.50")
+            smoke[0].env_value("LYRACORE_DIR"),
+            Some(dev.project.root.to_string_lossy().to_string()).as_deref(),
+            "the harness resolves two roots; this is the one it cannot guess"
         );
-    }
-
-    #[test]
-    fn smoke_refuses_a_stack_that_is_not_up_and_says_what_to_run() {
-        let tmp = TempDir::new().unwrap();
-        let dev = DevManager::new(project_with_suite(&tmp)).unwrap();
-        let stack = FakeStack::new();
-
-        let error = dev.smoke(&stack.runner(), &stack.inspector()).unwrap_err();
+        // The client is built from the HARNESS's manifest, never this workspace's.
+        let built = stack
+            .rendered()
+            .into_iter()
+            .find(|r| r.contains("cargo build") && r.contains(ProjectLayout::HARNESS_CLIENT_BIN))
+            .expect("the wire client must be built");
         assert!(
-            error.to_string().contains("lyracore dev up"),
-            "must name the fix: {error}"
-        );
-        assert!(
-            stack.calls().is_empty(),
-            "nothing may be run against a stack that is not up"
+            built.contains(&format!("wire-harness/{HARNESS_SHA}")),
+            "{built}"
         );
     }
 
     #[test]
-    fn smoke_on_a_checkout_without_the_harness_seam_fails_cleanly() {
+    fn a_release_that_carries_its_own_suite_entrypoint_is_preferred() {
         let tmp = TempDir::new().unwrap();
-        // `project()` writes the publish script but no adapters/ directory.
-        let dev = DevManager::new(project(&tmp)).unwrap();
-        let stack = FakeStack::new();
-        let error = dev.smoke(&stack.runner(), &stack.inspector()).unwrap_err();
-        assert!(error.to_string().contains(ProjectLayout::SUITE_SCRIPT));
-    }
-
-    #[test]
-    fn a_failing_smoke_points_at_the_fixture_account() {
-        let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_suite(&tmp)).unwrap();
-        let stack = FakeStack::new();
+        let project = project_with_harness(&tmp);
+        let cached = project.harness_cache().join(HARNESS_SHA);
+        std::fs::write(
+            cached.join(ProjectLayout::HARNESS_SUITE_SCRIPT),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        let mut dev = DevManager::new(project).unwrap();
+        let stack = harness_stack();
         dev.up(
             &stack.runner(),
             &stack.inspector(),
@@ -1044,9 +1108,83 @@ mod tests {
         )
         .unwrap();
 
-        let failing = FakeStack::new()
+        dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
+        let harness = resolved_harness(&dev.project, &stack);
+        let rendered = smoke_command(&dev.project, &harness, &dev.bind).render();
+        assert!(rendered.contains("run-suite.sh"), "{rendered}");
+        assert!(rendered.contains("--smoke"), "{rendered}");
+        assert!(rendered.contains("--database lyracore"), "{rendered}");
+    }
+
+    #[test]
+    fn smoke_in_lan_mode_connects_to_the_lan_address() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project_with_harness(&tmp)).unwrap();
+        let stack = harness_stack();
+        dev.up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
+            .unwrap();
+
+        dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
+        let harness = resolved_harness(&dev.project, &stack);
+        assert_eq!(
+            smoke_command(&dev.project, &harness, &dev.bind).env_value("WIRE_HOST"),
+            Some("192.168.1.50")
+        );
+    }
+
+    #[test]
+    fn smoke_refuses_a_stack_that_is_not_up_and_says_what_to_run() {
+        let tmp = TempDir::new().unwrap();
+        let dev = DevManager::new(project_with_harness(&tmp)).unwrap();
+        let stack = harness_stack();
+
+        let error = dev.smoke(&stack.runner(), &stack.inspector()).unwrap_err();
+        assert!(
+            error.to_string().contains("lyracore dev up"),
+            "must name the fix: {error}"
+        );
+        assert!(
+            stack.calls().is_empty(),
+            "nothing may be run — not even a harness clone — against a stack that is not up"
+        );
+    }
+
+    #[test]
+    fn smoke_on_a_checkout_with_no_harness_pin_fails_cleanly() {
+        let tmp = TempDir::new().unwrap();
+        // `project()` writes no `.wire-harness-rev`.
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
+        let error = dev.smoke(&stack.runner(), &stack.inspector()).unwrap_err();
+        assert!(
+            error.to_string().contains(ProjectLayout::WIRE_HARNESS_PIN),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_failing_smoke_points_at_the_fixture_account() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project_with_harness(&tmp)).unwrap();
+        let stack = harness_stack();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
+
+        let failing = harness_stack()
             .with_process(4001, "x")
-            .fail_on("run-suite.sh", "logon failed");
+            .fail_on(ProjectLayout::HARNESS_SMOKE_SEAM, "logon failed");
         // Reuse the running stack's view of the world, but a runner that fails the harness.
         let error = dev
             .smoke(&failing.runner(), &stack.inspector())
@@ -1494,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn up_publishes_only_the_single_seeded_database_through_the_script() {
+    fn up_publishes_only_the_single_seeded_database_and_always_with_the_two_flags() {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
@@ -1509,13 +1647,17 @@ mod tests {
         let publishes: Vec<String> = stack
             .rendered()
             .into_iter()
-            .filter(|r| r.contains(ProjectLayout::PUBLISH_SCRIPT))
+            .filter(|r| r.starts_with("spacetime publish"))
             .collect();
         assert_eq!(publishes.len(), 1, "exactly one publish: {publishes:?}");
+        assert!(
+            publishes[0].ends_with(ProjectLayout::DATABASE),
+            "{publishes:?}"
+        );
         for shard in [
-            "spacetime-world-1",
-            "spacetime-world-2",
-            "spacetime-instances",
+            "lyracore-world-1",
+            "lyracore-world-2",
+            "lyracore-instances",
             "realm-core",
         ] {
             assert!(
@@ -1524,14 +1666,81 @@ mod tests {
                 publishes[0]
             );
         }
-        // And a bare `spacetime publish` never appears — only the authoritative wrapper.
+        // The guarantees that used to belong to `scripts/publish-module.sh` are now properties of
+        // the ONE command builder every publish in this CLI goes through.
+        assert!(
+            publishes[0].contains("--build-options=--features=debug_reducers"),
+            "{publishes:?}"
+        );
+        assert!(publishes[0].contains("--yes"), "{publishes:?}");
+    }
+
+    #[test]
+    fn up_preflights_before_it_publishes() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
+
+        let rendered = stack.rendered();
+        let publish = rendered
+            .iter()
+            .position(|r| r.starts_with("spacetime publish"))
+            .expect("published");
+        let gate = rendered
+            .iter()
+            .position(|r| r.contains("cargo check"))
+            .expect("preflighted");
+        assert!(gate < publish, "{rendered:?}");
+    }
+
+    #[test]
+    fn up_refuses_to_publish_a_checkout_the_gate_rejects() {
+        // The deploy-time break class: green under `cargo test`, fatal on publish.
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        std::fs::write(
+            project.module_sources().join("lib.rs"),
+            "#[client_visibility_filter]\nconst RLS: Filter =\n    \
+             Filter::Sql(\"SELECT * FROM game_character WHERE no_such_column = :sender\");\n",
+        )
+        .unwrap();
+        let mut dev = DevManager::new(project).unwrap();
+        let stack = FakeStack::new();
+
+        let error = dev
+            .up(
+                &stack.runner(),
+                &stack.inspector(),
+                &FakeHttp::new(),
+                ClientBind::Loopback,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Nothing was published"),
+            "{error}"
+        );
         assert!(
             !stack
                 .rendered()
                 .iter()
-                .any(|r| r.starts_with("spacetime publish")),
-            "publishing must go through {}",
-            ProjectLayout::PUBLISH_SCRIPT
+                .any(|r| r.contains("spacetime publish")),
+            "{:?}",
+            stack.rendered()
+        );
+        assert!(
+            !stack
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Spawn { spec, .. }
+                if spec.render().contains("gateway"))),
+            "and no gateway may be started against an unpublished module"
         );
     }
 
