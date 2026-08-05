@@ -122,7 +122,8 @@ fn version_from(value: &str) -> Option<Version> {
     }
 }
 
-/// Whether the `spacetime` CLI is usable, so checks 2 and 3 know whether to skip.
+/// Whether the `spacetime` CLI is PRESENT, so checks 2 and 3 know whether to skip. Presence, not
+/// agreement: a drifted CLI is reported here and still used below.
 fn check_versions(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
@@ -173,23 +174,20 @@ fn check_versions(
         return false;
     };
     match parse_version(&banner) {
-        Some(found) if found == pinned => {
-            println!("spacetime CLI ok ({found})");
-            true
-        }
-        found => {
-            failures.bad(format!(
-                "spacetime CLI reports {}, this repository is pinned to {pinned} \
-                 ({}/Cargo.toml, gateway/Cargo.toml). Install the matching CLI:\n    \
-                 curl -sSf https://install.spacetimedb.com | sh -s -- --version {pinned}",
-                found.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
-                ProjectLayout::MODULE_DIR,
-            ));
-            // The CLI is present but wrong. Running schema extraction through it would report a
-            // second, confusing failure for a cause already named above.
-            false
-        }
+        Some(found) if found == pinned => println!("spacetime CLI ok ({found})"),
+        found => failures.bad(format!(
+            "spacetime CLI reports {}, this repository is pinned to {pinned} \
+             ({}/Cargo.toml, gateway/Cargo.toml). Install the matching CLI:\n    \
+             curl -sSf https://install.spacetimedb.com | sh -s -- --version {pinned}",
+            found.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+            ProjectLayout::MODULE_DIR,
+        )),
     }
+    // A MISMATCHED CLI still runs checks 2 and 3, deliberately. The drift is already reported
+    // above; skipping schema extraction over it would silently drop the two checks that catch the
+    // most expensive break classes, every run, until someone reinstalls a CLI. Presence is the
+    // gate here, not agreement.
+    true
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -283,9 +281,7 @@ fn check_schema(
 ) -> bool {
     step("module schema + #[default] values validate (offline wasm schema extraction)");
     if !have_cli || std::env::var_os(SKIP_SCHEMA_VAR).is_some() {
-        println!(
-            "SKIP: no usable `spacetime` on PATH (or {SKIP_SCHEMA_VAR} set) — schema not validated"
-        );
+        println!("SKIP: no `spacetime` on PATH (or {SKIP_SCHEMA_VAR} set) — schema not validated");
         return false;
     }
     match runner.run_and_wait(&schema_command(project, scratch)) {
@@ -571,15 +567,18 @@ mod tests {
         );
         let mut failures = Failures::default();
         let have_cli = check_versions(&project, &stack.runner(), &mut failures);
-        assert!(
-            !have_cli,
-            "a mismatched CLI must not then be used to extract a schema"
-        );
         assert_eq!(failures.0.len(), 1, "{:?}", failures.0);
         assert!(
             failures.0[0].contains("install.spacetimedb.com"),
             "{:?}",
             failures.0
+        );
+        // ...and the drift does NOT cost you checks 2 and 3. Skipping them over a version this run
+        // has already reported would quietly halve the gate on every machine that has drifted —
+        // and the shell preflight this ports gates check 2 on PRESENCE, not agreement.
+        assert!(
+            have_cli,
+            "a mismatched CLI must still be used to extract a schema"
         );
     }
 
