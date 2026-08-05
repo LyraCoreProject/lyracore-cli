@@ -266,7 +266,10 @@ mod tests {
         std::fs::create_dir_all(root.join("module/src")).unwrap();
         std::fs::write(
             root.join("module/Cargo.toml"),
-            "spacetimedb = { version = \"=2.5.0\" }\n",
+            format!(
+                "spacetimedb = {{ version = \"={}\" }}\n",
+                crate::proc::fake::FAKE_SPACETIME_VERSION
+            ),
         )
         .unwrap();
         std::fs::write(

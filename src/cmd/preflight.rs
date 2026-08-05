@@ -97,7 +97,7 @@ pub fn pinned_rust(toolchain_toml: &str) -> Option<Version> {
     version_from(line.split('"').nth(1)?)
 }
 
-/// `spacetimedb = { version = "=2.5.0", … }` out of `module/Cargo.toml`.
+/// `spacetimedb = { version = "=2.7.1", … }` out of `module/Cargo.toml`.
 pub fn pinned_spacetimedb(module_manifest: &str) -> Option<Version> {
     let line = module_manifest
         .lines()
@@ -494,7 +494,7 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proc::fake::{FakeStack, FAKE_RUST_VERSION};
+    use crate::proc::fake::{FakeStack, FAKE_RUST_VERSION, FAKE_SPACETIME_VERSION};
     use tempfile::TempDir;
 
     // ---- the version gate ----
@@ -511,9 +511,9 @@ mod tests {
 
         assert_eq!(
             pinned_spacetimedb(
-                "[dependencies]\nspacetimedb = { version = \"=2.5.0\", features = [\"unstable\"] }\n"
+                "[dependencies]\nspacetimedb = { version = \"=2.7.1\", features = [\"unstable\"] }\n"
             ),
-            Some(Version(2, 5, 0))
+            Some(Version(2, 7, 1))
         );
         assert_eq!(pinned_spacetimedb("[package]\nname = \"x\"\n"), None);
     }
@@ -698,7 +698,9 @@ mod tests {
         std::fs::create_dir_all(root.join("module/src")).unwrap();
         std::fs::write(
             root.join("module/Cargo.toml"),
-            "[dependencies]\nspacetimedb = { version = \"=2.5.0\" }\n",
+            format!(
+                "[dependencies]\nspacetimedb = {{ version = \"={FAKE_SPACETIME_VERSION}\" }}\n"
+            ),
         )
         .unwrap();
         std::fs::write(
