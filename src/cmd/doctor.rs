@@ -7,7 +7,11 @@ use crate::project::ProjectLayout;
 use crate::Result;
 use std::process::{Command, Stdio};
 
-pub const REQUIRED_SPACETIME: Version = Version(2, 5, 0);
+/// The SpacetimeDB version LyraCore is pinned to. `doctor` asks it as a **floor** (`>=`) — it only
+/// answers "can you get `dev up` off the ground"; `preflight` is the one that demands an EXACT match,
+/// and it reads the pin out of the checkout's own `module/Cargo.toml` rather than from this constant.
+/// Keep this in step with that pin (LyraCore's `module/Cargo.toml` + `gateway/Cargo.toml`).
+pub const REQUIRED_SPACETIME: Version = Version(2, 7, 1);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Check {
@@ -268,8 +272,8 @@ mod tests {
     #[test]
     fn versions_are_read_out_of_real_banners() {
         assert_eq!(
-            parse_version("spacetimedb tool version 2.5.0; spacetime-lib version 2.5.0"),
-            Some(Version(2, 5, 0))
+            parse_version("spacetimedb tool version 2.7.1; spacetime-lib version 2.7.1"),
+            Some(Version(2, 7, 1))
         );
         assert_eq!(
             parse_version("rustc 1.80.1 (abc 2024-08-08)"),
@@ -280,10 +284,11 @@ mod tests {
 
     #[test]
     fn the_required_spacetimedb_version_is_enforced_in_the_right_direction() {
-        assert!(Version(2, 5, 0) >= REQUIRED_SPACETIME);
-        assert!(Version(2, 5, 1) >= REQUIRED_SPACETIME);
+        assert!(Version(2, 7, 1) >= REQUIRED_SPACETIME);
+        assert!(Version(2, 7, 2) >= REQUIRED_SPACETIME);
         assert!(Version(3, 0, 0) >= REQUIRED_SPACETIME);
-        assert!(Version(2, 4, 9) < REQUIRED_SPACETIME);
+        assert!(Version(2, 7, 0) < REQUIRED_SPACETIME);
+        assert!(Version(2, 5, 0) < REQUIRED_SPACETIME);
         assert!(Version(1, 9, 9) < REQUIRED_SPACETIME);
     }
 
