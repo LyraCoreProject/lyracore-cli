@@ -1,11 +1,11 @@
-//! The local single-realm lifecycle: `dev up | status | logs | down`.
+//! The local single-realm lifecycle: `dev up | status | logs | smoke | down`.
 //!
 //! Scope is the seeded loopback fixture — ONE database. The five-database production recipe in
 //! `docs/danger-zones.md` §3 is deliberately not reproduced here, and the variables that would
 //! enable it are actively unset for the child gateway.
 
-use crate::project::{Component, ProjectLayout};
 use crate::proc::{CommandSpec, ProcessInspector, ProcessRunner};
+use crate::project::{ClientBind, Component, ProjectLayout};
 use crate::state::{ProcessRecord, RuntimeState};
 use crate::{Error, Result};
 use std::thread::sleep;
@@ -69,12 +69,21 @@ pub fn stop_action(record: Option<&ProcessRecord>, live_identity: Option<&str>) 
 pub struct DevManager {
     project: ProjectLayout,
     state: RuntimeState,
+    /// How the client-facing listeners are (or are about to be) bound. Read from state, so
+    /// `status`/`logs`/`smoke`/`down` all describe the stack that is actually running rather than
+    /// assuming loopback; replaced by `up`'s argument once that is checked.
+    bind: ClientBind,
 }
 
 impl DevManager {
     pub fn new(project: ProjectLayout) -> Result<Self> {
         let state = RuntimeState::load(&project.state_file())?;
-        Ok(Self { project, state })
+        let bind = state.bind();
+        Ok(Self {
+            project,
+            state,
+            bind,
+        })
     }
 
     fn status_for(
@@ -84,23 +93,37 @@ impl DevManager {
     ) -> ComponentStatus {
         let record = self.state.record(component);
         let live = record.and_then(|r| inspector.identity(r.pid));
-        let serving = inspector.port_serving(component.health_port());
+        let serving =
+            inspector.serving(&component.health_host(&self.bind), component.health_port());
         classify(record, live.as_deref(), serving)
     }
 
     // ---- up ----
 
-    pub fn up(&mut self, runner: &dyn ProcessRunner, inspector: &dyn ProcessInspector) -> Result<()> {
+    pub fn up(
+        &mut self,
+        runner: &dyn ProcessRunner,
+        inspector: &dyn ProcessInspector,
+        bind: ClientBind,
+    ) -> Result<()> {
         self.project.ensure_dirs()?;
         self.state.database = ProjectLayout::DATABASE.to_string();
 
         let spacetime = self.status_for(Component::Spacetime, inspector);
+        // Under the RECORDED bind — "is a gateway of ours running, wherever it was put?".
+        self.check_bind_change(&self.status_for(Component::Gateway, inspector), &bind)?;
+        self.bind = bind;
+        self.state.client_host = self.bind.host();
+        // ...and now under the requested one, which is where anything we start must answer.
         let gateway = self.status_for(Component::Gateway, inspector);
-        if matches!(spacetime, ComponentStatus::Healthy | ComponentStatus::External)
-            && gateway == ComponentStatus::Healthy
+
+        if matches!(
+            spacetime,
+            ComponentStatus::Healthy | ComponentStatus::External
+        ) && gateway == ComponentStatus::Healthy
         {
             println!("dev stack already up — nothing to do.");
-            self.print_status(inspector);
+            self.print_status(runner, inspector);
             return Ok(());
         }
 
@@ -112,8 +135,37 @@ impl DevManager {
 
         self.state.save(&self.project.state_file())?;
         println!("✓ dev stack is up.");
-        self.print_status(inspector);
+        if let ClientBind::Lan(ip) = &self.bind {
+            println!(
+                "  LAN mode: clients on this network use realmlist {ip}. SpacetimeDB stays on \
+                 127.0.0.1 — only the logon and world ports are reachable from the LAN."
+            );
+        }
+        self.print_status(runner, inspector);
         Ok(())
+    }
+
+    /// A running gateway cannot change where it listens. Silently reporting "already up" for a
+    /// `--lan` request that a loopback gateway is serving would leave the contributor waiting for
+    /// a LAN connection that can never arrive — and the reverse would leave a LAN listener up
+    /// after a plain `dev up`.
+    fn check_bind_change(&self, gateway: &ComponentStatus, wanted: &ClientBind) -> Result<()> {
+        if !matches!(
+            gateway,
+            ComponentStatus::Healthy | ComponentStatus::Starting
+        ) || &self.bind == wanted
+        {
+            return Ok(());
+        }
+        Err(Error::Process(format!(
+            "the running gateway is bound to {} and a running process cannot be rebound; \
+             `lyracore dev down` first, then start it the way you want ({}).",
+            ProjectLayout::world_bind(&self.bind),
+            match wanted {
+                ClientBind::Loopback => "lyracore dev up".to_string(),
+                ClientBind::Lan(ip) => format!("lyracore dev up --lan {ip}"),
+            }
+        )))
     }
 
     fn ensure_spacetime(
@@ -140,7 +192,10 @@ impl DevManager {
             _ => {}
         }
 
-        println!("· starting SpacetimeDB on {}...", ProjectLayout::stdb_listen());
+        println!(
+            "· starting SpacetimeDB on {}...",
+            ProjectLayout::stdb_listen()
+        );
         let cmd = CommandSpec::new("spacetime")
             .arg("start")
             .arg("--listen-addr")
@@ -201,7 +256,10 @@ impl DevManager {
         inspector: &dyn ProcessInspector,
         current: &ComponentStatus,
     ) -> Result<()> {
-        if matches!(current, ComponentStatus::Healthy | ComponentStatus::Starting) {
+        if matches!(
+            current,
+            ComponentStatus::Healthy | ComponentStatus::Starting
+        ) {
             println!("· gateway already running — reusing it.");
             return Ok(());
         }
@@ -215,8 +273,12 @@ impl DevManager {
                 ProjectLayout::WORLD_PORT
             )));
         }
-        println!("· starting the gateway on {}...", ProjectLayout::world_bind());
-        let record = self.spawn_recorded(Component::Gateway, &gateway_command(&self.project), runner, inspector)?;
+        println!(
+            "· starting the gateway on {}...",
+            ProjectLayout::world_bind(&self.bind)
+        );
+        let command = gateway_command(&self.project, &self.bind);
+        let record = self.spawn_recorded(Component::Gateway, &command, runner, inspector)?;
         self.state.set(Component::Gateway, Some(record));
         self.wait_for_port(Component::Gateway, inspector)?;
         Ok(())
@@ -241,14 +303,11 @@ impl DevManager {
         Ok(ProcessRecord { pid, identity })
     }
 
-    fn wait_for_port(
-        &self,
-        component: Component,
-        inspector: &dyn ProcessInspector,
-    ) -> Result<()> {
+    fn wait_for_port(&self, component: Component, inspector: &dyn ProcessInspector) -> Result<()> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
+        let host = component.health_host(&self.bind);
         while Instant::now() < deadline {
-            if inspector.port_serving(component.health_port()) {
+            if inspector.serving(&host, component.health_port()) {
                 return Ok(());
             }
             // Died during startup — fail now rather than after the full timeout.
@@ -264,8 +323,9 @@ impl DevManager {
             sleep(Duration::from_millis(200));
         }
         Err(Error::Process(format!(
-            "{} did not answer on port {} within {}s; see {}",
+            "{} did not answer on {}:{} within {}s; see {}",
             component.as_str(),
+            host,
             component.health_port(),
             STARTUP_TIMEOUT.as_secs(),
             self.project.log_file(component).display()
@@ -274,34 +334,126 @@ impl DevManager {
 
     // ---- status ----
 
-    pub fn status(&self, inspector: &dyn ProcessInspector) -> Result<()> {
-        self.print_status(inspector);
+    pub fn status(
+        &self,
+        runner: &dyn ProcessRunner,
+        inspector: &dyn ProcessInspector,
+    ) -> Result<()> {
+        self.print_status(runner, inspector);
         Ok(())
     }
 
-    fn print_status(&self, inspector: &dyn ProcessInspector) {
-        println!("database: {}", ProjectLayout::DATABASE);
+    fn print_status(&self, runner: &dyn ProcessRunner, inspector: &dyn ProcessInspector) {
+        let spacetime = self.status_for(Component::Spacetime, inspector);
         for component in Component::ALL {
             let record = self.state.record(component);
             let pid = record.map(|r| r.pid);
+            let endpoint = format!(
+                "{}:{}",
+                component.health_host(&self.bind),
+                component.health_port()
+            );
             let line = match self.status_for(component, inspector) {
                 ComponentStatus::Stopped => "stopped".to_string(),
                 ComponentStatus::Starting => format!(
-                    "starting  (PID {}, not yet answering on {})",
+                    "starting  (PID {}, not yet answering on {endpoint})",
                     pid.unwrap_or(0),
-                    component.health_port()
                 ),
                 ComponentStatus::Healthy => {
-                    format!("healthy   (PID {}, port {})", pid.unwrap_or(0), component.health_port())
+                    format!("healthy   (PID {}, {endpoint})", pid.unwrap_or(0))
                 }
                 ComponentStatus::Unhealthy(why) => format!("unhealthy ({why})"),
-                ComponentStatus::External => format!(
-                    "external  (port {} answers; not started by this CLI)",
-                    component.health_port()
-                ),
+                ComponentStatus::External => {
+                    format!("external  ({endpoint} answers; not started by this CLI)")
+                }
             };
             println!("  {:<10} {}", component.as_str(), line);
         }
+        // The third thing a component can be wrong about: both processes alive, and the database
+        // they are supposed to be serving never published (or published to another node). Ports
+        // and PIDs both look perfect in that state.
+        println!(
+            "  {:<10} {}",
+            "database",
+            self.database_health(runner, &spacetime)
+        );
+        if let ClientBind::Lan(ip) = &self.bind {
+            println!("  {:<10} LAN — clients connect to realmlist {ip}", "bind");
+        }
+    }
+
+    /// Ask the node about the fixture database itself. `describe` reads the published schema: it
+    /// proves the database exists on the node the gateway is pointed at, and it reads no rows, so
+    /// it cannot be confused by row-level visibility.
+    fn database_health(&self, runner: &dyn ProcessRunner, spacetime: &ComponentStatus) -> String {
+        let database = ProjectLayout::DATABASE;
+        if matches!(
+            spacetime,
+            ComponentStatus::Stopped | ComponentStatus::Unhealthy(_)
+        ) {
+            return format!("{database} (not checked — SpacetimeDB is not serving)");
+        }
+        match runner.run_and_wait(&describe_command()) {
+            Ok(_) => format!("{database} published on {}", ProjectLayout::stdb_uri()),
+            Err(e) => format!(
+                "{database} UNREACHABLE on {} ({e}) — run `lyracore dev up` to publish it",
+                ProjectLayout::stdb_uri()
+            ),
+        }
+    }
+
+    // ---- smoke ----
+
+    /// Hand off to the pinned wire harness's generic login smoke (#246): logon → world handshake →
+    /// character enumerate → enter world, against the running fixture.
+    ///
+    /// This CLI deliberately owns none of that. The harness is a separate, server-agnostic
+    /// repository pinned by `.wire-harness-rev`, and the checkout's own
+    /// `adapters/lyracore/run-suite.sh` is the seam that resolves it — including the
+    /// `LYRACORE_WIRE_HARNESS_DIR` override, which reaches it through the inherited environment.
+    pub fn smoke(
+        &self,
+        runner: &dyn ProcessRunner,
+        inspector: &dyn ProcessInspector,
+    ) -> Result<()> {
+        let script = self.project.suite_script();
+        if !script.exists() {
+            return Err(Error::ProjectLayout(format!(
+                "{} is missing — this does not look like a full checkout",
+                ProjectLayout::SUITE_SCRIPT
+            )));
+        }
+        for component in Component::ALL {
+            match self.status_for(component, inspector) {
+                ComponentStatus::Healthy | ComponentStatus::External => {}
+                other => {
+                    return Err(Error::Process(format!(
+                        "{} is {} — `lyracore dev smoke` needs a running stack; run \
+                         `lyracore dev up` first",
+                        component.as_str(),
+                        match other {
+                            ComponentStatus::Stopped => "stopped".to_string(),
+                            ComponentStatus::Starting => "still starting".to_string(),
+                            ComponentStatus::Unhealthy(why) => format!("unhealthy ({why})"),
+                            _ => unreachable!("healthy and external are handled above"),
+                        }
+                    )))
+                }
+            }
+        }
+
+        println!("· running the pinned wire harness's login smoke...");
+        runner
+            .run_streaming(&smoke_command(&self.project, &self.bind))
+            .map_err(|e| {
+                Error::Process(format!(
+                "{e}\n  The smoke test signs in as the fixture account. If it failed to log in, \
+                 provision it first:\n    printf 'test123' | ./lyracore account create TEST \
+                 --password-stdin"
+            ))
+            })?;
+        println!("✓ smoke passed.");
+        Ok(())
     }
 
     // ---- logs ----
@@ -339,7 +491,10 @@ impl DevManager {
             match stop_action(record, live.as_deref()) {
                 StopAction::NothingRecorded => {}
                 StopAction::AlreadyGone(pid) => {
-                    println!("· {} PID {pid} is already gone — clearing it.", component.as_str());
+                    println!(
+                        "· {} PID {pid} is already gone — clearing it.",
+                        component.as_str()
+                    );
                     self.state.set(component, None);
                 }
                 StopAction::Stop(pid) => {
@@ -370,6 +525,12 @@ impl DevManager {
             }
         }
 
+        if self.state.record(Component::Gateway).is_none() {
+            // The bind belonged to that process. Leaving it recorded would make the next
+            // `dev up` refuse a mode change that nothing is holding any more.
+            self.state.client_host = String::new();
+            self.bind = ClientBind::Loopback;
+        }
         self.state.save(&self.project.state_file())?;
         match refusal {
             Some(error) => Err(error),
@@ -383,12 +544,18 @@ impl DevManager {
 
 /// The single-database fixture gateway. Only `LYRACORE_DATABASE` is configured, which — per
 /// `gateway/src/config.rs` — collapses routing to that one database.
-fn gateway_command(project: &ProjectLayout) -> CommandSpec {
+fn gateway_command(project: &ProjectLayout, bind: &ClientBind) -> CommandSpec {
     let mut cmd = CommandSpec::new(project.gateway_bin().to_string_lossy().to_string())
         .env("LYRACORE_DATABASE", ProjectLayout::DATABASE)
         .env("LYRACORE_SPACETIMEDB_URL", ProjectLayout::stdb_uri())
-        .env("LYRACORE_LOGON_BIND", ProjectLayout::logon_bind())
-        .env("LYRACORE_WORLD_BIND", ProjectLayout::world_bind())
+        .env("LYRACORE_LOGON_BIND", ProjectLayout::logon_bind(bind))
+        .env("LYRACORE_WORLD_BIND", ProjectLayout::world_bind(bind))
+        // The realm list is answered from the seeded `game_realm` row, which says 127.0.0.1 — a
+        // client that reached the logon tier over the LAN would be sent to its OWN loopback for
+        // the world tier. This override is what makes `--lan` a working realm rather than a
+        // working handshake. It is set in loopback mode too, so the advertised address is a
+        // property of how the CLI launched the gateway and not of a row someone may have edited.
+        .env("LYRACORE_REALM_ADDRESS", ProjectLayout::realm_address(bind))
         .env("LYRACORE_AOI", "1")
         .env("MALLOC_ARENA_MAX", "2")
         .env("RUST_LOG", "info");
@@ -396,6 +563,29 @@ fn gateway_command(project: &ProjectLayout) -> CommandSpec {
         cmd = cmd.env_remove(var);
     }
     cmd
+}
+
+/// The database-health probe: schema only, no rows, no writes.
+fn describe_command() -> CommandSpec {
+    CommandSpec::new("spacetime")
+        .arg("describe")
+        .arg("--json")
+        .arg("-s")
+        .arg(ProjectLayout::STDB_SERVER)
+        .arg(ProjectLayout::DATABASE)
+}
+
+/// `dev smoke` — the checkout's own harness seam, told which database and gateway this fixture is
+/// and (in LAN mode) which host to connect to. Everything below it belongs to the harness.
+fn smoke_command(project: &ProjectLayout, bind: &ClientBind) -> CommandSpec {
+    CommandSpec::new("bash")
+        .arg(project.suite_script().to_string_lossy().to_string())
+        .arg("--smoke")
+        .arg("--database")
+        .arg(ProjectLayout::DATABASE)
+        .arg("--gateway")
+        .arg(project.gateway_bin().to_string_lossy().to_string())
+        .env("WIRE_HOST", bind.host())
 }
 
 fn classify(
@@ -410,12 +600,12 @@ fn classify(
             "recorded PID {} is gone; run `lyracore dev down` then `lyracore dev up`",
             record.pid
         )),
-        (Some(record), Some(found)) if found != record.identity => ComponentStatus::Unhealthy(
-            format!(
+        (Some(record), Some(found)) if found != record.identity => {
+            ComponentStatus::Unhealthy(format!(
                 "PID {} has been reused by another process; run `lyracore dev down --forget`",
                 record.pid
-            ),
-        ),
+            ))
+        }
         (Some(_), Some(_)) if port_serving => ComponentStatus::Healthy,
         (Some(_), Some(_)) => ComponentStatus::Starting,
     }
@@ -437,7 +627,11 @@ mod tests {
     fn project(tmp: &TempDir) -> ProjectLayout {
         std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::create_dir_all(tmp.path().join("scripts")).unwrap();
-        std::fs::write(tmp.path().join(ProjectLayout::PUBLISH_SCRIPT), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            tmp.path().join(ProjectLayout::PUBLISH_SCRIPT),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
         ProjectLayout::from_root(tmp.path()).unwrap()
     }
 
@@ -445,7 +639,10 @@ mod tests {
 
     #[test]
     fn an_unrecorded_component_is_never_signalled() {
-        assert_eq!(stop_action(None, Some("anything")), StopAction::NothingRecorded);
+        assert_eq!(
+            stop_action(None, Some("anything")),
+            StopAction::NothingRecorded
+        );
     }
 
     #[test]
@@ -485,7 +682,9 @@ mod tests {
 
         let stack = FakeStack::new().with_process(42, "somebody-elses-vim");
 
-        let error = dev.down(&stack.runner(), &stack.inspector(), false).unwrap_err();
+        let error = dev
+            .down(&stack.runner(), &stack.inspector(), false)
+            .unwrap_err();
         assert!(matches!(error, Error::ForeignProcess { pid: 42, .. }));
         assert!(
             stack.terminated().is_empty(),
@@ -512,12 +711,16 @@ mod tests {
     fn down_stops_our_own_processes_gateway_first() {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
-        dev.state.set(Component::Spacetime, Some(record(10, "stdb")));
+        dev.state
+            .set(Component::Spacetime, Some(record(10, "stdb")));
         dev.state.set(Component::Gateway, Some(record(20, "gw")));
 
-        let stack = FakeStack::new().with_process(10, "stdb").with_process(20, "gw");
+        let stack = FakeStack::new()
+            .with_process(10, "stdb")
+            .with_process(20, "gw");
 
-        dev.down(&stack.runner(), &stack.inspector(), false).unwrap();
+        dev.down(&stack.runner(), &stack.inspector(), false)
+            .unwrap();
         assert_eq!(stack.terminated(), vec![20, 10]);
         assert!(dev.state.record(Component::Spacetime).is_none());
     }
@@ -531,14 +734,311 @@ mod tests {
         assert!(stack.terminated().is_empty());
     }
 
+    // ---- --lan ----
+
+    fn lan() -> ClientBind {
+        ClientBind::parse_lan("192.168.1.50").unwrap()
+    }
+
+    #[test]
+    fn lan_moves_only_the_client_facing_listeners() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+
+        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+
+        let gateway = gateway_command(&dev.project, &lan());
+        assert_eq!(
+            gateway.env_value("LYRACORE_LOGON_BIND"),
+            Some("192.168.1.50:3724")
+        );
+        assert_eq!(
+            gateway.env_value("LYRACORE_WORLD_BIND"),
+            Some("192.168.1.50:8085")
+        );
+        // The realm list must send the client to an address it can reach — the seeded
+        // `game_realm` row says 127.0.0.1, which is the client's OWN machine over the LAN.
+        assert_eq!(
+            gateway.env_value("LYRACORE_REALM_ADDRESS"),
+            Some("192.168.1.50:8085")
+        );
+        // The database is the whole reason this flag is narrow: it never leaves loopback.
+        assert_eq!(
+            gateway.env_value("LYRACORE_SPACETIMEDB_URL"),
+            Some("http://127.0.0.1:3000")
+        );
+        let started_stdb: Vec<String> = stack
+            .rendered()
+            .into_iter()
+            .filter(|r| r.contains("spacetime start"))
+            .collect();
+        assert_eq!(
+            started_stdb,
+            vec!["spacetime start --listen-addr 127.0.0.1:3000"]
+        );
+        assert!(
+            !stack.rendered().iter().any(|r| r.contains("192.168.1.50")),
+            "no LAN address may reach the database tier: {:?}",
+            stack.rendered()
+        );
+    }
+
+    #[test]
+    fn a_lan_gateway_is_health_checked_where_it_actually_listens() {
+        // The bug this exists for: probing 127.0.0.1:8085 for a gateway bound to the LAN address
+        // reports a perfectly healthy stack as "starting" forever.
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+
+        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+
+        assert_eq!(
+            dev.status_for(Component::Gateway, &stack.inspector()),
+            ComponentStatus::Healthy
+        );
+        assert!(
+            !stack
+                .inspector()
+                .serving("127.0.0.1", ProjectLayout::WORLD_PORT),
+            "the fake must model a LAN bind as not answering on loopback, or this proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_recorded_bind_survives_into_the_next_command() {
+        let tmp = TempDir::new().unwrap();
+        let layout_root = tmp.path().to_path_buf();
+        let stack = FakeStack::new();
+        {
+            let mut dev = DevManager::new(project(&tmp)).unwrap();
+            dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+        }
+        // A fresh process (`dev status`) reads state.json and must probe the LAN address.
+        let dev = DevManager::new(ProjectLayout::from_root(&layout_root).unwrap()).unwrap();
+        assert_eq!(dev.bind, lan());
+        assert_eq!(
+            dev.status_for(Component::Gateway, &stack.inspector()),
+            ComponentStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn a_running_gateway_is_never_silently_left_on_the_wrong_bind() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
+
+        // `dev up --lan` onto a running loopback stack: the old "already up — nothing to do" would
+        // report success for a LAN realm that is not listening on the LAN at all.
+        let error = dev
+            .up(&stack.runner(), &stack.inspector(), lan())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("dev down"),
+            "the refusal must say how to fix it: {error}"
+        );
+        assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE);
+
+        // ...and after `dev down` the same request is accepted.
+        dev.down(&stack.runner(), &stack.inspector(), false)
+            .unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+    }
+
+    #[test]
+    fn up_is_still_idempotent_in_lan_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+        let after_first: Vec<String> = stack.rendered();
+
+        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+        let added: Vec<String> = stack.rendered()[after_first.len()..].to_vec();
+        assert!(
+            added
+                .iter()
+                .all(|r| r == "spacetime describe --json -s local lyracore"),
+            "the second `up --lan` did more than report status: {added:?}"
+        );
+    }
+
+    // ---- smoke ----
+
+    fn project_with_suite(tmp: &TempDir) -> ProjectLayout {
+        let layout = project(tmp);
+        std::fs::create_dir_all(tmp.path().join("adapters/lyracore")).unwrap();
+        std::fs::write(tmp.path().join(ProjectLayout::SUITE_SCRIPT), "#!/bin/sh\n").unwrap();
+        layout
+    }
+
+    #[test]
+    fn smoke_hands_off_to_the_checkouts_pinned_harness_seam() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project_with_suite(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
+
+        dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
+
+        let smoke: Vec<CommandSpec> = stack
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Stream(spec) => Some(spec),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(smoke.len(), 1, "exactly one harness run: {smoke:?}");
+        let rendered = smoke[0].render();
+        assert!(
+            rendered.contains(ProjectLayout::SUITE_SCRIPT) && rendered.contains("--smoke"),
+            "smoke must go through the checkout's harness seam, not a client this CLI owns: \
+             {rendered}"
+        );
+        // The harness resolves the PIN itself (.wire-harness-rev) and honours
+        // LYRACORE_WIRE_HARNESS_DIR from the inherited environment — this CLI must not second-guess
+        // either, so it pins nothing and unsets nothing.
+        assert_eq!(smoke[0].env_value("LYRACORE_WIRE_HARNESS_DIR"), None);
+        assert!(!smoke[0].removes_env("LYRACORE_WIRE_HARNESS_DIR"));
+        assert_eq!(smoke[0].env_value("WIRE_HOST"), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn smoke_in_lan_mode_connects_to_the_lan_address() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project_with_suite(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+
+        dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
+        assert_eq!(
+            smoke_command(&dev.project, &dev.bind).env_value("WIRE_HOST"),
+            Some("192.168.1.50")
+        );
+    }
+
+    #[test]
+    fn smoke_refuses_a_stack_that_is_not_up_and_says_what_to_run() {
+        let tmp = TempDir::new().unwrap();
+        let dev = DevManager::new(project_with_suite(&tmp)).unwrap();
+        let stack = FakeStack::new();
+
+        let error = dev.smoke(&stack.runner(), &stack.inspector()).unwrap_err();
+        assert!(
+            error.to_string().contains("lyracore dev up"),
+            "must name the fix: {error}"
+        );
+        assert!(
+            stack.calls().is_empty(),
+            "nothing may be run against a stack that is not up"
+        );
+    }
+
+    #[test]
+    fn smoke_on_a_checkout_without_the_harness_seam_fails_cleanly() {
+        let tmp = TempDir::new().unwrap();
+        // `project()` writes the publish script but no adapters/ directory.
+        let dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        let error = dev.smoke(&stack.runner(), &stack.inspector()).unwrap_err();
+        assert!(error.to_string().contains(ProjectLayout::SUITE_SCRIPT));
+    }
+
+    #[test]
+    fn a_failing_smoke_points_at_the_fixture_account() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project_with_suite(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
+
+        let failing = FakeStack::new()
+            .with_process(4001, "x")
+            .fail_on("run-suite.sh", "logon failed");
+        // Reuse the running stack's view of the world, but a runner that fails the harness.
+        let error = dev
+            .smoke(&failing.runner(), &stack.inspector())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("account create TEST"),
+            "the most common smoke failure is an unprovisioned fixture account: {error}"
+        );
+    }
+
+    // ---- database health ----
+
+    #[test]
+    fn status_reports_the_database_not_just_the_processes() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
+
+        // Both processes are alive and both ports answer — the state in which an unpublished (or
+        // wrong-node) database is invisible to a PID-and-port check.
+        let healthy = dev.database_health(&stack.runner(), &ComponentStatus::Healthy);
+        assert!(healthy.contains(ProjectLayout::DATABASE), "{healthy}");
+        assert!(!healthy.contains("UNREACHABLE"), "{healthy}");
+
+        let broken = FakeStack::new().fail_on("describe", "database not found");
+        let unhealthy = dev.database_health(&broken.runner(), &ComponentStatus::Healthy);
+        assert!(unhealthy.contains("UNREACHABLE"), "{unhealthy}");
+        assert!(
+            unhealthy.contains("lyracore dev up"),
+            "must be actionable: {unhealthy}"
+        );
+    }
+
+    #[test]
+    fn the_database_probe_reads_schema_and_never_writes() {
+        let cmd = describe_command().render();
+        assert_eq!(cmd, "spacetime describe --json -s local lyracore");
+        for forbidden in [
+            "publish",
+            "delete",
+            "sql",
+            "call",
+            "-c",
+            "server set-default",
+        ] {
+            assert!(!cmd.contains(forbidden), "{cmd} must not {forbidden}");
+        }
+    }
+
+    #[test]
+    fn a_stopped_database_is_reported_as_unchecked_not_as_broken() {
+        let tmp = TempDir::new().unwrap();
+        let dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        let line = dev.database_health(&stack.runner(), &ComponentStatus::Stopped);
+        assert!(line.contains("not checked"), "{line}");
+        assert!(
+            stack.calls().is_empty(),
+            "no node to ask — the probe must not be attempted"
+        );
+    }
+
     // ---- the four status states ----
 
     #[test]
     fn status_distinguishes_all_four_states() {
         let ours = record(7, "ours");
         assert_eq!(classify(None, None, false), ComponentStatus::Stopped);
-        assert_eq!(classify(Some(&ours), Some("ours"), false), ComponentStatus::Starting);
-        assert_eq!(classify(Some(&ours), Some("ours"), true), ComponentStatus::Healthy);
+        assert_eq!(
+            classify(Some(&ours), Some("ours"), false),
+            ComponentStatus::Starting
+        );
+        assert_eq!(
+            classify(Some(&ours), Some("ours"), true),
+            ComponentStatus::Healthy
+        );
         assert!(matches!(
             classify(Some(&ours), None, false),
             ComponentStatus::Unhealthy(_)
@@ -556,7 +1056,10 @@ mod tests {
         let ComponentStatus::Unhealthy(why) = classify(Some(&ours), None, false) else {
             panic!("expected unhealthy");
         };
-        assert!(why.contains("lyracore dev"), "diagnostic must be actionable: {why}");
+        assert!(
+            why.contains("lyracore dev"),
+            "diagnostic must be actionable: {why}"
+        );
     }
 
     // ---- the fixture / safety contract ----
@@ -564,8 +1067,11 @@ mod tests {
     #[test]
     fn the_gateway_runs_against_exactly_one_database() {
         let tmp = TempDir::new().unwrap();
-        let cmd = gateway_command(&project(&tmp));
-        assert_eq!(cmd.env_value("LYRACORE_DATABASE"), Some(ProjectLayout::DATABASE));
+        let cmd = gateway_command(&project(&tmp), &ClientBind::Loopback);
+        assert_eq!(
+            cmd.env_value("LYRACORE_DATABASE"),
+            Some(ProjectLayout::DATABASE)
+        );
         for var in PRODUCTION_TOPOLOGY_VARS {
             assert_eq!(cmd.env_value(var), None, "{var} must not be set");
             assert!(
@@ -578,10 +1084,13 @@ mod tests {
     #[test]
     fn the_gateway_binds_loopback_only() {
         let tmp = TempDir::new().unwrap();
-        let cmd = gateway_command(&project(&tmp));
+        let cmd = gateway_command(&project(&tmp), &ClientBind::Loopback);
         for var in ["LYRACORE_LOGON_BIND", "LYRACORE_WORLD_BIND"] {
             let bind = cmd.env_value(var).unwrap();
-            assert!(bind.starts_with("127.0.0.1:"), "{var} must be loopback, got {bind}");
+            assert!(
+                bind.starts_with("127.0.0.1:"),
+                "{var} must be loopback, got {bind}"
+            );
         }
     }
 
@@ -591,17 +1100,24 @@ mod tests {
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         // Nothing running: `up` must start both, and spawning is what opens their ports.
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
 
         for rendered in stack.rendered() {
             let args: Vec<&str> = rendered.split_whitespace().collect();
-            assert!(!args.contains(&"-c"), "a -c wipe must never be rendered: {rendered}");
+            assert!(
+                !args.contains(&"-c"),
+                "a -c wipe must never be rendered: {rendered}"
+            );
             assert!(!args.contains(&"--clear-database"), "no wipe: {rendered}");
             assert!(
                 !rendered.contains("server set-default"),
                 "the selected server must never be changed: {rendered}"
             );
-            assert!(!rendered.contains("delete"), "no database deletion: {rendered}");
+            assert!(
+                !rendered.contains("delete"),
+                "no database deletion: {rendered}"
+            );
         }
     }
 
@@ -610,7 +1126,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
 
         let publishes: Vec<String> = stack
             .rendered()
@@ -618,7 +1135,12 @@ mod tests {
             .filter(|r| r.contains(ProjectLayout::PUBLISH_SCRIPT))
             .collect();
         assert_eq!(publishes.len(), 1, "exactly one publish: {publishes:?}");
-        for shard in ["spacetime-world-1", "spacetime-world-2", "spacetime-instances", "realm-core"] {
+        for shard in [
+            "spacetime-world-1",
+            "spacetime-world-2",
+            "spacetime-instances",
+            "realm-core",
+        ] {
             assert!(
                 !publishes[0].contains(shard),
                 "the fixture must not touch {shard}: {}",
@@ -627,7 +1149,10 @@ mod tests {
         }
         // And a bare `spacetime publish` never appears — only the authoritative wrapper.
         assert!(
-            !stack.rendered().iter().any(|r| r.starts_with("spacetime publish")),
+            !stack
+                .rendered()
+                .iter()
+                .any(|r| r.starts_with("spacetime publish")),
             "publishing must go through {}",
             ProjectLayout::PUBLISH_SCRIPT
         );
@@ -637,7 +1162,8 @@ mod tests {
     fn up_is_idempotent_when_everything_is_already_healthy() {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
-        dev.state.set(Component::Spacetime, Some(record(10, "stdb")));
+        dev.state
+            .set(Component::Spacetime, Some(record(10, "stdb")));
         dev.state.set(Component::Gateway, Some(record(20, "gw")));
 
         let stack = FakeStack::new()
@@ -646,12 +1172,16 @@ mod tests {
             .with_port(ProjectLayout::STDB_PORT)
             .with_port(ProjectLayout::WORLD_PORT);
 
-        dev.up(&stack.runner(), &stack.inspector()).unwrap();
-        assert!(
-            stack.calls().is_empty(),
-            "a healthy stack must not be restarted, republished, or re-claimed: {:?}",
-            stack.calls()
-        );
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
+        // The status report's read-only database probe is the ONE thing a second `up` may run.
+        // Nothing may be started, built, published or re-claimed.
+        for rendered in stack.rendered() {
+            assert_eq!(
+                rendered, "spacetime describe --json -s local lyracore",
+                "a healthy stack must not be restarted, rebuilt, republished or re-claimed"
+            );
+        }
     }
 
     #[test]
@@ -661,14 +1191,18 @@ mod tests {
         // Port 3000 answers, but no PID of ours owns it.
         let stack = FakeStack::new().with_port(ProjectLayout::STDB_PORT);
 
-        dev.up(&stack.runner(), &stack.inspector()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
 
         assert!(
             dev.state.record(Component::Spacetime).is_none(),
             "a pre-existing server must never be recorded as ours"
         );
         assert!(
-            !stack.rendered().iter().any(|r| r.contains("spacetime start")),
+            !stack
+                .rendered()
+                .iter()
+                .any(|r| r.contains("spacetime start")),
             "must not start a second node"
         );
     }
@@ -678,20 +1212,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         // SpacetimeDB is ours and healthy; the gateway died.
-        dev.state.set(Component::Spacetime, Some(record(10, "stdb")));
+        dev.state
+            .set(Component::Spacetime, Some(record(10, "stdb")));
 
         let stack = FakeStack::new()
             .with_process(10, "stdb")
             .with_port(ProjectLayout::STDB_PORT);
 
-        dev.up(&stack.runner(), &stack.inspector()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
 
         assert!(
-            !stack.rendered().iter().any(|r| r.contains("spacetime start")),
+            !stack
+                .rendered()
+                .iter()
+                .any(|r| r.contains("spacetime start")),
             "the healthy node must not be restarted"
         );
         assert!(
-            stack.calls().iter().any(|c| matches!(c, Call::Spawn { spec, .. }
+            stack
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Spawn { spec, .. }
                 if spec.render().contains("gateway"))),
             "the missing gateway must be started"
         );
@@ -708,13 +1250,20 @@ mod tests {
             .with_port(ProjectLayout::STDB_PORT)
             .with_port(ProjectLayout::WORLD_PORT);
 
-        let error = dev.up(&stack.runner(), &stack.inspector()).unwrap_err();
+        let error = dev
+            .up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap_err();
         assert!(
-            error.to_string().contains(&ProjectLayout::WORLD_PORT.to_string()),
+            error
+                .to_string()
+                .contains(&ProjectLayout::WORLD_PORT.to_string()),
             "the refusal must name the contended port: {error}"
         );
         assert!(
-            !stack.calls().iter().any(|c| matches!(c, Call::Spawn { .. })),
+            !stack
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Spawn { .. })),
             "nothing may be spawned against a foreign listener"
         );
         assert!(dev.state.record(Component::Gateway).is_none());

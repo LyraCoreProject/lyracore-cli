@@ -85,12 +85,69 @@ fn version_output(program: &str, args: &[&str]) -> Option<String> {
 pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
     vec![
         check_layout(layout),
-        check_tool("Rust", "rustc", "install Rust from https://rustup.rs/"),
-        check_tool("Cargo", "cargo", "Cargo ships with Rust — see https://rustup.rs/"),
+        check_rust(layout.as_ref().ok()),
+        check_tool(
+            "Cargo",
+            "cargo",
+            "Cargo ships with Rust — see https://rustup.rs/",
+        ),
         check_spacetime(),
         check_wasm_target(),
         check_ports(),
     ]
+}
+
+/// Read the checkout's declared minimum Rust version out of its workspace manifest.
+///
+/// The requirement is the project's, not this CLI's: hardcoding a number here would be a second
+/// place to forget to bump, and it would be wrong for every other checkout.
+pub fn required_rust(manifest: &str) -> Option<Version> {
+    let line = manifest
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("rust-version"))?;
+    let value = line.split('"').nth(1)?;
+    let mut parts = value.split('.').map(str::parse::<u32>);
+    // `rust-version` is legally two components ("1.93") as well as three.
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch))) => Some(Version(major, minor, patch)),
+        (Some(Ok(major)), Some(Ok(minor)), None) => Some(Version(major, minor, 0)),
+        _ => None,
+    }
+}
+
+fn check_rust(project: Option<&ProjectLayout>) -> Check {
+    let Some(text) = version_output("rustc", &["--version"]) else {
+        return Check::fail(
+            "Rust",
+            "`rustc` not found — install Rust from https://rustup.rs/",
+        );
+    };
+    let (Some(found), Some(required)) = (
+        parse_version(&text),
+        project
+            .and_then(|p| std::fs::read_to_string(p.root.join("Cargo.toml")).ok())
+            .as_deref()
+            .and_then(required_rust),
+    ) else {
+        // Either the banner or the manifest was unreadable. `rustc` exists, which is the
+        // launch-blocking half; report what we have rather than inventing a requirement.
+        return Check::pass("Rust", text.trim().to_string());
+    };
+
+    if found >= required {
+        return Check::pass("Rust", format!("{found} (requires {required})"));
+    }
+    // Genuinely launch-blocking: the workspace will not compile, so `dev up` cannot build the
+    // gateway or the module.
+    Check::fail(
+        "Rust",
+        format!(
+            "found {found}, but this checkout needs {required} — `rustup update` (the pinned \
+             toolchain in rust-toolchain.toml is installed automatically by any cargo command \
+             run inside the checkout, so this usually means rustup is not managing this rustc)"
+        ),
+    )
 }
 
 fn check_layout(layout: &Result<ProjectLayout>) -> Check {
@@ -214,7 +271,10 @@ mod tests {
             parse_version("spacetimedb tool version 2.5.0; spacetime-lib version 2.5.0"),
             Some(Version(2, 5, 0))
         );
-        assert_eq!(parse_version("rustc 1.80.1 (abc 2024-08-08)"), Some(Version(1, 80, 1)));
+        assert_eq!(
+            parse_version("rustc 1.80.1 (abc 2024-08-08)"),
+            Some(Version(1, 80, 1))
+        );
         assert_eq!(parse_version("no version here"), None);
     }
 
@@ -225,6 +285,30 @@ mod tests {
         assert!(Version(3, 0, 0) >= REQUIRED_SPACETIME);
         assert!(Version(2, 4, 9) < REQUIRED_SPACETIME);
         assert!(Version(1, 9, 9) < REQUIRED_SPACETIME);
+    }
+
+    #[test]
+    fn the_rust_requirement_is_read_from_the_checkout_not_hardcoded() {
+        assert_eq!(
+            required_rust("[workspace.package]\nrust-version = \"1.93.0\"\n"),
+            Some(Version(1, 93, 0))
+        );
+        // Two-component form, and a manifest that simply does not declare one.
+        assert_eq!(
+            required_rust("rust-version = \"1.85\"\n"),
+            Some(Version(1, 85, 0))
+        );
+        assert_eq!(required_rust("[package]\nname = \"x\"\n"), None);
+        assert_eq!(required_rust("rust-version = \"stable\"\n"), None);
+    }
+
+    #[test]
+    fn a_rustc_older_than_the_checkout_requires_is_launch_blocking() {
+        // The comparison itself, without depending on which rustc happens to be running the test.
+        assert!(Version(1, 92, 0) < Version(1, 93, 0));
+        assert!(Version(1, 93, 0) >= Version(1, 93, 0));
+        // And the real check never blocks on a checkout it could not read a requirement from.
+        assert!(!check_rust(None).is_blocking(), "rustc is present in CI");
     }
 
     #[test]
