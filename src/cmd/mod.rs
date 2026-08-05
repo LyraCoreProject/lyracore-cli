@@ -5,7 +5,7 @@ pub mod import;
 pub mod preflight;
 pub mod publish;
 
-use crate::project::{ClientBind, Component};
+use crate::project::{ClientBind, Component, Topology};
 use crate::{Error, Result};
 use account::PasswordSource;
 use import::ImportOptions;
@@ -20,10 +20,14 @@ USAGE:
                                                the fixture database). Takes database NAMES;
                                                every flag is refused, including the -c wipe
   lyracore publish --skip-preflight [DB ...]   publish without the gate (say why in the PR)
-  lyracore dev up                              start (or reuse) the local single-realm stack
+  lyracore dev up                              start (or reuse) the local realm: four databases
+                                               with a live shard seam across Elwynn
+  lyracore dev up --single                     the one-database fixture instead — no seam, no
+                                               realm-core, every topology variable unset
   lyracore dev up --lan <IP>                   also serve clients on this machine's private-LAN
                                                address (SpacetimeDB stays on loopback)
-  lyracore dev status                          report each component's state
+  lyracore dev status                          report each component's state, and each
+                                               database's own published/connected verdict
   lyracore dev logs [spacetime|gateway]        show a component's log file
   lyracore dev smoke                           run the pinned wire harness's login smoke
   lyracore dev down [--forget]                 stop the processes this CLI started
@@ -50,6 +54,7 @@ pub enum Command {
     },
     DevUp {
         bind: ClientBind,
+        topology: Topology,
     },
     DevStatus,
     DevLogs(Option<Component>),
@@ -93,20 +98,7 @@ impl Command {
                 })
             }
 
-            ["dev", "up"] => Ok(Command::DevUp {
-                bind: ClientBind::Loopback,
-            }),
-            ["dev", "up", "--lan", ip] => {
-                ClientBind::parse_lan(ip).map(|bind| Command::DevUp { bind })
-            }
-            ["dev", "up", "--lan"] => Err(Error::Usage(
-                "`dev up --lan` needs this machine's private-LAN IPv4 address, e.g. \
-                 `dev up --lan 192.168.1.50`"
-                    .to_string(),
-            )),
-            ["dev", "up", other, ..] => Err(Error::Usage(format!(
-                "unknown `dev up` option '{other}' — the only one is --lan <IP>"
-            ))),
+            ["dev", "up", rest @ ..] => parse_dev_up(rest),
             ["dev", "status"] => Ok(Command::DevStatus),
             ["dev", "smoke"] => Ok(Command::DevSmoke),
             ["dev", "down"] => Ok(Command::DevDown { forget: false }),
@@ -149,6 +141,44 @@ impl Command {
             [other, ..] => Err(Error::Usage(format!("unknown command '{other}'"))),
         }
     }
+}
+
+/// `dev up [--single] [--lan <IP>]`, in either order.
+///
+/// The two options are orthogonal — `--single` chooses how many databases, `--lan` chooses who can
+/// reach the two client-facing ports — so refusing to combine them would only mean a contributor
+/// debugging a seam on a LAN client had to go back to hand-rolling the launch.
+fn parse_dev_up(args: &[&str]) -> Result<Command> {
+    let mut bind = ClientBind::Loopback;
+    let mut topology = Topology::Sharded;
+    let mut rest = args;
+    while let Some((head, tail)) = rest.split_first() {
+        match *head {
+            "--single" => {
+                topology = Topology::Single;
+                rest = tail;
+            }
+            "--lan" => match tail.split_first() {
+                Some((ip, after)) if !ip.starts_with('-') => {
+                    bind = ClientBind::parse_lan(ip)?;
+                    rest = after;
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "`dev up --lan` needs this machine's private-LAN IPv4 address, e.g. \
+                         `dev up --lan 192.168.1.50`"
+                            .to_string(),
+                    ))
+                }
+            },
+            other => {
+                return Err(Error::Usage(format!(
+                    "unknown `dev up` option '{other}' — the only ones are --single and --lan <IP>"
+                )))
+            }
+        }
+    }
+    Ok(Command::DevUp { bind, topology })
 }
 
 fn parse_import(args: &[&str]) -> Result<Command> {
@@ -205,7 +235,8 @@ mod tests {
         assert_eq!(
             parse("dev up").unwrap(),
             Command::DevUp {
-                bind: ClientBind::Loopback
+                bind: ClientBind::Loopback,
+                topology: Topology::Sharded,
             }
         );
         assert_eq!(parse("dev status").unwrap(), Command::DevStatus);
@@ -258,11 +289,12 @@ mod tests {
     }
 
     #[test]
-    fn lan_is_the_only_option_dev_up_takes_and_it_needs_a_private_address() {
+    fn lan_needs_a_private_address_and_no_other_option_is_invented() {
         assert_eq!(
             parse("dev up --lan 192.168.1.50").unwrap(),
             Command::DevUp {
-                bind: ClientBind::parse_lan("192.168.1.50").unwrap()
+                bind: ClientBind::parse_lan("192.168.1.50").unwrap(),
+                topology: Topology::Sharded,
             }
         );
         for line in [
@@ -270,7 +302,9 @@ mod tests {
             "dev up --lan 8.8.8.8", // public
             "dev up --lan 0.0.0.0", // every interface
             "dev up --public",      // not a flag this CLI has
+            "dev up --sharded",     // sharded is the default, not a flag
             "dev up --lan 10.0.0.1 extra",
+            "dev up --lan --single", // an option is not an address
         ] {
             let error = parse(line).unwrap_err();
             assert_eq!(
@@ -279,6 +313,36 @@ mod tests {
                 "`{line}` should be a usage error"
             );
         }
+    }
+
+    #[test]
+    fn single_selects_the_one_database_fixture_and_composes_with_lan() {
+        assert_eq!(
+            parse("dev up --single").unwrap(),
+            Command::DevUp {
+                bind: ClientBind::Loopback,
+                topology: Topology::Single,
+            }
+        );
+        // Orthogonal options: how many databases, and who can reach the client-facing ports.
+        for line in [
+            "dev up --single --lan 10.0.0.7",
+            "dev up --lan 10.0.0.7 --single",
+        ] {
+            assert_eq!(
+                parse(line).unwrap(),
+                Command::DevUp {
+                    bind: ClientBind::parse_lan("10.0.0.7").unwrap(),
+                    topology: Topology::Single,
+                },
+                "`{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_text_documents_the_topology_flag() {
+        assert!(USAGE.contains("--single"), "{USAGE}");
     }
 
     #[test]

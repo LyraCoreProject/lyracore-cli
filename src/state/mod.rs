@@ -3,7 +3,7 @@
 //! Only processes this CLI started are recorded here. A SpacetimeDB the contributor was already
 //! running is used but never claimed, so `dev down` cannot stop something it did not start.
 
-use crate::project::{ClientBind, Component};
+use crate::project::{ClientBind, Component, Topology};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -22,9 +22,18 @@ pub struct RuntimeState {
     pub spacetime: Option<ProcessRecord>,
     #[serde(default)]
     pub gateway: Option<ProcessRecord>,
-    /// Recorded for diagnostics and so a renamed database (#241) is visible in stale state.
+    /// The DEFAULT WORLD shard. Recorded for diagnostics and so a renamed database (#241) is
+    /// visible in stale state; the rest of the topology is derived from `topology` below.
     #[serde(default)]
     pub database: String,
+    /// Which topology the running stack was brought up as (#11) — `"sharded"` or `"single"`.
+    ///
+    /// Recorded for the same reason `client_host` is: `status`, `logs` and `account create` must
+    /// describe the stack that is actually running, not the one the default would build today. A
+    /// pre-#11 state file has no field, which reads back as the default (see
+    /// [`Topology::from_recorded`]).
+    #[serde(default)]
+    pub topology: String,
     /// The host the running gateway's client-facing listeners were bound to by the `dev up` that
     /// started it. Absent or unparseable = loopback, which is also what every pre-`--lan` state
     /// file reads back as.
@@ -60,6 +69,11 @@ impl RuntimeState {
     /// How the recorded stack's client-facing listeners are bound.
     pub fn bind(&self) -> ClientBind {
         ClientBind::from_recorded(&self.client_host)
+    }
+
+    /// Which database topology the recorded stack was brought up as.
+    pub fn topology(&self) -> Topology {
+        Topology::from_recorded(&self.topology)
     }
 
     pub fn set(&mut self, component: Component, record: Option<ProcessRecord>) {
@@ -108,6 +122,23 @@ mod tests {
         let state = RuntimeState::load(&path).unwrap();
         assert_eq!(state.record(Component::Gateway).unwrap().pid, 42);
         assert_eq!(state.bind(), ClientBind::Loopback);
+        // ...and it also predates #11's topology field, which reads back as the new default.
+        assert_eq!(state.topology(), Topology::Sharded);
+    }
+
+    #[test]
+    fn a_recorded_topology_survives_a_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let state = RuntimeState {
+            topology: Topology::Single.as_str().to_string(),
+            ..Default::default()
+        };
+        state.save(&path).unwrap();
+        assert_eq!(
+            RuntimeState::load(&path).unwrap().topology(),
+            Topology::Single
+        );
     }
 
     #[test]

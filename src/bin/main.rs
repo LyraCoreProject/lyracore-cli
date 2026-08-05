@@ -48,9 +48,10 @@ fn run(args: &[String]) -> Result<i32> {
             skip_preflight,
         )
         .map(|_| EXIT_OK),
-        Command::DevUp { bind } => {
+        Command::DevUp { bind, topology } => {
             let mut dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
-            dev.up(&runner, &inspector, &http, bind).map(|_| EXIT_OK)
+            dev.up(&runner, &inspector, &http, bind, topology)
+                .map(|_| EXIT_OK)
         }
         Command::DevStatus => {
             let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;

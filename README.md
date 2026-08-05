@@ -2,12 +2,12 @@
 
 # lyracore-cli
 
-Source-first developer CLI for LyraCore. It drives the local, single-database developer fixture:
-start SpacetimeDB, publish the module, claim the operator identity, run the gateway, and provision
+Source-first developer CLI for LyraCore. It drives the local developer fixture: start SpacetimeDB,
+publish the module, claim the operator identity, wire the shard seam, run the gateway, and provision
 accounts.
 
-It deliberately does **not** manage production realms, sharding, backups, system services, or the
-installation of Rust and SpacetimeDB.
+It deliberately does **not** manage production realms, backups, system services, or the installation
+of Rust and SpacetimeDB.
 
 ## Commands
 
@@ -15,7 +15,7 @@ installation of Rust and SpacetimeDB.
 lyracore doctor
 lyracore preflight
 lyracore publish [DATABASE ...] [--skip-preflight]
-lyracore dev up [--lan <IP>]
+lyracore dev up [--single] [--lan <IP>]
 lyracore dev status
 lyracore dev logs [spacetime|gateway]
 lyracore dev smoke
@@ -74,18 +74,87 @@ remembered: a schema change needs all of them, and the gateway reports a shard l
 
 ## What `dev up` does
 
+`dev up` brings up a **sharded** realm by default — four databases with a live shard seam across
+Elwynn, so the first thing a new contributor walks across is a real shard crossing:
+
+| database | role | wired by |
+| --- | --- | --- |
+| `lyracore` | default world shard. Holds the seam menu, and region `0:1` — Northshire Valley | `LYRACORE_DATABASE` |
+| `lyracore-elwynn` | map-0 region shard: region `0:2`, the rest of Elwynn | `LYRACORE_REGION_SHARDS` |
+| `lyracore-kalimdor` | map 1 | `LYRACORE_SHARD_MAP="1:*=lyracore-kalimdor"` |
+| `lyracore-realm` | realm-core: accounts, sessions, the character→shard index, the region assignments | `LYRACORE_REALM_CORE` |
+
+Realm-core is **mandatory**, not optional: a gateway serving more than one world shard with no
+realm-core refuses to serve them. And `lyracore` is first in every list this CLI builds, because the
+gateway reads the seam menu from the *first* entry of its own world-shard list — anything sorting
+ahead of it switches region routing off, silently.
+
+The steps:
+
 1. Starts SpacetimeDB on `127.0.0.1:3000`, **or reuses one already listening there.** A node the CLI
    did not start is never recorded and never stopped by `dev down`.
 2. Builds the gateway.
-3. Runs `preflight`, then publishes **only** the seeded fixture database, through the same internal
-   command `lyracore publish` uses — which is what guarantees `--features=debug_reducers`, `--yes`,
+3. Runs `preflight`, then publishes each database in turn, through the same internal command
+   `lyracore publish` uses — which is what guarantees `--features=debug_reducers`, `--yes`,
    `-s local`, and the unreachability of a `-c` wipe. No path here renders a `spacetime publish`
-   any other way, clears a database, or re-selects the SpacetimeDB server.
+   any other way, clears a database, or re-selects the SpacetimeDB server. A failure part way
+   through names the databases that *did* land, because a half-published realm presents as an
+   unrelated mid-session hang rather than a loud "no such table".
 4. Resolves the coordinator credential (see below), minting one from the local node if this host has
    no SpacetimeDB login.
-5. Calls `claim_operator` **as that identity** (idempotent for the same identity, so repeating
-   `dev up` is not an error).
-6. Starts the gateway with the same credential, bound to loopback.
+5. Calls `claim_operator` **as that identity**, on every database (idempotent for the same identity,
+   so repeating `dev up` is not an error). A shard claimed by nobody, or by a different identity,
+   refuses the gateway's own writes — and nothing fails until the first write that shard has to
+   serve.
+6. Wires the seam: `import_map_regions` on both world shards with the bytes of the server checkout's
+   `content/regions/fixture.regions`, then `set_region_assignment` on realm-core for both regions.
+   Both reducers are operator-gated, so both go over the same bearer-token HTTP path as
+   `claim_operator` — never `spacetime call`, whose identity differs from the one `dev up` claimed
+   with.
+7. Starts the gateway with the same credential, bound to loopback.
+8. **Reads the realised topology back out of the gateway's own log** and fails if it came up short.
+   See below.
+
+The seam geometry is not in this CLI and must not be. `content/regions/fixture.regions` is content
+data owned by the server checkout; `dev up` ships that file's bytes to the reducer and nothing else.
+A checkout that predates it (older server, newer CLI) gets a printed skip and a coherent
+single-region realm — never a half-wired one.
+
+### The silent collapse, and what is done about it
+
+A gateway's response to bad topology configuration is not an error. It is **collapse to one
+database**: a malformed shard-map rule is logged and dropped, an absent — or default-equal —
+`LYRACORE_REALM_CORE` reads as "unconfigured", an empty `LYRACORE_SHARD_MAP` still counts as set, and
+a database that never published is "unreachable, falling back to the default". The result starts,
+binds, answers its health probe, passes every PID-and-port check, and serves one database while the
+others sit published, claimed and unused.
+
+So `dev up` does not stop at exporting the right strings:
+
+* it reads `coordinator connected to shard <db>` back out of `.lyracore/logs/gateway.log` — the
+  gateway awaits every one of those connections *before* it binds its listeners, so a gateway
+  answering its port has already written all of them — and **fails, naming the missing databases**,
+  if the realm came up short. The gateway is left running and recorded, so `dev down` still stops
+  it;
+* a gateway build that does not log that line at all is reported as *unverified* rather than as
+  collapsed;
+* `dev status` reports each database separately: published or unreachable, connected or never
+  reached.
+
+### `--single` — one database, on purpose
+
+`dev up --single` is the pre-sharding fixture, unchanged: one database, no seam, no realm-core, and
+`LYRACORE_SHARD_MAP`, `LYRACORE_SHARD_MAP_FILE`, `LYRACORE_REALM_CORE` and `LYRACORE_REGION_SHARDS`
+all *actively unset* for the child gateway — so a contributor who has the production recipe exported
+in their shell still gets the fixture, not a multi-database gateway pointed at databases this CLI
+never published. An unconfigured shard map collapses every lookup to `LYRACORE_DATABASE`, making the
+result equivalent to a single-database build.
+
+The two options compose: `dev up --single --lan 192.168.1.50` is a one-database realm on the LAN.
+
+A running gateway cannot be re-sharded any more than it can be rebound — its shard set is read from
+the environment once, at startup. Switching modes is refused with the `dev down` to run first, rather
+than reporting "already up" for a realm with the wrong number of databases in it.
 
 ### The coordinator credential
 
@@ -171,14 +240,12 @@ It signs in as the fixture account, so provision that first:
 printf 'test123' | lyracore account create TEST --password-stdin
 ```
 
-### One database, on purpose
+### Not the production topology
 
-This fixture is a **single-database** stack. The multi-database production topology is not
-reproduced here, and `LYRACORE_SHARD_MAP`, `LYRACORE_SHARD_MAP_FILE`, `LYRACORE_REALM_CORE`, and `LYRACORE_REGION_SHARDS`
-are *actively unset* for the child gateway — so a contributor who has the production recipe exported
-in their shell still gets the fixture, not a multi-database gateway pointed at databases this CLI
-never published. An unconfigured shard map collapses every lookup to `LYRACORE_DATABASE`, making the result
-equivalent to a single-database build.
+The sharded fixture is not the production recipe in the server repo's `docs/danger-zones.md` §3 —
+different databases, a different seam, loopback only, and every topology variable decided by this
+CLI rather than inherited from your shell. Nothing here reads one out of the environment in either
+mode.
 
 A gateway already serving the world port is **refused, never adopted** — its build and topology are
 unknown, and the health probe would otherwise pass against someone else's listener.
@@ -189,10 +256,15 @@ A bare PID is not an identity: PIDs get reused, and signalling a recycled one ki
 process. Each recorded PID is stored with its process start time and command name, read via POSIX
 `ps` — no `/proc`, no `grep -P`, no GNU-only flags, so Linux and macOS behave the same.
 
-`dev status` checks all three things that can be wrong independently: the recorded PID is still the
-process the CLI started, its endpoint answers (on the LAN address, in LAN mode), and the fixture
-database is actually published on the node — a stack whose PIDs and ports are both perfect is still
-broken if nothing was ever published to it.
+`dev status` checks the things that can be wrong independently: the recorded PID is still the
+process the CLI started, its endpoint answers (on the LAN address, in LAN mode), and — **per
+database** — that it is published on the node and that the gateway actually connected to it. A stack
+whose PIDs and ports are both perfect is still broken if a database was never published, and still
+half-broken if one was published and never reached; in a sharded realm the database that *is* fine
+is invariably the default one, which is why the report is per-database rather than one line.
+
+Which databases it reports is read from `state.json`, so it describes the realm that is actually
+running rather than the one today's default would build.
 
 `dev down` compares that identity before signalling anything. If the PID now belongs to something
 else it **refuses and kills nothing**, directing you to `dev down --forget`, which drops the record
@@ -208,6 +280,12 @@ zeroized buffer and is absent from rendered commands, logs, error messages, and 
 ```bash
 printf 'hunter2' | lyracore account create TEST --password-stdin
 ```
+
+On a sharded realm the account is written **twice** — once on the world shard, whose account id owns
+the characters, and once on realm-core, which is where the logon server answers the SRP6 challenge
+from. `account create` reads the running realm's topology out of `state.json` and hands the
+provisioning child the same `LYRACORE_REALM_CORE` the gateway is using. Without it the account
+exists, the command reports success, and the login is refused forever.
 
 ## Project layout coupling
 
