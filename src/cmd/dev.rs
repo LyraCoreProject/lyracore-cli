@@ -4,9 +4,11 @@
 //! `docs/danger-zones.md` §3 is deliberately not reproduced here, and the variables that would
 //! enable it are actively unset for the child gateway.
 
+use crate::http::HttpClient;
 use crate::proc::{CommandSpec, ProcessInspector, ProcessRunner};
 use crate::project::{ClientBind, Component, ProjectLayout};
 use crate::state::{ProcessRecord, RuntimeState};
+use crate::token::Credential;
 use crate::{Error, Result};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -104,6 +106,7 @@ impl DevManager {
         &mut self,
         runner: &dyn ProcessRunner,
         inspector: &dyn ProcessInspector,
+        http: &dyn HttpClient,
         bind: ClientBind,
     ) -> Result<()> {
         self.project.ensure_dirs()?;
@@ -130,8 +133,22 @@ impl DevManager {
         self.ensure_spacetime(runner, inspector, &spacetime)?;
         self.build_gateway(runner)?;
         self.publish(runner)?;
-        self.claim_operator(runner)?;
-        self.ensure_gateway(runner, inspector, &gateway)?;
+        // ONE credential for the rest of this run, resolved here rather than inside each step
+        // that needs it: `claim_operator` and the gateway MUST be the same identity, or the
+        // module's `require_operator` refuses every provision the gateway makes.
+        //
+        // After the publish, because on a fresh host `publish` is the step that can leave behind a
+        // `spacetime` login there was none of a minute ago — and reusing that is better than
+        // minting a second identity. Before the gateway spawn, because a credential we cannot get
+        // must be a clear refusal rather than a gateway that starts, warns, and dies 15s later.
+        let credential = crate::token::resolve_or_mint(
+            runner,
+            http,
+            &self.project.token_file(),
+            &ProjectLayout::stdb_uri(),
+        )?;
+        self.claim_operator(runner, http, &credential)?;
+        self.ensure_gateway(runner, inspector, &gateway, &credential)?;
 
         self.state.save(&self.project.state_file())?;
         println!("✓ dev stack is up.");
@@ -236,17 +253,37 @@ impl DevManager {
         Ok(())
     }
 
-    fn claim_operator(&self, runner: &dyn ProcessRunner) -> Result<()> {
+    /// Claim the operator AS the identity the gateway is about to use.
+    ///
+    /// `claim_operator` is TOFU on `ctx.sender()`: idempotent for the same identity, refused for a
+    /// different one. So the caller matters more than the call, and it differs by credential:
+    ///
+    /// - a `spacetime login` token IS the `spacetime` CLI's identity, so the proven `spacetime
+    ///   call` path is kept exactly as it was;
+    /// - a server-issued token is an identity the `spacetime` CLI knows nothing about. Shelling
+    ///   out would claim the operator for the CLI's identity instead, and the gateway — running as
+    ///   the minted one — would then be refused by its own database. It is called with the token.
+    fn claim_operator(
+        &self,
+        runner: &dyn ProcessRunner,
+        http: &dyn HttpClient,
+        credential: &Credential,
+    ) -> Result<()> {
         println!("· claiming the operator identity...");
-        // Idempotent for the same identity, so repeated `dev up` is not an error.
-        runner.run_and_wait(
-            &CommandSpec::new("spacetime")
-                .arg("call")
-                .arg("-s")
-                .arg(ProjectLayout::STDB_SERVER)
-                .arg(ProjectLayout::DATABASE)
-                .arg("claim_operator"),
-        )?;
+        if !credential.is_server_issued() {
+            runner.run_and_wait(&claim_command())?;
+            return Ok(());
+        }
+        http.post_json(&claim_url(), Some(credential.token()), "[]")
+            .map_err(|e| {
+                Error::Process(format!(
+                    "{e}\n  `claim_operator` was called with the server-issued identity in {}. A \
+                     refusal there almost always means this database was claimed by a DIFFERENT \
+                     identity (an earlier `spacetime login`, or another checkout): delete that \
+                     file and re-run `lyracore dev up` to fall back to that login.",
+                    self.project.token_file().display()
+                ))
+            })?;
         Ok(())
     }
 
@@ -255,6 +292,7 @@ impl DevManager {
         runner: &dyn ProcessRunner,
         inspector: &dyn ProcessInspector,
         current: &ComponentStatus,
+        credential: &Credential,
     ) -> Result<()> {
         if matches!(
             current,
@@ -273,16 +311,11 @@ impl DevManager {
                 ProjectLayout::WORLD_PORT
             )));
         }
-        // Resolved HERE, not in `up`: a stack that is already running needs no credential, and a
-        // logged-out CLI should not be an error for a command that then does nothing. It is
-        // resolved BEFORE the spawn so a missing token is a clear refusal rather than a gateway
-        // that starts, warns, and dies 15s later on a subscription timeout.
-        let token = crate::token::resolve(runner)?;
         println!(
             "· starting the gateway on {}...",
             ProjectLayout::world_bind(&self.bind)
         );
-        let command = gateway_command(&self.project, &self.bind, &token);
+        let command = gateway_command(&self.project, &self.bind, credential.token());
         let record = self.spawn_recorded(Component::Gateway, &command, runner, inspector)?;
         self.state.set(Component::Gateway, Some(record));
         self.wait_for_port(Component::Gateway, inspector)?;
@@ -575,6 +608,26 @@ fn gateway_command(project: &ProjectLayout, bind: &ClientBind, token: &str) -> C
     cmd
 }
 
+/// The TOFU operator claim, for the credential the `spacetime` CLI already carries.
+fn claim_command() -> CommandSpec {
+    CommandSpec::new("spacetime")
+        .arg("call")
+        .arg("-s")
+        .arg(ProjectLayout::STDB_SERVER)
+        .arg(ProjectLayout::DATABASE)
+        .arg("claim_operator")
+}
+
+/// The same reducer over the node's HTTP API, which is the only way to call it as an identity the
+/// `spacetime` CLI does not hold. `[]` is `claim_operator`'s (empty) argument list.
+fn claim_url() -> String {
+    format!(
+        "{}/v1/database/{}/call/claim_operator",
+        ProjectLayout::stdb_uri(),
+        ProjectLayout::DATABASE
+    )
+}
+
 /// The database-health probe: schema only, no rows, no writes.
 fn describe_command() -> CommandSpec {
     CommandSpec::new("spacetime")
@@ -624,6 +677,7 @@ fn classify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::fake::{FakeHttp, MINTED_TOKEN};
     use crate::proc::fake::{Call, FakeStack, FAKE_TOKEN};
     use tempfile::TempDir;
 
@@ -756,7 +810,8 @@ mod tests {
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
 
-        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
+            .unwrap();
 
         let gateway = gateway_command(&dev.project, &lan(), FAKE_TOKEN);
         assert_eq!(
@@ -802,7 +857,8 @@ mod tests {
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
 
-        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
+            .unwrap();
 
         assert_eq!(
             dev.status_for(Component::Gateway, &stack.inspector()),
@@ -823,7 +879,8 @@ mod tests {
         let stack = FakeStack::new();
         {
             let mut dev = DevManager::new(project(&tmp)).unwrap();
-            dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+            dev.up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
+                .unwrap();
         }
         // A fresh process (`dev status`) reads state.json and must probe the LAN address.
         let dev = DevManager::new(ProjectLayout::from_root(&layout_root).unwrap()).unwrap();
@@ -839,13 +896,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
 
         // `dev up --lan` onto a running loopback stack: the old "already up — nothing to do" would
         // report success for a LAN realm that is not listening on the LAN at all.
         let error = dev
-            .up(&stack.runner(), &stack.inspector(), lan())
+            .up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
             .unwrap_err();
         assert!(
             error.to_string().contains("dev down"),
@@ -856,7 +918,8 @@ mod tests {
         // ...and after `dev down` the same request is accepted.
         dev.down(&stack.runner(), &stack.inspector(), false)
             .unwrap();
-        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
+            .unwrap();
     }
 
     #[test]
@@ -864,10 +927,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
+            .unwrap();
         let after_first: Vec<String> = stack.rendered();
 
-        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
+            .unwrap();
         let added: Vec<String> = stack.rendered()[after_first.len()..].to_vec();
         assert!(
             added
@@ -891,8 +956,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project_with_suite(&tmp)).unwrap();
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
 
         dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
 
@@ -924,7 +994,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project_with_suite(&tmp)).unwrap();
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
+        dev.up(&stack.runner(), &stack.inspector(), &FakeHttp::new(), lan())
+            .unwrap();
 
         dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
         assert_eq!(
@@ -965,8 +1036,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project_with_suite(&tmp)).unwrap();
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
 
         let failing = FakeStack::new()
             .with_process(4001, "x")
@@ -988,8 +1064,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
 
         // Both processes are alive and both ports answer — the state in which an unpublished (or
         // wrong-node) database is invisible to a PID-and-port check.
@@ -1101,8 +1182,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
 
         let cmd = gateway_command(&dev.project, &ClientBind::Loopback, FAKE_TOKEN);
         assert_eq!(cmd.env_value(crate::token::TOKEN_VAR), Some(FAKE_TOKEN));
@@ -1128,18 +1214,182 @@ mod tests {
     }
 
     #[test]
-    fn up_refuses_to_start_an_anonymous_gateway_when_no_token_can_be_read() {
+    fn a_host_with_no_spacetime_login_mints_a_local_identity_and_uses_it_throughout() {
+        // #297: `spacetime login` (2.5.0) offers only the spacetimedb.com browser flow, so
+        // requiring it would put a third-party signup in front of `git clone && ./lyracore dev up`.
+        // A logged-out host mints a SERVER-ISSUED identity from its own node instead.
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
-        // A `spacetime` CLI that is not logged in.
         let stack = FakeStack::new().fail_on("login show", "You are not logged in");
+        let http = FakeHttp::new();
+
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &http,
+            ClientBind::Loopback,
+        )
+        .unwrap();
+
+        // Minted once, from the loopback node.
+        assert_eq!(http.mints().len(), 1, "{:?}", http.requests());
+        assert_eq!(http.mints()[0].url, "http://127.0.0.1:3000/v1/identity");
+
+        // ...and the gateway was started with it.
+        let gateway: Vec<CommandSpec> = stack
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Spawn { spec, .. } if spec.render().contains("gateway") => Some(spec),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gateway.len(), 1, "{gateway:?}");
+        assert_eq!(
+            gateway[0].env_value(crate::token::TOKEN_VAR),
+            Some(MINTED_TOKEN)
+        );
+
+        // Nothing loggable, and nothing on disk except the 0600 credential file, carries it.
+        for rendered in stack.rendered() {
+            assert!(!rendered.contains(MINTED_TOKEN), "leaked into: {rendered}");
+        }
+        let state = std::fs::read_to_string(dev.project.state_file()).unwrap();
+        assert!(
+            !state.contains(MINTED_TOKEN),
+            "leaked into state.json: {state}"
+        );
+    }
+
+    #[test]
+    fn a_minted_identity_claims_the_operator_as_itself_not_as_the_spacetime_cli() {
+        // The lock-out this prevents: `spacetime call claim_operator` runs as the CLI's identity,
+        // which for a minted credential is a DIFFERENT identity — the operator would be claimed by
+        // one identity and the gateway would run as another, and every provision would be refused.
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
+        let http = FakeHttp::new();
+
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &http,
+            ClientBind::Loopback,
+        )
+        .unwrap();
+
+        assert!(
+            !stack
+                .rendered()
+                .iter()
+                .any(|r| r.contains("claim_operator")),
+            "the claim must not be shelled out as the `spacetime` CLI's identity: {:?}",
+            stack.rendered()
+        );
+        let claims: Vec<_> = http
+            .requests()
+            .into_iter()
+            .filter(|r| r.url.ends_with("/call/claim_operator"))
+            .collect();
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(
+            claims[0].url,
+            "http://127.0.0.1:3000/v1/database/lyracore/call/claim_operator"
+        );
+        assert_eq!(claims[0].bearer.as_deref(), Some(MINTED_TOKEN));
+        assert_eq!(claims[0].body, "[]", "claim_operator takes no arguments");
+    }
+
+    #[test]
+    fn a_logged_in_host_still_claims_through_the_spacetime_cli_and_mints_nothing() {
+        // The dev-machine case must be untouched by #297: an existing login is reused, the claim
+        // goes through the proven `spacetime call` path, and no credential is written into the
+        // checkout.
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        let http = FakeHttp::new();
+
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &http,
+            ClientBind::Loopback,
+        )
+        .unwrap();
+
+        assert!(
+            stack
+                .rendered()
+                .iter()
+                .any(|r| r == "spacetime call -s local lyracore claim_operator"),
+            "{:?}",
+            stack.rendered()
+        );
+        assert!(http.requests().is_empty(), "{:?}", http.requests());
+        assert!(!dev.project.token_file().exists());
+    }
+
+    #[test]
+    fn the_minted_identity_survives_into_the_next_run() {
+        // `claim_operator` refuses a second identity, so the credential MUST be stable across
+        // invocations — including a fresh process that reloads everything from `.lyracore/`.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let http = FakeHttp::new();
+        {
+            let mut dev = DevManager::new(project(&tmp)).unwrap();
+            let stack = FakeStack::new().fail_on("login show", "You are not logged in");
+            dev.up(
+                &stack.runner(),
+                &stack.inspector(),
+                &http,
+                ClientBind::Loopback,
+            )
+            .unwrap();
+            dev.down(&stack.runner(), &stack.inspector(), false)
+                .unwrap();
+        }
+        let mut dev = DevManager::new(ProjectLayout::from_root(&root).unwrap()).unwrap();
+        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &http,
+            ClientBind::Loopback,
+        )
+        .unwrap();
+
+        assert_eq!(
+            http.mints().len(),
+            1,
+            "the second run minted a second identity: {:?}",
+            http.requests()
+        );
+    }
+
+    #[test]
+    fn up_refuses_to_start_an_anonymous_gateway_when_no_credential_can_be_had() {
+        // Logged out AND unable to mint (a node that answers its port but not the API): there is
+        // no credential, and an anonymous gateway would look up for 15s and then die on a
+        // subscription timeout. Refuse before spawning anything.
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
+        let http = FakeHttp::failing("no such endpoint");
 
         let error = dev
-            .up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .up(
+                &stack.runner(),
+                &stack.inspector(),
+                &http,
+                ClientBind::Loopback,
+            )
             .unwrap_err();
         assert!(
-            error.to_string().contains("spacetime login"),
-            "the refusal must name the fix: {error}"
+            error.to_string().contains("SpacetimeDB node"),
+            "the refusal must name what could not be reached: {error}"
         );
         assert!(
             !stack
@@ -1147,8 +1397,47 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Call::Spawn { spec, .. }
                 if spec.render().contains("gateway"))),
-            "an anonymous gateway must not be started at all — it would look up for 15s and then \
-             die on a subscription timeout"
+            "an anonymous gateway must not be started at all"
+        );
+    }
+
+    #[test]
+    fn a_database_claimed_by_another_identity_says_which_file_to_delete() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
+
+        // The node mints happily; it is the CLAIM it refuses.
+        struct ClaimRefused;
+        impl crate::http::HttpClient for ClaimRefused {
+            fn post_json(&self, url: &str, _bearer: Option<&str>, _body: &str) -> Result<String> {
+                if url.ends_with("/v1/identity") {
+                    return Ok(format!(
+                        "{{\"identity\":\"c2\",\"token\":\"{}\"}}",
+                        crate::http::fake::MINTED_TOKEN
+                    ));
+                }
+                Err(Error::Process(format!(
+                    "{url} answered HTTP 400: operator already claimed"
+                )))
+            }
+        }
+
+        let error = dev
+            .up(
+                &stack.runner(),
+                &stack.inspector(),
+                &ClaimRefused,
+                ClientBind::Loopback,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("operator already claimed"),
+            "the node's own reason must survive: {error}"
+        );
+        assert!(
+            error.to_string().contains("coordinator-token"),
+            "and the way out must be named: {error}"
         );
     }
 
@@ -1171,8 +1460,13 @@ mod tests {
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         // Nothing running: `up` must start both, and spawning is what opens their ports.
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
 
         for rendered in stack.rendered() {
             let args: Vec<&str> = rendered.split_whitespace().collect();
@@ -1197,8 +1491,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
 
         let publishes: Vec<String> = stack
             .rendered()
@@ -1243,8 +1542,13 @@ mod tests {
             .with_port(ProjectLayout::STDB_PORT)
             .with_port(ProjectLayout::WORLD_PORT);
 
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
         // The status report's read-only database probe is the ONE thing a second `up` may run.
         // Nothing may be started, built, published or re-claimed.
         for rendered in stack.rendered() {
@@ -1262,8 +1566,13 @@ mod tests {
         // Port 3000 answers, but no PID of ours owns it.
         let stack = FakeStack::new().with_port(ProjectLayout::STDB_PORT);
 
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
 
         assert!(
             dev.state.record(Component::Spacetime).is_none(),
@@ -1290,8 +1599,13 @@ mod tests {
             .with_process(10, "stdb")
             .with_port(ProjectLayout::STDB_PORT);
 
-        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
-            .unwrap();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+        )
+        .unwrap();
 
         assert!(
             !stack
@@ -1322,7 +1636,12 @@ mod tests {
             .with_port(ProjectLayout::WORLD_PORT);
 
         let error = dev
-            .up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .up(
+                &stack.runner(),
+                &stack.inspector(),
+                &FakeHttp::new(),
+                ClientBind::Loopback,
+            )
             .unwrap_err();
         assert!(
             error
