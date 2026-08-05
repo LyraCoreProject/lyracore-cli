@@ -175,7 +175,7 @@ pub const FAKE_TOKEN: &str = "eyJmYWtl.TOKEN-must-never-be-rendered.SIG";
 /// whose tools match — the ordinary case; a fixture pinning anything else models the drift that
 /// `lyracore preflight`'s check 0 exists to catch.
 pub const FAKE_RUST_VERSION: &str = "1.93.0";
-pub const FAKE_SPACETIME_VERSION: &str = "2.5.0";
+pub const FAKE_SPACETIME_VERSION: &str = "2.7.1";
 
 /// Canned stdout for the commands this CLI actually reads output from.
 ///
