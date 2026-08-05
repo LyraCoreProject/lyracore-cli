@@ -11,6 +11,8 @@ installation of Rust and SpacetimeDB.
 
 ```text
 lyracore doctor
+lyracore preflight
+lyracore publish [DATABASE ...] [--skip-preflight]
 lyracore dev up [--lan <IP>]
 lyracore dev status
 lyracore dev logs [spacetime|gateway]
@@ -23,15 +25,60 @@ Runtime state lives in the git-ignored `.lyracore/` of the target checkout — `
 processes the CLI started, `logs/{spacetime,gateway}.log`, and `coordinator-token` (mode `0600`) if
 this host had no SpacetimeDB login and the CLI minted a local identity.
 
+## `preflight` — the offline deploy gate
+
+```bash
+lyracore preflight
+```
+
+The break class `cargo test` and `cargo check` cannot see. It touches **no node**: no publish, no
+call, no sql, no database, so it is safe to run against a live stack. Five checks:
+
+| # | Check | The break it catches |
+| --- | --- | --- |
+| 0 | `rustc` and the `spacetime` CLI **exactly** match the versions the checkout pins (`rust-toolchain.toml`, `module/Cargo.toml`) | tools drifting out from under the pin — a CLI ahead of it publishes a schema the repo never tested against |
+| 1 | the module compiles with `--features=debug_reducers` | code that only a publish compiles, so the default test config never sees it |
+| 2 | real, offline wasm schema extraction (`spacetime generate` into a scratch directory) | a `#[default(0)]` on a `u64`, which SpacetimeDB rejects at migration time and nothing in-tree validates |
+| 3 | every `#[client_visibility_filter]` names real tables and columns | a filter stored as raw text at publish, rejecting a gateway **subscription** at login time |
+| 4 | a script with a configurable `DB` target threads it into every tool it drives | an ETL writing to one database and asserting against another |
+
+Every check runs even after one fails, so a run hands back every problem rather than one per
+attempt. Check 0 is an EXACT match, unlike `doctor`'s minimum-version floor: newer is not fine when
+a publish is the thing being gated. Where `spacetimedb-standalone` is unavailable,
+`PREFLIGHT_SKIP_SCHEMA=1` skips check 2 — and then nothing validates your `#[default]` encodings.
+
+## `publish` — the one correct deploy
+
+```bash
+lyracore publish                                   # the fixture database
+lyracore publish lyracore lyracore-world-1 realm-core
+```
+
+Runs `preflight`, then `spacetime publish -s local -p <checkout>/module
+--build-options=--features=debug_reducers --yes <DATABASE>` for each database in turn, stopping at
+the first failure. It takes database **NAMES**:
+
+* `--features=debug_reducers` is baked in — a plain build omits the debug module, so publish reports
+  a FALSE "Removed table" breaking change and aborts;
+* `--yes` is baked in — SpacetimeDB prompts for ANY schema change, even an additive END-appended
+  `#[default]` column, and a non-interactive stdin turns that prompt into an EOF abort;
+* `-c` / `--delete-data` — the destructive wipe — is **refused**, as is any other flag-shaped
+  argument, with exit 2 and before a single `spacetime` process starts. Nothing is forwarded.
+
+`--skip-preflight` is the only recognised flag, and it says on stdout that nothing validated the
+schema. Publishing several databases in one command is what makes "every shard" checkable instead of
+remembered: a schema change needs all of them, and the gateway reports a shard left behind only as
+"realm-core unreachable — LOGONS WILL BE REFUSED".
+
 ## What `dev up` does
 
 1. Starts SpacetimeDB on `127.0.0.1:3000`, **or reuses one already listening there.** A node the CLI
    did not start is never recorded and never stopped by `dev down`.
 2. Builds the gateway.
-3. Publishes **only** the seeded fixture database, always through the target checkout's
-   `scripts/publish-module.sh` — which is what guarantees `--features=debug_reducers`, `--yes`,
-   `-s local`, and the refusal to forward a `-c` wipe. No path here invokes `spacetime publish`
-   directly, clears a database, or re-selects the SpacetimeDB server.
+3. Runs `preflight`, then publishes **only** the seeded fixture database, through the same internal
+   command `lyracore publish` uses — which is what guarantees `--features=debug_reducers`, `--yes`,
+   `-s local`, and the unreachability of a `-c` wipe. No path here renders a `spacetime publish`
+   any other way, clears a database, or re-selects the SpacetimeDB server.
 4. Resolves the coordinator credential (see below), minting one from the local node if this host has
    no SpacetimeDB login.
 5. Calls `claim_operator` **as that identity** (idempotent for the same identity, so repeating
@@ -96,11 +143,25 @@ rather than reporting "already up" for a realm that is not listening where you a
 ### `dev smoke`
 
 Runs the pinned wire harness's generic login smoke — logon, world handshake, character enumerate,
-enter world — against the running fixture, by handing off to the checkout's own
-`adapters/lyracore/run-suite.sh`. The harness is a separate, server-agnostic repository that the
-checkout pins; this CLI resolves nothing about it and overrides nothing, so
-`LYRACORE_WIRE_HARNESS_DIR` reaches it through the inherited environment exactly as documented
-there.
+enter world — against the running fixture.
+
+The harness is a separate, server-agnostic repository consumed as the RELEASE pinned in the
+checkout's `.wire-harness-rev` (`<tag> <full sha>`), and this CLI owns the consume path:
+
+* the **tag** is what is cloned — a release, never a branch, and there is deliberately no way to say
+  `main`;
+* the **sha** is what the checkout is then verified against, because a tag is a mutable ref and
+  "pinned to a tag someone moved" is not pinned. A mismatch is reported as a supply-chain event, not
+  a stale cache;
+* the clone lands in the git-ignored `.lyracore/wire-harness/<sha>/`, so it can never appear in the
+  server repo's `git status`. The repository is private, so the clone uses your existing git
+  credentials over ssh;
+* `LYRACORE_WIRE_HARNESS_DIR=/path/to/wire-harness` overrides all of that with a local working tree.
+  It is validated, and announced on stderr every time — a stale local checkout silently substituted
+  for the pin is a measurement nobody can reproduce.
+
+The seam is resolved **inside that pinned checkout**, not from an `adapters/` directory in the
+server repo. The wire client is built from the harness's own manifest.
 
 It signs in as the fixture account, so provision that first:
 
@@ -149,8 +210,14 @@ printf 'hunter2' | lyracore account create TEST --password-stdin
 ## Project layout coupling
 
 `src/project.rs` is the single adapter holding the target project's internal database, package,
-script, and bind names. Renaming those internals is a one-file change here, and no public command
+path, and bind names. Renaming those internals is a one-file change here, and no public command
 surface moves with it.
+
+The CLI drives a checkout through `Cargo.toml`, `rust-toolchain.toml`, `module/`, `scripts/*.sh` and
+`.wire-harness-rev` — it does **not** shell out to any script in the target repository. The
+guarantees that used to belong to `scripts/publish-module.sh` and `scripts/preflight.sh` are
+properties of `cmd/publish.rs` and `cmd/preflight.rs` here, so a checkout that ships without a
+`scripts/` or `adapters/` directory is still fully drivable.
 
 ## Exit codes
 

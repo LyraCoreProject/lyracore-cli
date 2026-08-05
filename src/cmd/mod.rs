@@ -1,6 +1,8 @@
 pub mod account;
 pub mod dev;
 pub mod doctor;
+pub mod preflight;
+pub mod publish;
 
 use crate::project::{ClientBind, Component};
 use crate::{Error, Result};
@@ -11,6 +13,11 @@ lyracore — local LyraCore development
 
 USAGE:
   lyracore doctor                              check prerequisites for `dev up`
+  lyracore preflight                           the offline deploy gate: build, schema, filters
+  lyracore publish [DATABASE ...]              preflight, then publish the module (default:
+                                               the fixture database). Takes database NAMES;
+                                               every flag is refused, including the -c wipe
+  lyracore publish --skip-preflight [DB ...]   publish without the gate (say why in the PR)
   lyracore dev up                              start (or reuse) the local single-realm stack
   lyracore dev up --lan <IP>                   also serve clients on this machine's private-LAN
                                                address (SpacetimeDB stays on loopback)
@@ -27,6 +34,11 @@ prompt. It is never passed as a command-line argument.";
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Doctor,
+    Preflight,
+    Publish {
+        databases: Vec<String>,
+        skip_preflight: bool,
+    },
     DevUp {
         bind: ClientBind,
     },
@@ -51,6 +63,25 @@ impl Command {
             ["-h"] | ["--help"] | ["help"] => Ok(Command::Help),
 
             ["doctor"] => Ok(Command::Doctor),
+            ["preflight"] => Ok(Command::Preflight),
+            ["preflight", other, ..] => Err(Error::Usage(format!(
+                "`preflight` takes no arguments (got '{other}')"
+            ))),
+
+            // Everything that is not the one recognised option is a database NAME — and
+            // `publish::databases` is what refuses anything flag-shaped, including `-c`.
+            ["publish", rest @ ..] => {
+                let skip_preflight = rest.contains(&"--skip-preflight");
+                let names: Vec<String> = rest
+                    .iter()
+                    .filter(|arg| **arg != "--skip-preflight")
+                    .map(|arg| (*arg).to_string())
+                    .collect();
+                publish::databases(&names).map(|databases| Command::Publish {
+                    databases,
+                    skip_preflight,
+                })
+            }
 
             ["dev", "up"] => Ok(Command::DevUp {
                 bind: ClientBind::Loopback,
@@ -194,6 +225,67 @@ mod tests {
                 "`{line}` should be a usage error"
             );
         }
+    }
+
+    #[test]
+    fn publish_defaults_to_the_fixture_database_and_takes_names() {
+        assert_eq!(
+            parse("publish").unwrap(),
+            Command::Publish {
+                databases: vec![crate::project::ProjectLayout::DATABASE.to_string()],
+                skip_preflight: false,
+            }
+        );
+        assert_eq!(
+            parse("publish lyracore lyracore-world-1").unwrap(),
+            Command::Publish {
+                databases: vec!["lyracore".to_string(), "lyracore-world-1".to_string()],
+                skip_preflight: false,
+            }
+        );
+    }
+
+    #[test]
+    fn skip_preflight_is_the_only_flag_publish_accepts() {
+        assert_eq!(
+            parse("publish --skip-preflight").unwrap(),
+            Command::Publish {
+                databases: vec![crate::project::ProjectLayout::DATABASE.to_string()],
+                skip_preflight: true,
+            }
+        );
+        assert_eq!(
+            parse("publish --skip-preflight realm-core").unwrap(),
+            Command::Publish {
+                databases: vec!["realm-core".to_string()],
+                skip_preflight: true,
+            }
+        );
+    }
+
+    #[test]
+    fn publish_refuses_the_destructive_flag_at_the_command_line() {
+        // The one unrecoverable mistake available here. Exit 2, before anything runs.
+        for line in [
+            "publish -c",
+            "publish --delete-data",
+            "publish lyracore -c",
+            "publish --clear",
+        ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(
+                error.exit_code(),
+                crate::error::EXIT_USAGE,
+                "`{line}` should be refused"
+            );
+            assert!(error.to_string().contains("Refusing"), "`{line}`: {error}");
+        }
+    }
+
+    #[test]
+    fn preflight_takes_no_arguments() {
+        assert_eq!(parse("preflight").unwrap(), Command::Preflight);
+        assert!(parse("preflight lyracore").is_err());
     }
 
     #[test]
