@@ -273,11 +273,16 @@ impl DevManager {
                 ProjectLayout::WORLD_PORT
             )));
         }
+        // Resolved HERE, not in `up`: a stack that is already running needs no credential, and a
+        // logged-out CLI should not be an error for a command that then does nothing. It is
+        // resolved BEFORE the spawn so a missing token is a clear refusal rather than a gateway
+        // that starts, warns, and dies 15s later on a subscription timeout.
+        let token = crate::token::resolve(runner)?;
         println!(
             "· starting the gateway on {}...",
             ProjectLayout::world_bind(&self.bind)
         );
-        let command = gateway_command(&self.project, &self.bind);
+        let command = gateway_command(&self.project, &self.bind, &token);
         let record = self.spawn_recorded(Component::Gateway, &command, runner, inspector)?;
         self.state.set(Component::Gateway, Some(record));
         self.wait_for_port(Component::Gateway, inspector)?;
@@ -544,8 +549,13 @@ impl DevManager {
 
 /// The single-database fixture gateway. Only `LYRACORE_DATABASE` is configured, which — per
 /// `gateway/src/config.rs` — collapses routing to that one database.
-fn gateway_command(project: &ProjectLayout, bind: &ClientBind) -> CommandSpec {
+fn gateway_command(project: &ProjectLayout, bind: &ClientBind, token: &str) -> CommandSpec {
     let mut cmd = CommandSpec::new(project.gateway_bin().to_string_lossy().to_string())
+        // The privileged coordinator connection. `game_account`/`game_session` are private module
+        // tables and `provision_account` is operator-gated, so without this the gateway connects
+        // anonymously and cannot authenticate anyone. Environment, never argv — and `CommandSpec`
+        // renders program + args only, so it cannot reach a log line or an error message.
+        .env(crate::token::TOKEN_VAR, token)
         .env("LYRACORE_DATABASE", ProjectLayout::DATABASE)
         .env("LYRACORE_SPACETIMEDB_URL", ProjectLayout::stdb_uri())
         .env("LYRACORE_LOGON_BIND", ProjectLayout::logon_bind(bind))
@@ -614,7 +624,7 @@ fn classify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proc::fake::{Call, FakeStack};
+    use crate::proc::fake::{Call, FakeStack, FAKE_TOKEN};
     use tempfile::TempDir;
 
     fn record(pid: u32, identity: &str) -> ProcessRecord {
@@ -748,7 +758,7 @@ mod tests {
 
         dev.up(&stack.runner(), &stack.inspector(), lan()).unwrap();
 
-        let gateway = gateway_command(&dev.project, &lan());
+        let gateway = gateway_command(&dev.project, &lan(), FAKE_TOKEN);
         assert_eq!(
             gateway.env_value("LYRACORE_LOGON_BIND"),
             Some("192.168.1.50:3724")
@@ -1067,7 +1077,7 @@ mod tests {
     #[test]
     fn the_gateway_runs_against_exactly_one_database() {
         let tmp = TempDir::new().unwrap();
-        let cmd = gateway_command(&project(&tmp), &ClientBind::Loopback);
+        let cmd = gateway_command(&project(&tmp), &ClientBind::Loopback, FAKE_TOKEN);
         assert_eq!(
             cmd.env_value("LYRACORE_DATABASE"),
             Some(ProjectLayout::DATABASE)
@@ -1082,9 +1092,70 @@ mod tests {
     }
 
     #[test]
+    fn the_gateway_gets_the_coordinator_token_and_nothing_loggable_does() {
+        // `game_account`/`game_session` are PRIVATE module tables and `provision_account` is
+        // operator-gated. A gateway launched without this token connects anonymously, cannot read
+        // an account, and dies 15s later on "coordinator subscriptions not applied" — which reads
+        // like a node fault, not a credential one. So: it must be set, and it must be set as an
+        // ENVIRONMENT variable, never an argument.
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new();
+        dev.up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap();
+
+        let cmd = gateway_command(&dev.project, &ClientBind::Loopback, FAKE_TOKEN);
+        assert_eq!(cmd.env_value(crate::token::TOKEN_VAR), Some(FAKE_TOKEN));
+        assert!(
+            !cmd.args().iter().any(|a| a.contains(FAKE_TOKEN)),
+            "a token in argv is world-readable via `ps`"
+        );
+        assert!(!cmd.render().contains(FAKE_TOKEN), "{}", cmd.render());
+
+        // Nothing this run could have written to a log or an error message carries it.
+        for rendered in stack.rendered() {
+            assert!(
+                !rendered.contains(FAKE_TOKEN),
+                "the coordinator token leaked into: {rendered}"
+            );
+        }
+        // ...nor does the state file the CLI just wrote.
+        let state = std::fs::read_to_string(dev.project.state_file()).unwrap();
+        assert!(
+            !state.contains(FAKE_TOKEN),
+            "leaked into state.json: {state}"
+        );
+    }
+
+    #[test]
+    fn up_refuses_to_start_an_anonymous_gateway_when_no_token_can_be_read() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        // A `spacetime` CLI that is not logged in.
+        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
+
+        let error = dev
+            .up(&stack.runner(), &stack.inspector(), ClientBind::Loopback)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("spacetime login"),
+            "the refusal must name the fix: {error}"
+        );
+        assert!(
+            !stack
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Spawn { spec, .. }
+                if spec.render().contains("gateway"))),
+            "an anonymous gateway must not be started at all — it would look up for 15s and then \
+             die on a subscription timeout"
+        );
+    }
+
+    #[test]
     fn the_gateway_binds_loopback_only() {
         let tmp = TempDir::new().unwrap();
-        let cmd = gateway_command(&project(&tmp), &ClientBind::Loopback);
+        let cmd = gateway_command(&project(&tmp), &ClientBind::Loopback, FAKE_TOKEN);
         for var in ["LYRACORE_LOGON_BIND", "LYRACORE_WORLD_BIND"] {
             let bind = cmd.env_value(var).unwrap();
             assert!(
