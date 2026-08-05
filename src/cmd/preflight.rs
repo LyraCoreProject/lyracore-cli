@@ -417,15 +417,11 @@ fn threads_db(line: &str) -> bool {
     false
 }
 
-fn check_db_threading(project: &ProjectLayout, failures: &mut Failures) {
-    step("scripts thread their configurable DB target into every tool invocation");
-    let dir = project.scripts_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        println!(
-            "SKIP: no {}/ directory in this checkout",
-            ProjectLayout::SCRIPTS_DIR
-        );
-        return;
+/// The `*.sh` files in one directory, sorted. A directory that is not there yields none — a
+/// checkout predating a move should skip that root, not fail the check.
+fn shell_scripts_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
     };
     let mut scripts: Vec<PathBuf> = entries
         .flatten()
@@ -433,6 +429,24 @@ fn check_db_threading(project: &ProjectLayout, failures: &mut Failures) {
         .filter(|path| path.extension().is_some_and(|e| e == "sh"))
         .collect();
     scripts.sort();
+    scripts
+}
+
+fn check_db_threading(project: &ProjectLayout, failures: &mut Failures) {
+    step("scripts thread their configurable DB target into every tool invocation");
+    // BOTH script roots. The world-import ETL — the scripts that actually take a `DB` override and
+    // drive the importer with it — lives with the importer, not in `scripts/`; a scan that looked
+    // only at `scripts/` would find no `DB=`-defining script at all and print a vacuous "ok".
+    let mut scripts = shell_scripts_in(&project.scripts_dir());
+    scripts.extend(shell_scripts_in(&project.importer_scripts_dir()));
+    if scripts.is_empty() {
+        println!(
+            "SKIP: no {}/ or {}/ scripts in this checkout",
+            ProjectLayout::SCRIPTS_DIR,
+            ProjectLayout::IMPORTER_SCRIPTS_DIR
+        );
+        return;
+    }
 
     let mut ok = true;
     for path in scripts {

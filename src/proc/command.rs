@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A command the CLI intends to run.
@@ -16,6 +17,13 @@ pub struct CommandSpec {
     /// plenty of contributor shells; inheriting it would silently turn the single-database
     /// fixture into a five-database gateway pointed at databases this CLI never published.
     env_remove: Vec<String>,
+    /// The directory the child runs in. `None` inherits ours.
+    ///
+    /// `lyracore` works from any subdirectory of a checkout, so "inherit" means "wherever the
+    /// contributor happened to be". A child that resolves a path relative to the checkout ROOT —
+    /// the import scripts run `./target/debug/lyracore-importer` — is then broken by nothing worse
+    /// than the caller's `cd`.
+    cwd: Option<PathBuf>,
 }
 
 impl CommandSpec {
@@ -25,6 +33,7 @@ impl CommandSpec {
             args: Vec::new(),
             env: BTreeMap::new(),
             env_remove: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -41,6 +50,15 @@ impl CommandSpec {
     pub fn env_remove(mut self, key: impl Into<String>) -> Self {
         self.env_remove.push(key.into());
         self
+    }
+
+    pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(dir.into());
+        self
+    }
+
+    pub fn cwd_value(&self) -> Option<&Path> {
+        self.cwd.as_deref()
     }
 
     pub fn program(&self) -> &str {
@@ -67,6 +85,9 @@ impl CommandSpec {
         }
         for key in &self.env_remove {
             cmd.env_remove(key);
+        }
+        if let Some(dir) = &self.cwd {
+            cmd.current_dir(dir);
         }
         cmd
     }
