@@ -8,5 +8,6 @@ pub mod error;
 pub mod proc;
 pub mod project;
 pub mod state;
+pub mod token;
 
 pub use error::{Error, Result};
