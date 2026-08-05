@@ -11,9 +11,10 @@ installation of Rust and SpacetimeDB.
 
 ```text
 lyracore doctor
-lyracore dev up
+lyracore dev up [--lan <IP>]
 lyracore dev status
 lyracore dev logs [spacetime|gateway]
+lyracore dev smoke
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
 ```
@@ -36,6 +37,37 @@ processes the CLI started, and `logs/{spacetime,gateway}.log`.
 Re-running `dev up` on a healthy stack does nothing; on a partially-up stack it starts only the
 missing part.
 
+### `--lan <IP>` — let another machine on your network connect
+
+`dev up --lan 192.168.1.50` binds the two CLIENT-FACING listeners (logon 3724, world 8085) to that
+address and advertises it in the realm list, so a 1.12.1 client elsewhere on the LAN can set its
+realmlist to it and play.
+
+**SpacetimeDB is not part of that.** It stays on `127.0.0.1:3000` in every mode: the database's
+admin surface is not something a `dev` command should put on a network.
+
+The address must be a private one — `10.0.0.0/8`, `172.16.0.0/12`, or `192.168.0.0/16`. A public
+address, or `0.0.0.0`, is a usage error rather than a wildcard bind, because "expose an alpha game
+server to the internet" should not be one mistyped character away from "let my flatmate log in".
+
+A running gateway cannot be rebound: switching modes is refused with the `dev down` to run first,
+rather than reporting "already up" for a realm that is not listening where you asked.
+
+### `dev smoke`
+
+Runs the pinned wire harness's generic login smoke — logon, world handshake, character enumerate,
+enter world — against the running fixture, by handing off to the checkout's own
+`adapters/lyracore/run-suite.sh`. The harness is a separate, server-agnostic repository that the
+checkout pins; this CLI resolves nothing about it and overrides nothing, so
+`LYRACORE_WIRE_HARNESS_DIR` reaches it through the inherited environment exactly as documented
+there.
+
+It signs in as the fixture account, so provision that first:
+
+```bash
+printf 'test123' | lyracore account create TEST --password-stdin
+```
+
 ### One database, on purpose
 
 This fixture is a **single-database** stack. The multi-database production topology is not
@@ -53,6 +85,11 @@ unknown, and the health probe would otherwise pass against someone else's listen
 A bare PID is not an identity: PIDs get reused, and signalling a recycled one kills a stranger's
 process. Each recorded PID is stored with its process start time and command name, read via POSIX
 `ps` — no `/proc`, no `grep -P`, no GNU-only flags, so Linux and macOS behave the same.
+
+`dev status` checks all three things that can be wrong independently: the recorded PID is still the
+process the CLI started, its endpoint answers (on the LAN address, in LAN mode), and the fixture
+database is actually published on the node — a stack whose PIDs and ports are both perfect is still
+broken if nothing was ever published to it.
 
 `dev down` compares that identity before signalling anything. If the PID now belongs to something
 else it **refuses and kills nothing**, directing you to `dev down --forget`, which drops the record
@@ -90,7 +127,7 @@ it is usually your own running stack.
 
 ```bash
 cargo test
-cargo +1.80 check   # the supported minimum toolchain
+cargo +1.85 check   # the supported minimum toolchain
 ```
 
 Tests run entirely against fake command and process adapters plus temporary directories; nothing in

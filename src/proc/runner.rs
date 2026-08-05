@@ -13,6 +13,12 @@ pub trait ProcessRunner {
     /// never rendered, and never logged.
     fn run_with_secret_stdin(&self, cmd: &CommandSpec, secret: &[u8]) -> Result<String>;
 
+    /// Run to completion with the child's output going straight to this terminal.
+    ///
+    /// For the long, chatty child (`dev smoke`'s harness run) whose progress is the point:
+    /// capturing it would hold every line back until the run ended.
+    fn run_streaming(&self, cmd: &CommandSpec) -> Result<()>;
+
     /// Start a background process with stdout+stderr appended to `log`, returning its PID.
     fn spawn_logged(&self, cmd: &CommandSpec, log: &Path) -> Result<u32>;
 
@@ -58,6 +64,22 @@ impl ProcessRunner for RealProcessRunner {
         }
         let output = child.wait_with_output()?;
         Self::finish(cmd, output)
+    }
+
+    fn run_streaming(&self, cmd: &CommandSpec) -> Result<()> {
+        // stdin is /dev/null: the harness must never be able to sit waiting on a prompt inside
+        // what a contributor started as a one-shot check.
+        let status = cmd.build().stdin(Stdio::null()).status()?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(Error::SubprocessFailed {
+            command: cmd.render(),
+            code: status.code().unwrap_or(1),
+            // The child already printed its own diagnosis to this terminal; repeating a captured
+            // copy here is not possible (nothing was captured) and would be noise if it were.
+            message: "see the output above".to_string(),
+        })
     }
 
     fn spawn_logged(&self, cmd: &CommandSpec, log: &Path) -> Result<u32> {

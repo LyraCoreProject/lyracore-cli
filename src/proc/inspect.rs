@@ -4,7 +4,7 @@
 //! process. We pair the PID with the kernel's start time plus the command name, both read through
 //! POSIX `ps` — no `/proc` (absent on macOS), no `grep -P`, no GNU-only flags.
 
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::process::Command;
 use std::time::Duration;
 
@@ -12,8 +12,9 @@ pub trait ProcessInspector {
     /// A stable identity for a live PID, or `None` if no such process exists.
     fn identity(&self, pid: u32) -> Option<String>;
 
-    /// Is something accepting connections on this loopback port?
-    fn port_serving(&self, port: u16) -> bool;
+    /// Is something accepting connections on `host:port`? The host matters since `--lan`: a
+    /// gateway bound to a LAN address does not answer on loopback.
+    fn serving(&self, host: &str, port: u16) -> bool;
 }
 
 pub struct RealProcessInspector;
@@ -36,9 +37,14 @@ impl ProcessInspector for RealProcessInspector {
         (!identity.is_empty()).then_some(identity)
     }
 
-    fn port_serving(&self, port: u16) -> bool {
-        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-        TcpStream::connect_timeout(&addr.into(), Duration::from_millis(250)).is_ok()
+    fn serving(&self, host: &str, port: u16) -> bool {
+        // `to_socket_addrs` rather than a parsed literal: every host this CLI probes is one it
+        // chose itself (loopback, or the `--lan` address it validated), so this is a formatting
+        // convenience, not a name-resolution feature.
+        let Ok(mut addrs) = (host, port).to_socket_addrs() else {
+            return false;
+        };
+        addrs.any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok())
     }
 }
 
@@ -63,5 +69,19 @@ mod tests {
         let inspector = RealProcessInspector;
         let ours = std::process::id();
         assert_eq!(inspector.identity(ours), inspector.identity(ours));
+    }
+
+    #[test]
+    fn a_listener_is_seen_on_the_host_it_bound_and_not_on_another() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let inspector = RealProcessInspector;
+        assert!(inspector.serving("127.0.0.1", port));
+        // Nothing is listening on this address here, and an unroutable/unassigned host must read
+        // as "not serving" rather than hanging or panicking.
+        assert!(!inspector.serving("192.0.2.1", port));
+        assert!(!inspector.serving("not a host", port));
     }
 }

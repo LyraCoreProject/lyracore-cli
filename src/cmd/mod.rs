@@ -2,7 +2,7 @@ pub mod account;
 pub mod dev;
 pub mod doctor;
 
-use crate::project::Component;
+use crate::project::{ClientBind, Component};
 use crate::{Error, Result};
 use account::PasswordSource;
 
@@ -12,8 +12,11 @@ lyracore — local LyraCore development
 USAGE:
   lyracore doctor                              check prerequisites for `dev up`
   lyracore dev up                              start (or reuse) the local single-realm stack
+  lyracore dev up --lan <IP>                   also serve clients on this machine's private-LAN
+                                               address (SpacetimeDB stays on loopback)
   lyracore dev status                          report each component's state
   lyracore dev logs [spacetime|gateway]        show a component's log file
+  lyracore dev smoke                           run the pinned wire harness's login smoke
   lyracore dev down [--forget]                 stop the processes this CLI started
   lyracore account create USER [--password-stdin]
                                                provision an account's SRP6 credentials
@@ -24,11 +27,19 @@ prompt. It is never passed as a command-line argument.";
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Doctor,
-    DevUp,
+    DevUp {
+        bind: ClientBind,
+    },
     DevStatus,
     DevLogs(Option<Component>),
-    DevDown { forget: bool },
-    AccountCreate { user: String, source: PasswordSource },
+    DevSmoke,
+    DevDown {
+        forget: bool,
+    },
+    AccountCreate {
+        user: String,
+        source: PasswordSource,
+    },
     Help,
 }
 
@@ -41,21 +52,37 @@ impl Command {
 
             ["doctor"] => Ok(Command::Doctor),
 
-            ["dev", "up"] => Ok(Command::DevUp),
+            ["dev", "up"] => Ok(Command::DevUp {
+                bind: ClientBind::Loopback,
+            }),
+            ["dev", "up", "--lan", ip] => {
+                ClientBind::parse_lan(ip).map(|bind| Command::DevUp { bind })
+            }
+            ["dev", "up", "--lan"] => Err(Error::Usage(
+                "`dev up --lan` needs this machine's private-LAN IPv4 address, e.g. \
+                 `dev up --lan 192.168.1.50`"
+                    .to_string(),
+            )),
+            ["dev", "up", other, ..] => Err(Error::Usage(format!(
+                "unknown `dev up` option '{other}' — the only one is --lan <IP>"
+            ))),
             ["dev", "status"] => Ok(Command::DevStatus),
+            ["dev", "smoke"] => Ok(Command::DevSmoke),
             ["dev", "down"] => Ok(Command::DevDown { forget: false }),
             ["dev", "down", "--forget"] => Ok(Command::DevDown { forget: true }),
             ["dev", "logs"] => Ok(Command::DevLogs(None)),
-            ["dev", "logs", name] => Component::parse(name).map(|c| Command::DevLogs(Some(c))).ok_or_else(|| {
-                Error::Usage(format!(
-                    "unknown component '{name}' — expected one of: spacetime, gateway"
-                ))
-            }),
+            ["dev", "logs", name] => Component::parse(name)
+                .map(|c| Command::DevLogs(Some(c)))
+                .ok_or_else(|| {
+                    Error::Usage(format!(
+                        "unknown component '{name}' — expected one of: spacetime, gateway"
+                    ))
+                }),
             ["dev"] => Err(Error::Usage(
-                "`dev` needs a subcommand: up, status, logs, down".to_string(),
+                "`dev` needs a subcommand: up, status, logs, smoke, down".to_string(),
             )),
             ["dev", other, ..] => Err(Error::Usage(format!(
-                "unknown `dev` subcommand '{other}' — expected up, status, logs, or down"
+                "unknown `dev` subcommand '{other}' — expected up, status, logs, smoke, or down"
             ))),
 
             ["account", "create", user] => Ok(Command::AccountCreate {
@@ -90,10 +117,19 @@ mod tests {
     #[test]
     fn the_documented_surface_parses() {
         assert_eq!(parse("doctor").unwrap(), Command::Doctor);
-        assert_eq!(parse("dev up").unwrap(), Command::DevUp);
+        assert_eq!(
+            parse("dev up").unwrap(),
+            Command::DevUp {
+                bind: ClientBind::Loopback
+            }
+        );
         assert_eq!(parse("dev status").unwrap(), Command::DevStatus);
+        assert_eq!(parse("dev smoke").unwrap(), Command::DevSmoke);
         assert_eq!(parse("dev logs").unwrap(), Command::DevLogs(None));
-        assert_eq!(parse("dev down").unwrap(), Command::DevDown { forget: false });
+        assert_eq!(
+            parse("dev down").unwrap(),
+            Command::DevDown { forget: false }
+        );
         assert_eq!(
             parse("account create TEST --password-stdin").unwrap(),
             Command::AccountCreate {
@@ -125,7 +161,10 @@ mod tests {
 
     #[test]
     fn down_takes_forget() {
-        assert_eq!(parse("dev down --forget").unwrap(), Command::DevDown { forget: true });
+        assert_eq!(
+            parse("dev down --forget").unwrap(),
+            Command::DevDown { forget: true }
+        );
     }
 
     #[test]
@@ -134,8 +173,38 @@ mod tests {
     }
 
     #[test]
+    fn lan_is_the_only_option_dev_up_takes_and_it_needs_a_private_address() {
+        assert_eq!(
+            parse("dev up --lan 192.168.1.50").unwrap(),
+            Command::DevUp {
+                bind: ClientBind::parse_lan("192.168.1.50").unwrap()
+            }
+        );
+        for line in [
+            "dev up --lan",         // no address
+            "dev up --lan 8.8.8.8", // public
+            "dev up --lan 0.0.0.0", // every interface
+            "dev up --public",      // not a flag this CLI has
+            "dev up --lan 10.0.0.1 extra",
+        ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(
+                error.exit_code(),
+                crate::error::EXIT_USAGE,
+                "`{line}` should be a usage error"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_commands_are_usage_errors() {
-        for line in ["nonsense", "dev", "dev sideways", "account", "account create"] {
+        for line in [
+            "nonsense",
+            "dev",
+            "dev sideways",
+            "account",
+            "account create",
+        ] {
             let error = parse(line).unwrap_err();
             assert_eq!(
                 error.exit_code(),

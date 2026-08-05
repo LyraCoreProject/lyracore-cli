@@ -3,7 +3,7 @@
 //! Only processes this CLI started are recorded here. A SpacetimeDB the contributor was already
 //! running is used but never claimed, so `dev down` cannot stop something it did not start.
 
-use crate::project::Component;
+use crate::project::{ClientBind, Component};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -25,6 +25,11 @@ pub struct RuntimeState {
     /// Recorded for diagnostics and so a renamed database (#241) is visible in stale state.
     #[serde(default)]
     pub database: String,
+    /// The host the running gateway's client-facing listeners were bound to by the `dev up` that
+    /// started it. Absent or unparseable = loopback, which is also what every pre-`--lan` state
+    /// file reads back as.
+    #[serde(default)]
+    pub client_host: String,
 }
 
 impl RuntimeState {
@@ -50,6 +55,11 @@ impl RuntimeState {
             Component::Spacetime => self.spacetime.as_ref(),
             Component::Gateway => self.gateway.as_ref(),
         }
+    }
+
+    /// How the recorded stack's client-facing listeners are bound.
+    pub fn bind(&self) -> ClientBind {
+        ClientBind::from_recorded(&self.client_host)
     }
 
     pub fn set(&mut self, component: Component, record: Option<ProcessRecord>) {
@@ -81,6 +91,38 @@ mod tests {
         state.save(&path).unwrap();
 
         assert_eq!(RuntimeState::load(&path).unwrap(), state);
+    }
+
+    #[test]
+    fn state_written_before_lan_existed_reads_back_as_loopback() {
+        // A `state.json` from #251 has no `client_host` at all. It must load, not fail, and the
+        // stack it describes must be treated as the loopback one it is.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        fs::write(
+            &path,
+            r#"{"spacetime":null,"gateway":{"pid":42,"identity":"ours"},"database":"lyracore"}"#,
+        )
+        .unwrap();
+
+        let state = RuntimeState::load(&path).unwrap();
+        assert_eq!(state.record(Component::Gateway).unwrap().pid, 42);
+        assert_eq!(state.bind(), ClientBind::Loopback);
+    }
+
+    #[test]
+    fn a_recorded_lan_host_survives_a_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let state = RuntimeState {
+            client_host: "192.168.1.50".to_string(),
+            ..Default::default()
+        };
+        state.save(&path).unwrap();
+        assert_eq!(
+            RuntimeState::load(&path).unwrap().bind(),
+            ClientBind::parse_lan("192.168.1.50").unwrap()
+        );
     }
 
     #[test]

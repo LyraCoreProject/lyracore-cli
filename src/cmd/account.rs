@@ -4,8 +4,8 @@
 //! `gateway provision USER --password-stdin`, which computes the SRP6 salt/verifier itself — so
 //! neither this CLI nor the child ever exposes it through argv, and `ps` shows only the username.
 
-use crate::project::ProjectLayout;
 use crate::proc::{CommandSpec, ProcessRunner};
+use crate::project::ProjectLayout;
 use crate::{Error, Result};
 use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -29,7 +29,9 @@ pub fn create(
     runner: &dyn ProcessRunner,
 ) -> Result<()> {
     if user.trim().is_empty() {
-        return Err(Error::Usage("account create requires a username".to_string()));
+        return Err(Error::Usage(
+            "account create requires a username".to_string(),
+        ));
     }
 
     let password = match source {
@@ -218,7 +220,10 @@ mod tests {
         }
         // Nothing rendered — i.e. nothing loggable — carries the secret.
         for rendered in stack.rendered() {
-            assert!(!rendered.contains(SECRET), "leaked into a log line: {rendered}");
+            assert!(
+                !rendered.contains(SECRET),
+                "leaked into a log line: {rendered}"
+            );
         }
     }
 
@@ -226,8 +231,10 @@ mod tests {
     fn a_failing_provision_does_not_put_the_password_in_the_error() {
         let tmp = TempDir::new().unwrap();
         let project = project_with_gateway(&tmp);
-        let stack = FakeStack::new()
-            .fail_on("provision", "invalid password: expected 1-16 non-control ASCII bytes");
+        let stack = FakeStack::new().fail_on(
+            "provision",
+            "invalid password: expected 1-16 non-control ASCII bytes",
+        );
 
         let error = stack
             .runner()
@@ -267,7 +274,10 @@ mod tests {
     fn an_overlong_password_is_not_echoed_in_its_own_rejection() {
         let long = "p".repeat(64);
         let error = validate(long.as_bytes()).unwrap_err().to_string();
-        assert!(!error.contains(&long), "rejection echoed the password: {error}");
+        assert!(
+            !error.contains(&long),
+            "rejection echoed the password: {error}"
+        );
     }
 
     #[test]

@@ -6,7 +6,10 @@
 name = "lyracore-cli"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+# 1.85 is a floor the LOCKED dependency graph sets, not this crate's own code: several
+# transitive crates declare `edition = "2024"`, which Cargo needs 1.85 just to parse. (The
+# LyraCore workspace this CLI drives pins 1.93.0 for the same class of reason.)
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Source-first developer CLI for LyraCore"
 repository = "https://github.com/LyraCoreProject/lyracore-cli"
