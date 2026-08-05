@@ -5,7 +5,8 @@
 //! neither this CLI nor the child ever exposes it through argv, and `ps` shows only the username.
 
 use crate::proc::{CommandSpec, ProcessRunner};
-use crate::project::ProjectLayout;
+use crate::project::{ProjectLayout, Topology};
+use crate::state::RuntimeState;
 use crate::{Error, Result};
 use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -54,6 +55,11 @@ pub fn create(
     // the module — after the password had already been read. `dev up` is what mints and claims.
     let credential = crate::token::resolve_existing(runner, &project.token_file())?;
 
+    // Which topology `dev up` actually brought up, not which one is the default today. The child
+    // has to be handed the SAME realm-core the running gateway authenticates against, or the
+    // account is written somewhere the logon path never looks.
+    let topology = RuntimeState::load(&project.state_file())?.topology();
+
     let password = match source {
         PasswordSource::Stdin => read_line_secret(&mut std::io::stdin().lock())?,
         PasswordSource::Tty => read_password_from_tty()?,
@@ -61,7 +67,7 @@ pub fn create(
     validate(&password)?;
 
     runner.run_with_secret_stdin(
-        &provision_command(project, user, credential.token()),
+        &provision_command(project, user, credential.token(), topology),
         &password,
     )?;
     println!("✓ provisioned account '{}'.", user.to_uppercase());
@@ -70,18 +76,33 @@ pub fn create(
 
 /// The provisioning invocation. `user` is an argument; the password is not, and cannot be —
 /// `CommandSpec` has no way to carry one.
-fn provision_command(project: &ProjectLayout, user: &str, token: &str) -> CommandSpec {
-    CommandSpec::new(project.gateway_bin().to_string_lossy().to_string())
-        .arg("provision")
-        .arg(user)
-        .arg("--password-stdin")
-        .env(crate::token::TOKEN_VAR, token)
-        .env("LYRACORE_DATABASE", ProjectLayout::DATABASE)
-        .env("LYRACORE_SPACETIMEDB_URL", ProjectLayout::stdb_uri())
-        .env_remove("LYRACORE_SHARD_MAP")
-        .env_remove("LYRACORE_SHARD_MAP_FILE")
-        .env_remove("LYRACORE_REALM_CORE")
-        .env_remove("LYRACORE_REGION_SHARDS")
+///
+/// # Why this child needs the topology at all
+///
+/// `gateway provision` writes the account TWICE: once on the world shard, whose `#[auto_inc]`
+/// account id owns the characters, and once on realm-core, which is where the logon server answers
+/// the SRP6 challenge from. It finds realm-core the same way the running gateway does — out of
+/// `LYRACORE_REALM_CORE`. Left unset in a sharded realm it writes only the world shard's copy,
+/// reports success, and the account can never log in.
+///
+/// That variable list is [`ProjectLayout::TOPOLOGY_VARS`] and the decision is
+/// [`Topology::apply_env`], shared with the gateway launch. It used to be four inline `env_remove`
+/// calls here — which is how this child kept the pre-#11 behaviour after the gateway's changed.
+fn provision_command(
+    project: &ProjectLayout,
+    user: &str,
+    token: &str,
+    topology: Topology,
+) -> CommandSpec {
+    topology.apply_env(
+        CommandSpec::new(project.gateway_bin().to_string_lossy().to_string())
+            .arg("provision")
+            .arg(user)
+            .arg("--password-stdin")
+            .env(crate::token::TOKEN_VAR, token)
+            .env("LYRACORE_DATABASE", ProjectLayout::DATABASE)
+            .env("LYRACORE_SPACETIMEDB_URL", ProjectLayout::stdb_uri()),
+    )
 }
 
 fn validate(password: &[u8]) -> Result<()> {
@@ -197,12 +218,76 @@ mod tests {
         ProjectLayout::from_root(tmp.path()).unwrap()
     }
 
+    /// The sharded default, unless a test is specifically about the one-database fixture.
+    fn provision(project: &ProjectLayout, user: &str, token: &str) -> CommandSpec {
+        provision_command(project, user, token, Topology::Sharded)
+    }
+
+    // ---- the topology contract (#11) ----
+
+    #[test]
+    fn a_sharded_realm_provisions_against_realm_core() {
+        // `gateway provision` writes the account on the world shard AND on realm-core, and finds
+        // realm-core only through this variable. Unset, it writes one copy, reports success, and
+        // the account can never log in — the logon server answers the SRP6 challenge from
+        // realm-core and finds nothing there.
+        let tmp = TempDir::new().unwrap();
+        let cmd = provision(&project_with_gateway(&tmp), "TEST", FAKE_TOKEN);
+        assert_eq!(
+            cmd.env_value("LYRACORE_DATABASE"),
+            Some(ProjectLayout::DATABASE)
+        );
+        assert_eq!(
+            cmd.env_value("LYRACORE_REALM_CORE"),
+            Some(ProjectLayout::REALM_CORE)
+        );
+        assert!(!cmd.removes_env("LYRACORE_REALM_CORE"));
+    }
+
+    #[test]
+    fn the_single_database_fixture_still_unsets_every_topology_variable() {
+        // The pre-#11 behaviour of this child, kept exactly: a contributor with the production
+        // recipe exported provisions into the fixture, not into their production realm-core.
+        let tmp = TempDir::new().unwrap();
+        let cmd = provision_command(
+            &project_with_gateway(&tmp),
+            "TEST",
+            FAKE_TOKEN,
+            Topology::Single,
+        );
+        for var in ProjectLayout::TOPOLOGY_VARS {
+            assert_eq!(cmd.env_value(var), None, "{var} must not be set");
+            assert!(cmd.removes_env(var), "{var} must be actively unset");
+        }
+    }
+
+    #[test]
+    fn the_topology_comes_from_the_running_stack_not_from_the_current_default() {
+        // `account create` on a `--single` stack must not point the child at a realm-core that was
+        // never published, and one on a sharded stack must point at the one that was. The answer
+        // is in `state.json`, written by the `dev up` that started the gateway.
+        let tmp = TempDir::new().unwrap();
+        let project = project_with_gateway(&tmp);
+        crate::state::RuntimeState {
+            topology: Topology::Single.as_str().to_string(),
+            ..Default::default()
+        }
+        .save(&project.state_file())
+        .unwrap();
+        assert_eq!(
+            RuntimeState::load(&project.state_file())
+                .unwrap()
+                .topology(),
+            Topology::Single
+        );
+    }
+
     // ---- the secret contract ----
 
     #[test]
     fn the_password_is_never_a_command_argument() {
         let tmp = TempDir::new().unwrap();
-        let cmd = provision_command(&project_with_gateway(&tmp), "TEST", FAKE_TOKEN);
+        let cmd = provision(&project_with_gateway(&tmp), "TEST", FAKE_TOKEN);
 
         assert!(cmd.args().contains(&"--password-stdin".to_string()));
         assert!(
@@ -222,7 +307,7 @@ mod tests {
         // identity and the reducer refuses the write. The token must be there — in the
         // environment, not in argv, and not in anything rendered.
         let tmp = TempDir::new().unwrap();
-        let cmd = provision_command(&project_with_gateway(&tmp), "TEST", FAKE_TOKEN);
+        let cmd = provision(&project_with_gateway(&tmp), "TEST", FAKE_TOKEN);
         assert_eq!(cmd.env_value(crate::token::TOKEN_VAR), Some(FAKE_TOKEN));
         assert!(!cmd.render().contains(FAKE_TOKEN), "{}", cmd.render());
     }
@@ -265,7 +350,7 @@ mod tests {
         let credential =
             crate::token::resolve_existing(&FakeStack::new().runner(), &project.token_file())
                 .unwrap();
-        let cmd = provision_command(&project, "TEST", credential.token());
+        let cmd = provision(&project, "TEST", credential.token());
         assert_eq!(cmd.env_value(crate::token::TOKEN_VAR), Some(MINTED_TOKEN));
         assert!(!cmd.render().contains(MINTED_TOKEN), "{}", cmd.render());
     }
@@ -278,10 +363,7 @@ mod tests {
 
         stack
             .runner()
-            .run_with_secret_stdin(
-                &provision_command(&project, "TEST", FAKE_TOKEN),
-                SECRET.as_bytes(),
-            )
+            .run_with_secret_stdin(&provision(&project, "TEST", FAKE_TOKEN), SECRET.as_bytes())
             .unwrap();
 
         match stack.calls().as_slice() {
@@ -311,10 +393,7 @@ mod tests {
 
         let error = stack
             .runner()
-            .run_with_secret_stdin(
-                &provision_command(&project, "TEST", FAKE_TOKEN),
-                SECRET.as_bytes(),
-            )
+            .run_with_secret_stdin(&provision(&project, "TEST", FAKE_TOKEN), SECRET.as_bytes())
             .unwrap_err();
 
         assert!(

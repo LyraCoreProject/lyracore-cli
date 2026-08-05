@@ -37,6 +37,9 @@ struct Inner {
     failures: HashMap<String, String>,
     /// Canned stdout, keyed by a substring of the rendered command. Overrides the defaults below.
     stdouts: HashMap<String, String>,
+    /// A spawned gateway's whole log file, in place of the one derived from its environment. For
+    /// the case the derivation cannot express: a build that never logs its shard connections.
+    log_override: Option<String>,
 }
 
 /// A fake machine: which processes exist, which ports answer, and what was run.
@@ -83,6 +86,13 @@ impl FakeStack {
             .unwrap()
             .stdouts
             .insert(needle.to_string(), stdout.to_string());
+        self
+    }
+
+    /// Write this, verbatim, as the log of any gateway spawned on this stack — instead of the one
+    /// derived from the topology variables it was handed.
+    pub fn with_gateway_log(self, text: &str) -> Self {
+        self.0.lock().unwrap().log_override = Some(text.to_string());
         self
     }
 
@@ -165,6 +175,86 @@ fn endpoint_for(cmd: &CommandSpec) -> Option<String> {
         return cmd.env_value("LYRACORE_WORLD_BIND").map(str::to_string);
     }
     None
+}
+
+/// What a spawned gateway writes to its log — modelled from the ENVIRONMENT it was handed, the
+/// same way the real one derives it (`ShardMap::from_env` → `Coordinator::connect`).
+///
+/// This is the point of the fake, not decoration. The failure #11 is shaped around is that a wrong
+/// topology variable produces a gateway that starts, binds, answers, and serves ONE database — so a
+/// fake that always logged four shards would make every silent-collapse test pass against a world
+/// where the collapse cannot happen. Reproduced here, rule for rule:
+///
+/// - a shard-map rule that is not `<map|*>:<bucket|*>=<db>` is DROPPED (`ShardMap::parse` logs and
+///   skips it), and so is `<map>=<db>` shorthand's malformed cousin;
+/// - `LYRACORE_REALM_CORE` that is blank, absent, or EQUAL to the default database reads as
+///   unconfigured (`with_realm_core`);
+/// - `LYRACORE_REGION_SHARDS` drops the default database, realm-core, and anything a rule already
+///   names (`with_region_shards`);
+/// - an empty `LYRACORE_SHARD_MAP` is still SET, and therefore suppresses `LYRACORE_SHARD_MAP_FILE`.
+///
+/// Every one of those is silent in the real gateway's behaviour and visible only as a database
+/// missing from this list.
+fn gateway_log(cmd: &CommandSpec) -> String {
+    let default_db = cmd.env_value("LYRACORE_DATABASE").unwrap_or("lyracore");
+    let mut dbs = vec![default_db.to_string()];
+
+    // `LYRACORE_SHARD_MAP` wins over `_FILE` even when empty; the fake never reads a file.
+    for raw in cmd
+        .env_value("LYRACORE_SHARD_MAP")
+        .unwrap_or("")
+        .split(['\n', ',', ';'])
+    {
+        let rule = raw.split('#').next().unwrap_or("").trim();
+        if rule.is_empty() {
+            continue;
+        }
+        // `<map|*>:<bucket|*>=<db>`, or the `<map|*>=<db>` shorthand.
+        let Some((selector, db)) = rule.split_once('=') else {
+            continue; // malformed: logged and dropped
+        };
+        let (map, bucket) = selector.split_once(':').unwrap_or((selector, "*"));
+        let parses = |field: &str| field == "*" || field.parse::<u64>().is_ok();
+        if db.trim().is_empty() || !parses(map.trim()) || !parses(bucket.trim()) {
+            continue; // malformed: logged and dropped
+        }
+        let db = db.trim().to_string();
+        if !dbs.contains(&db) {
+            dbs.push(db);
+        }
+    }
+
+    // Blank, absent or default-equal all mean "unconfigured".
+    let realm_core = cmd
+        .env_value("LYRACORE_REALM_CORE")
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && *n != default_db);
+
+    for raw in cmd
+        .env_value("LYRACORE_REGION_SHARDS")
+        .unwrap_or("")
+        .split(['\n', ',', ';'])
+    {
+        let name = raw.split('#').next().unwrap_or("").trim();
+        // The default is already connected; realm-core owns no characters and is refused outright.
+        if name.is_empty() || name == default_db || Some(name) == realm_core {
+            continue;
+        }
+        if !dbs.iter().any(|d| d == name) {
+            dbs.push(name.to_string());
+        }
+    }
+    dbs.extend(realm_core.map(str::to_string));
+
+    let mut log = format!(
+        "gateway starting: logon={} world={} db={default_db}\n",
+        cmd.env_value("LYRACORE_LOGON_BIND").unwrap_or("?"),
+        cmd.env_value("LYRACORE_WORLD_BIND").unwrap_or("?"),
+    );
+    for db in dbs {
+        log.push_str(&format!("coordinator connected to shard {db}\n"));
+    }
+    log
 }
 
 /// The auth token a `FakeStack`'s `spacetime` CLI hands out. A distinctive literal, so a test can
@@ -270,6 +360,23 @@ impl ProcessRunner for FakeProcessRunner {
             },
             &render,
         )?;
+
+        // A spawned gateway writes a log, because reading that log back is how `dev up` checks the
+        // realised topology. `log_override` models the one case the derivation cannot: a gateway
+        // build that does not log its shard connections at all.
+        if render.contains("gateway") {
+            let text = self
+                .0
+                .lock()
+                .unwrap()
+                .log_override
+                .clone()
+                .unwrap_or_else(|| gateway_log(cmd));
+            if let Some(parent) = log.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(log, text);
+        }
 
         let endpoint = endpoint_for(cmd);
         let mut inner = self.0.lock().unwrap();

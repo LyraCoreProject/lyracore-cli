@@ -151,6 +151,8 @@ pub mod fake {
     pub struct FakeHttp {
         requests: Arc<Mutex<Vec<Request>>>,
         failure: Option<String>,
+        /// Refuse only the requests whose URL contains this — one reducer, not the whole node.
+        refused: Option<String>,
     }
 
     impl FakeHttp {
@@ -163,6 +165,17 @@ pub mod fake {
         pub fn failing(message: &str) -> Self {
             Self {
                 failure: Some(message.to_string()),
+                ..Self::default()
+            }
+        }
+
+        /// A node that answers everything except the requests whose URL contains `needle`, which it
+        /// refuses with `message`. For a reducer that rejects its ARGUMENT — the seam-menu import
+        /// refusing a malformed row, say — while the rest of the run is healthy.
+        pub fn refusing(needle: &str, message: &str) -> Self {
+            Self {
+                failure: Some(message.to_string()),
+                refused: Some(needle.to_string()),
                 ..Self::default()
             }
         }
@@ -188,7 +201,13 @@ pub mod fake {
                 body: body.to_string(),
             });
             if let Some(message) = &self.failure {
-                return Err(Error::Http(format!("{url} answered HTTP 400: {message}")));
+                let refused = self
+                    .refused
+                    .as_ref()
+                    .is_none_or(|n| url.contains(n.as_str()));
+                if refused {
+                    return Err(Error::Http(format!("{url} answered HTTP 400: {message}")));
+                }
             }
             Ok(if url.ends_with("/v1/identity") {
                 format!(r#"{{"identity":"{MINTED_IDENTITY}","token":"{MINTED_TOKEN}"}}"#)
