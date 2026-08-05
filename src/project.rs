@@ -9,7 +9,63 @@
 //! code, or output format changed.
 
 use crate::{Error, Result};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+
+/// Where the CLIENT-FACING listeners (logon + world) bind.
+///
+/// SpacetimeDB is deliberately absent from this choice: it is loopback in *every* mode. The
+/// database speaks an unauthenticated-by-default admin protocol on :3000, and `--lan` exists so a
+/// second machine can run a 1.12.1 client — not so it can publish modules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientBind {
+    /// The default: only this machine can reach the realm.
+    Loopback,
+    /// A private-LAN IPv4 address of this machine, from `dev up --lan <IP>`.
+    Lan(Ipv4Addr),
+}
+
+impl ClientBind {
+    /// The host the logon/world listeners bind to, and the host a client must connect to.
+    pub fn host(&self) -> String {
+        match self {
+            ClientBind::Loopback => Ipv4Addr::LOCALHOST.to_string(),
+            ClientBind::Lan(ip) => ip.to_string(),
+        }
+    }
+
+    /// Parse `--lan <IP>`.
+    ///
+    /// Only RFC1918 addresses are accepted. A public address would put an alpha game server with
+    /// no rate limiting and a 2004 password hash on the internet from a `dev` command; `0.0.0.0`
+    /// would do the same by accident, on every interface at once. Neither is a private LAN, and
+    /// neither is something this fixture should be able to do by typo.
+    pub fn parse_lan(raw: &str) -> Result<Self> {
+        let ip: Ipv4Addr = raw.trim().parse().map_err(|_| {
+            Error::Usage(format!(
+                "--lan needs a private IPv4 address of this machine, got '{raw}'"
+            ))
+        })?;
+        if !ip.is_private() {
+            return Err(Error::Usage(format!(
+                "--lan refuses {ip}: it is not a private-LAN address. Use one of this machine's \
+                 own addresses in 10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16 (`ip addr` / \
+                 `ifconfig`). Loopback is already the default, and this fixture must never be \
+                 published to a public address."
+            )));
+        }
+        Ok(ClientBind::Lan(ip))
+    }
+
+    /// A restored `client_host` from `state.json`. Anything that is not a private address — a
+    /// hand-edited state file, or the loopback default — reads back as loopback.
+    pub fn from_recorded(host: &str) -> Self {
+        match host.parse::<Ipv4Addr>() {
+            Ok(ip) if ip.is_private() => ClientBind::Lan(ip),
+            _ => ClientBind::Loopback,
+        }
+    }
+}
 
 /// A component the CLI can own a process for. The string form is also the log file stem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,11 +88,21 @@ impl Component {
         Component::ALL.into_iter().find(|c| c.as_str() == name)
     }
 
-    /// The loopback port whose answering means "this component is serving".
+    /// The port whose answering means "this component is serving".
     pub fn health_port(&self) -> u16 {
         match self {
             Component::Spacetime => ProjectLayout::STDB_PORT,
             Component::Gateway => ProjectLayout::WORLD_PORT,
+        }
+    }
+
+    /// The host that port must be probed on. The database is loopback in every mode; the gateway
+    /// is wherever `--lan` bound it — probing 127.0.0.1 for a LAN-bound gateway reports a healthy
+    /// process as permanently "starting".
+    pub fn health_host(&self, bind: &ClientBind) -> String {
+        match self {
+            Component::Spacetime => std::net::Ipv4Addr::LOCALHOST.to_string(),
+            Component::Gateway => bind.host(),
         }
     }
 }
@@ -58,8 +124,11 @@ impl ProjectLayout {
     pub const GATEWAY_BIN: &'static str = "target/debug/lyracore-gateway";
     pub const PUBLISH_SCRIPT: &'static str = "scripts/publish-module.sh";
 
-    // Loopback-only binds. The fixture is a contributor's own machine, never a LAN listener
-    // (`--lan` is parent #228's, after #225/#246).
+    /// The wire harness's entrypoint into this checkout, used by `dev smoke` (#246).
+    pub const SUITE_SCRIPT: &'static str = "adapters/lyracore/run-suite.sh";
+
+    // The database is loopback in every mode. Only the two client-facing ports follow the
+    // `ClientBind` chosen by `dev up [--lan IP]`.
     pub const STDB_PORT: u16 = 3000;
     pub const LOGON_PORT: u16 = 3724;
     pub const WORLD_PORT: u16 = 8085;
@@ -70,11 +139,16 @@ impl ProjectLayout {
     pub fn stdb_uri() -> String {
         format!("http://127.0.0.1:{}", Self::STDB_PORT)
     }
-    pub fn logon_bind() -> String {
-        format!("127.0.0.1:{}", Self::LOGON_PORT)
+    pub fn logon_bind(bind: &ClientBind) -> String {
+        format!("{}:{}", bind.host(), Self::LOGON_PORT)
     }
-    pub fn world_bind() -> String {
-        format!("127.0.0.1:{}", Self::WORLD_PORT)
+    pub fn world_bind(bind: &ClientBind) -> String {
+        format!("{}:{}", bind.host(), Self::WORLD_PORT)
+    }
+    /// What the realm list must advertise, so a client that reached the logon tier over the LAN is
+    /// sent to a world address it can also reach (the seeded `game_realm` row says loopback).
+    pub fn realm_address(bind: &ClientBind) -> String {
+        Self::world_bind(bind)
     }
 
     // ---- layout discovery ----
@@ -138,6 +212,10 @@ impl ProjectLayout {
         self.root.join(Self::PUBLISH_SCRIPT)
     }
 
+    pub fn suite_script(&self) -> PathBuf {
+        self.root.join(Self::SUITE_SCRIPT)
+    }
+
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(&self.logs_dir)?;
         Ok(())
@@ -174,6 +252,71 @@ mod tests {
             layout.log_file(Component::Gateway),
             tmp.path().join(".lyracore/logs/gateway.log")
         );
+    }
+
+    // ---- the `--lan` bind contract ----
+
+    #[test]
+    fn lan_accepts_the_three_private_ranges_only() {
+        for ok in ["192.168.1.50", "10.0.0.7", "172.16.4.4", "172.31.255.254"] {
+            assert!(
+                ClientBind::parse_lan(ok).is_ok(),
+                "{ok} is a private address"
+            );
+        }
+        // A public address, the wildcard, loopback, a link-local, a hostname and an IPv6 literal.
+        // `--lan 0.0.0.0` in particular is the one-character typo that would expose the fixture on
+        // every interface, so it must be a usage error rather than a "well, it binds".
+        for refused in [
+            "8.8.8.8",
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.32.0.1",
+            "my-desktop.local",
+            "::1",
+            "",
+        ] {
+            let error = ClientBind::parse_lan(refused).unwrap_err();
+            assert_eq!(
+                error.exit_code(),
+                crate::error::EXIT_USAGE,
+                "--lan {refused} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_client_facing_ports_follow_the_lan_address() {
+        let lan = ClientBind::parse_lan("192.168.1.50").unwrap();
+        assert_eq!(ProjectLayout::logon_bind(&lan), "192.168.1.50:3724");
+        assert_eq!(ProjectLayout::world_bind(&lan), "192.168.1.50:8085");
+        assert_eq!(ProjectLayout::realm_address(&lan), "192.168.1.50:8085");
+        // The database never leaves loopback, whatever `--lan` says.
+        assert_eq!(ProjectLayout::stdb_listen(), "127.0.0.1:3000");
+        assert_eq!(ProjectLayout::stdb_uri(), "http://127.0.0.1:3000");
+        assert_eq!(
+            Component::Spacetime.health_host(&lan),
+            "127.0.0.1",
+            "the database is probed on loopback in every mode"
+        );
+        assert_eq!(Component::Gateway.health_host(&lan), "192.168.1.50");
+    }
+
+    #[test]
+    fn the_default_bind_is_loopback_everywhere() {
+        let bind = ClientBind::Loopback;
+        assert_eq!(ProjectLayout::logon_bind(&bind), "127.0.0.1:3724");
+        assert_eq!(ProjectLayout::world_bind(&bind), "127.0.0.1:8085");
+    }
+
+    #[test]
+    fn a_recorded_host_round_trips_and_junk_falls_back_to_loopback() {
+        let lan = ClientBind::parse_lan("10.1.2.3").unwrap();
+        assert_eq!(ClientBind::from_recorded(&lan.host()), lan);
+        for junk in ["", "127.0.0.1", "8.8.8.8", "not-an-address"] {
+            assert_eq!(ClientBind::from_recorded(junk), ClientBind::Loopback);
+        }
     }
 
     #[test]

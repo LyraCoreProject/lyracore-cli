@@ -88,7 +88,9 @@ mod tests {
 
     #[test]
     fn render_round_trips_program_and_args() {
-        let cmd = CommandSpec::new("spacetime").arg("call").arg("claim_operator");
+        let cmd = CommandSpec::new("spacetime")
+            .arg("call")
+            .arg("claim_operator");
         assert_eq!(cmd.render(), "spacetime call claim_operator");
     }
 

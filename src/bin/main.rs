@@ -32,13 +32,17 @@ fn run(args: &[String]) -> Result<i32> {
             let blocking = cmd::doctor::report(&checks);
             Ok(if blocking { EXIT_FAILURE } else { EXIT_OK })
         }
-        Command::DevUp => {
+        Command::DevUp { bind } => {
             let mut dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
-            dev.up(&runner, &inspector).map(|_| EXIT_OK)
+            dev.up(&runner, &inspector, bind).map(|_| EXIT_OK)
         }
         Command::DevStatus => {
             let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
-            dev.status(&inspector).map(|_| EXIT_OK)
+            dev.status(&runner, &inspector).map(|_| EXIT_OK)
+        }
+        Command::DevSmoke => {
+            let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
+            dev.smoke(&runner, &inspector).map(|_| EXIT_OK)
         }
         Command::DevLogs(component) => {
             let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
