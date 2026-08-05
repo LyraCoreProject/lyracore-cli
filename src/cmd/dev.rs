@@ -1417,7 +1417,7 @@ mod tests {
                         crate::http::fake::MINTED_TOKEN
                     ));
                 }
-                Err(Error::Process(format!(
+                Err(Error::Http(format!(
                     "{url} answered HTTP 400: operator already claimed"
                 )))
             }
@@ -1438,6 +1438,13 @@ mod tests {
         assert!(
             error.to_string().contains("coordinator-token"),
             "and the way out must be named: {error}"
+        );
+        // A node failure wrapped in a node failure would print "process error: process error: …",
+        // which is the only thing anyone would notice about the message.
+        assert_eq!(
+            error.to_string().matches("process error:").count(),
+            1,
+            "the wrapped error double-prefixed itself: {error}"
         );
     }
 

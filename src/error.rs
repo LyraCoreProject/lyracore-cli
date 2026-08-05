@@ -25,6 +25,14 @@ pub enum Error {
     #[error("process error: {0}")]
     Process(String),
 
+    /// A failed request to the local SpacetimeDB node (`http.rs`).
+    ///
+    /// Its `Display` adds no prefix of its own, deliberately: every one of these is wrapped by the
+    /// caller that knows what the request was FOR, and a nested "process error: process error:"
+    /// would be the only thing a contributor noticed about the message.
+    #[error("{0}")]
+    Http(String),
+
     /// `down` found the recorded PID belongs to something else. Never kill it.
     #[error(
         "refusing to stop {component}: PID {pid} is no longer the process this CLI started \
@@ -76,6 +84,13 @@ mod tests {
         assert_eq!(
             Error::PrerequisiteMissing("nope".into()).exit_code(),
             EXIT_FAILURE
+        );
+        assert_eq!(Error::Http("nope".into()).exit_code(), EXIT_FAILURE);
+        // ...and an Http error adds no prefix of its own, because every one of them is wrapped by
+        // a caller that says what the request was for.
+        assert_eq!(
+            Error::Http("node said no".into()).to_string(),
+            "node said no"
         );
         assert_eq!(
             Error::SubprocessFailed {
