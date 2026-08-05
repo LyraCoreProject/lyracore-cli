@@ -1,12 +1,14 @@
 pub mod account;
 pub mod dev;
 pub mod doctor;
+pub mod import;
 pub mod preflight;
 pub mod publish;
 
 use crate::project::{ClientBind, Component};
 use crate::{Error, Result};
 use account::PasswordSource;
+use import::ImportOptions;
 
 pub const USAGE: &str = "\
 lyracore — local LyraCore development
@@ -27,6 +29,13 @@ USAGE:
   lyracore dev down [--forget]                 stop the processes this CLI started
   lyracore account create USER [--password-stdin]
                                                provision an account's SRP6 credentials
+  lyracore import [--client-data PATH]         build the REAL world in place of the seed
+                                               fixture: pull cmangos' classic-db, read your
+                                               own 1.12.1 client's Data/ archives, run the
+                                               world ETL and the class-spell import. Asks
+                                               for consent first, every time
+  lyracore import --accept                     the same, with the consent answered in
+                                               advance (scripted runs)
 
 The password is read from stdin with --password-stdin, otherwise from a hidden terminal
 prompt. It is never passed as a command-line argument.";
@@ -52,6 +61,7 @@ pub enum Command {
         user: String,
         source: PasswordSource,
     },
+    Import(ImportOptions),
     Help,
 }
 
@@ -131,9 +141,53 @@ impl Command {
                 "`account` supports: create USER [--password-stdin]".to_string(),
             )),
 
+            // `import` takes two options and no positional arguments. A bare path is the shape
+            // somebody will type first (`lyracore import /games/wow/Data`), so it is refused by
+            // NAME rather than as "unknown command".
+            ["import", rest @ ..] => parse_import(rest),
+
             [other, ..] => Err(Error::Usage(format!("unknown command '{other}'"))),
         }
     }
+}
+
+fn parse_import(args: &[&str]) -> Result<Command> {
+    let mut options = ImportOptions::default();
+    let mut rest = args;
+    while let Some((head, tail)) = rest.split_first() {
+        match *head {
+            "--accept" => {
+                options.accept = true;
+                rest = tail;
+            }
+            "--client-data" => match tail.split_first() {
+                Some((path, after)) if !path.starts_with('-') => {
+                    options.client_data = Some((*path).to_string());
+                    rest = after;
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "`import --client-data` needs the path to your 1.12.1 client's Data/ \
+                         directory, e.g. `--client-data /games/WoW-1.12.1/Data`"
+                            .to_string(),
+                    ))
+                }
+            },
+            other if other.starts_with('-') => {
+                return Err(Error::Usage(format!(
+                    "unknown `import` option '{other}' — the only ones are --accept and \
+                     --client-data PATH"
+                )))
+            }
+            other => {
+                return Err(Error::Usage(format!(
+                    "`import` takes no positional arguments (got '{other}'). Name the client \
+                     directory with --client-data {other}"
+                )))
+            }
+        }
+    }
+    Ok(Command::Import(options))
 }
 
 #[cfg(test)]
@@ -286,6 +340,65 @@ mod tests {
     fn preflight_takes_no_arguments() {
         assert_eq!(parse("preflight").unwrap(), Command::Preflight);
         assert!(parse("preflight lyracore").is_err());
+    }
+
+    #[test]
+    fn import_parses_its_two_options_in_any_order() {
+        assert_eq!(
+            parse("import").unwrap(),
+            Command::Import(import::ImportOptions::default())
+        );
+        assert_eq!(
+            parse("import --accept").unwrap(),
+            Command::Import(import::ImportOptions {
+                accept: true,
+                client_data: None,
+            })
+        );
+        assert_eq!(
+            parse("import --client-data /games/wow/Data --accept").unwrap(),
+            Command::Import(import::ImportOptions {
+                accept: true,
+                client_data: Some("/games/wow/Data".to_string()),
+            })
+        );
+        assert_eq!(
+            parse("import --accept --client-data /games/wow/Data").unwrap(),
+            Command::Import(import::ImportOptions {
+                accept: true,
+                client_data: Some("/games/wow/Data".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn import_refuses_a_bare_path_by_naming_the_flag_it_wanted() {
+        let error = parse("import /games/wow/Data").unwrap_err();
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
+        assert!(error.to_string().contains("--client-data"), "{error}");
+    }
+
+    #[test]
+    fn import_rejects_an_empty_or_flag_shaped_client_data_value() {
+        for line in [
+            "import --client-data",
+            "import --client-data --accept",
+            "import --nonsense",
+        ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(
+                error.exit_code(),
+                crate::error::EXIT_USAGE,
+                "`{line}` should be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_text_documents_import() {
+        assert!(USAGE.contains("lyracore import"), "{USAGE}");
+        assert!(USAGE.contains("--client-data"), "{USAGE}");
+        assert!(USAGE.contains("--accept"), "{USAGE}");
     }
 
     #[test]
