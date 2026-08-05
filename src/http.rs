@@ -43,12 +43,12 @@ impl HttpClient for LoopbackHttpClient {
         let (authority, path) = split_url(url)?;
         let address = authority
             .to_socket_addrs()
-            .map_err(|e| Error::Process(format!("cannot resolve {authority}: {e}")))?
+            .map_err(|e| Error::Http(format!("cannot resolve {authority}: {e}")))?
             .next()
-            .ok_or_else(|| Error::Process(format!("cannot resolve {authority}")))?;
+            .ok_or_else(|| Error::Http(format!("cannot resolve {authority}")))?;
 
         let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)
-            .map_err(|e| Error::Process(format!("cannot reach {url}: {e}")))?;
+            .map_err(|e| Error::Http(format!("cannot reach {url}: {e}")))?;
         stream.set_read_timeout(Some(TIMEOUT))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
 
@@ -67,14 +67,14 @@ impl HttpClient for LoopbackHttpClient {
 
         stream
             .write_all(request.as_bytes())
-            .map_err(|e| Error::Process(format!("cannot send to {url}: {e}")))?;
+            .map_err(|e| Error::Http(format!("cannot send to {url}: {e}")))?;
         stream.flush()?;
 
         // `Connection: close` means the response ends at EOF, so this needs no framing.
         let mut response = Vec::new();
         stream
             .read_to_end(&mut response)
-            .map_err(|e| Error::Process(format!("no answer from {url}: {e}")))?;
+            .map_err(|e| Error::Http(format!("no answer from {url}: {e}")))?;
         interpret(url, &String::from_utf8_lossy(&response))
     }
 }
@@ -83,7 +83,7 @@ impl HttpClient for LoopbackHttpClient {
 fn split_url(url: &str) -> Result<(&str, &str)> {
     let rest = url
         .strip_prefix("http://")
-        .ok_or_else(|| Error::Process(format!("{url} is not a plaintext http:// URL")))?;
+        .ok_or_else(|| Error::Http(format!("{url} is not a plaintext http:// URL")))?;
     match rest.find('/') {
         Some(slash) => Ok((&rest[..slash], &rest[slash..])),
         None => Ok((rest, "/")),
@@ -94,20 +94,20 @@ fn split_url(url: &str) -> Result<(&str, &str)> {
 fn interpret(url: &str, response: &str) -> Result<String> {
     let (head, body) = response
         .split_once("\r\n\r\n")
-        .ok_or_else(|| Error::Process(format!("{url} answered with a truncated HTTP response")))?;
+        .ok_or_else(|| Error::Http(format!("{url} answered with a truncated HTTP response")))?;
     let status: u16 = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse().ok())
-        .ok_or_else(|| Error::Process(format!("{url} answered without an HTTP status line")))?;
+        .ok_or_else(|| Error::Http(format!("{url} answered without an HTTP status line")))?;
 
     if (200..300).contains(&status) {
         return Ok(body.to_string());
     }
     // The node's message is the actionable half ("operator already claimed"), so it is quoted —
     // and it is the node's, not ours: nothing here can contain the credential we sent.
-    Err(Error::Process(format!(
+    Err(Error::Http(format!(
         "{url} answered HTTP {status}: {}",
         body.trim().lines().next().unwrap_or("(no detail)")
     )))
@@ -188,9 +188,7 @@ pub mod fake {
                 body: body.to_string(),
             });
             if let Some(message) = &self.failure {
-                return Err(Error::Process(format!(
-                    "{url} answered HTTP 400: {message}"
-                )));
+                return Err(Error::Http(format!("{url} answered HTTP 400: {message}")));
             }
             Ok(if url.ends_with("/v1/identity") {
                 format!(r#"{{"identity":"{MINTED_IDENTITY}","token":"{MINTED_TOKEN}"}}"#)
