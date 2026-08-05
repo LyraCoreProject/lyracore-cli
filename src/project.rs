@@ -200,6 +200,14 @@ impl ProjectLayout {
         self.state_dir.join("state.json")
     }
 
+    /// The coordinator credential this CLI minted from the local node (#297), if it ever had to.
+    ///
+    /// Inside the git-ignored state directory, next to `state.json` — a credential that belongs to
+    /// this checkout's fixture and to nothing else, and that must never become a commit.
+    pub fn token_file(&self) -> PathBuf {
+        self.state_dir.join("coordinator-token")
+    }
+
     pub fn log_file(&self, component: Component) -> PathBuf {
         self.logs_dir.join(format!("{}.log", component.as_str()))
     }
@@ -248,6 +256,11 @@ mod tests {
         std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
         let layout = ProjectLayout::from_root(tmp.path()).unwrap();
         assert_eq!(layout.state_file(), tmp.path().join(".lyracore/state.json"));
+        // The one credential on disk lives in the same ignored directory (#297).
+        assert_eq!(
+            layout.token_file(),
+            tmp.path().join(".lyracore/coordinator-token")
+        );
         assert_eq!(
             layout.log_file(Component::Gateway),
             tmp.path().join(".lyracore/logs/gateway.log")

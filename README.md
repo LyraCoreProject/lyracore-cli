@@ -20,7 +20,8 @@ lyracore account create USER [--password-stdin]
 ```
 
 Runtime state lives in the git-ignored `.lyracore/` of the target checkout — `state.json` for the
-processes the CLI started, and `logs/{spacetime,gateway}.log`.
+processes the CLI started, `logs/{spacetime,gateway}.log`, and `coordinator-token` (mode `0600`) if
+this host had no SpacetimeDB login and the CLI minted a local identity.
 
 ## What `dev up` does
 
@@ -31,26 +32,47 @@ processes the CLI started, and `logs/{spacetime,gateway}.log`.
    `scripts/publish-module.sh` — which is what guarantees `--features=debug_reducers`, `--yes`,
    `-s local`, and the refusal to forward a `-c` wipe. No path here invokes `spacetime publish`
    directly, clears a database, or re-selects the SpacetimeDB server.
-4. Calls `claim_operator` (idempotent for the same identity, so repeating `dev up` is not an error).
-5. Reads the `spacetime` CLI's auth token (`spacetime login show --token`) and starts the gateway
-   with it, bound to loopback.
+4. Resolves the coordinator credential (see below), minting one from the local node if this host has
+   no SpacetimeDB login.
+5. Calls `claim_operator` **as that identity** (idempotent for the same identity, so repeating
+   `dev up` is not an error).
+6. Starts the gateway with the same credential, bound to loopback.
 
-### The coordinator token
+### The coordinator credential
 
-Step 5 is not optional plumbing. `game_account` and `game_session` are **private** module tables and
-`provision_account` is operator-gated, so the gateway's coordinator connection has to authenticate
-as the identity that published the module and claimed the operator — which, here, is the
-`spacetime` CLI's own identity. Without it the gateway starts, warns, and dies ~15 seconds later on
-`coordinator subscriptions not applied within 15s`, which reads like a broken node rather than a
-missing credential; `account create` would fail as "operator only" for the same reason.
+Steps 4–6 are not optional plumbing. `game_account` and `game_session` are **private** module tables
+and `provision_account` is operator-gated, so the gateway's coordinator connection has to
+authenticate as the identity that claimed the operator. Without it the gateway starts, warns, and
+dies ~15 seconds later on `coordinator subscriptions not applied within 15s`, which reads like a
+broken node rather than a missing credential; `account create` would fail as "operator only" for the
+same reason.
 
-So `dev up` and `account create` both resolve the token first and **refuse to start anything** if
-they cannot, telling you to run `spacetime login`. The token is asked of the CLI rather than parsed
-out of `cli.toml`, because that file's location is the CLI's business and differs per platform.
+Where the credential comes from, in order:
 
-It reaches the child as an **environment variable, never an argument** (`ps` shows nothing), and
-`CommandSpec` renders program and arguments only — so it cannot reach a log line, an error message,
-or `state.json`.
+1. **`.lyracore/coordinator-token`** — one this CLI minted on an earlier run. It wins, because it is
+   the identity that already claimed the operator: `claim_operator` is idempotent for the same
+   identity and refuses a different one, so preferring anything else once this file exists would
+   lock the checkout out of its own database.
+2. **`spacetime login show --token`** — if you already use SpacetimeDB, your identity is reused and
+   nothing is minted or stored.
+3. **`POST /v1/identity` on the local node** — a **server-issued** identity, minted from the node
+   `dev up` just started and persisted at mode `0600`.
+
+Step 3 is what keeps the quickstart anonymous. `spacetime login` offers only the spacetimedb.com
+browser flow, so requiring it would put a third-party account signup in front of `git clone &&
+./lyracore dev up`; a server-issued token is exactly as privileged here, because the module trusts
+whoever claimed the operator and this CLI claims it with the token it just minted. That claim is
+made over the node's HTTP API rather than by shelling out to `spacetime call`, which would run as
+the CLI's identity instead — a claim by one identity and a gateway running as another is precisely
+the lock-out this avoids.
+
+`account create` uses the same ladder **without** step 3: a freshly minted identity has claimed
+nothing, so it would be refused after the password had already been read. It says to run `dev up`.
+
+The credential reaches a child as an **environment variable, never an argument** (`ps` shows
+nothing), and as an `Authorization` header, never a URL. `CommandSpec` renders program and arguments
+only — so it cannot reach a log line, an error message, or `state.json`. The one place it touches
+disk is `.lyracore/coordinator-token`, created `0600`, inside a git-ignored directory.
 
 Re-running `dev up` on a healthy stack does nothing; on a partially-up stack it starts only the
 missing part.
