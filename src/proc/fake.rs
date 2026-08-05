@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
     Wait(CommandSpec),
+    Stream(CommandSpec),
     SecretStdin { spec: CommandSpec, secret: Vec<u8> },
     Spawn { spec: CommandSpec, log: PathBuf },
     Terminate(u32),
@@ -26,7 +27,12 @@ pub enum Call {
 struct Inner {
     calls: Vec<Call>,
     processes: HashMap<u32, String>,
-    ports: HashSet<u16>,
+    /// Answering endpoints, as `host:port` — a fake gateway bound to a LAN address answers there
+    /// and nowhere else, exactly like the real one.
+    endpoints: HashSet<String>,
+    /// Which spawned PID opened which endpoint, so terminating it closes the listener like a
+    /// real one. (A pre-existing endpoint has no PID here and survives, also like a real one.)
+    listeners: HashMap<u32, String>,
     next_pid: u32,
     failures: HashMap<String, String>,
 }
@@ -45,13 +51,26 @@ impl FakeStack {
 
     /// A process that already exists — e.g. one recorded by an earlier `dev up`.
     pub fn with_process(self, pid: u32, identity: &str) -> Self {
-        self.0.lock().unwrap().processes.insert(pid, identity.to_string());
+        self.0
+            .lock()
+            .unwrap()
+            .processes
+            .insert(pid, identity.to_string());
         self
     }
 
-    /// A port already being served, by something this CLI did not start.
+    /// A loopback port already being served, by something this CLI did not start.
     pub fn with_port(self, port: u16) -> Self {
-        self.0.lock().unwrap().ports.insert(port);
+        self.with_endpoint("127.0.0.1", port)
+    }
+
+    /// The same, on a named host — for the `--lan` binds.
+    pub fn with_endpoint(self, host: &str, port: u16) -> Self {
+        self.0
+            .lock()
+            .unwrap()
+            .endpoints
+            .insert(format!("{host}:{port}"));
         self
     }
 
@@ -82,9 +101,10 @@ impl FakeStack {
         self.calls()
             .iter()
             .map(|call| match call {
-                Call::Wait(spec) | Call::SecretStdin { spec, .. } | Call::Spawn { spec, .. } => {
-                    spec.render()
-                }
+                Call::Wait(spec)
+                | Call::Stream(spec)
+                | Call::SecretStdin { spec, .. }
+                | Call::Spawn { spec, .. } => spec.render(),
                 Call::Terminate(pid) => format!("kill {pid}"),
             })
             .collect()
@@ -120,21 +140,29 @@ impl FakeProcessRunner {
     }
 }
 
-/// Which port a spawned command starts serving, so a fake spawn behaves like a real one.
-fn port_for(render: &str) -> Option<u16> {
+/// Which endpoint a spawned command starts serving, so a fake spawn behaves like a real one.
+///
+/// The gateway's is read out of the bind it was actually given, not assumed to be loopback —
+/// otherwise every `--lan` test would pass against a fake that cannot represent the bug.
+fn endpoint_for(cmd: &CommandSpec) -> Option<String> {
+    let render = cmd.render();
     if render.contains("spacetime start") {
-        Some(ProjectLayout::STDB_PORT)
-    } else if render.contains("gateway") {
-        Some(ProjectLayout::WORLD_PORT)
-    } else {
-        None
+        return Some(format!("127.0.0.1:{}", ProjectLayout::STDB_PORT));
     }
+    if render.contains("gateway") {
+        return cmd.env_value("LYRACORE_WORLD_BIND").map(str::to_string);
+    }
+    None
 }
 
 impl ProcessRunner for FakeProcessRunner {
     fn run_and_wait(&self, cmd: &CommandSpec) -> Result<String> {
         self.record(Call::Wait(cmd.clone()), &cmd.render())?;
         Ok(String::new())
+    }
+
+    fn run_streaming(&self, cmd: &CommandSpec) -> Result<()> {
+        self.record(Call::Stream(cmd.clone()), &cmd.render())
     }
 
     fn run_with_secret_stdin(&self, cmd: &CommandSpec, secret: &[u8]) -> Result<String> {
@@ -158,19 +186,25 @@ impl ProcessRunner for FakeProcessRunner {
             &render,
         )?;
 
+        let endpoint = endpoint_for(cmd);
         let mut inner = self.0.lock().unwrap();
         inner.next_pid += 1;
         let pid = inner.next_pid;
         inner.processes.insert(pid, format!("fake-start {render}"));
-        if let Some(port) = port_for(&render) {
-            inner.ports.insert(port);
+        if let Some(endpoint) = endpoint {
+            inner.endpoints.insert(endpoint.clone());
+            inner.listeners.insert(pid, endpoint);
         }
         Ok(pid)
     }
 
     fn terminate(&self, pid: u32) -> Result<()> {
         self.record(Call::Terminate(pid), "kill")?;
-        self.0.lock().unwrap().processes.remove(&pid);
+        let mut inner = self.0.lock().unwrap();
+        inner.processes.remove(&pid);
+        if let Some(endpoint) = inner.listeners.remove(&pid) {
+            inner.endpoints.remove(&endpoint);
+        }
         Ok(())
     }
 }
@@ -182,7 +216,11 @@ impl ProcessInspector for FakeProcessInspector {
         self.0.lock().unwrap().processes.get(&pid).cloned()
     }
 
-    fn port_serving(&self, port: u16) -> bool {
-        self.0.lock().unwrap().ports.contains(&port)
+    fn serving(&self, host: &str, port: u16) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .endpoints
+            .contains(&format!("{host}:{port}"))
     }
 }
