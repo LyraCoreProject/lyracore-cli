@@ -5,6 +5,7 @@
 
 pub mod cmd;
 pub mod error;
+pub mod http;
 pub mod proc;
 pub mod project;
 pub mod state;
