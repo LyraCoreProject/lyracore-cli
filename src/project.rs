@@ -122,10 +122,30 @@ impl ProjectLayout {
     pub const STDB_SERVER: &'static str = "local";
     pub const GATEWAY_PACKAGE: &'static str = "lyracore-gateway";
     pub const GATEWAY_BIN: &'static str = "target/debug/lyracore-gateway";
-    pub const PUBLISH_SCRIPT: &'static str = "scripts/publish-module.sh";
 
-    /// The wire harness's entrypoint into this checkout, used by `dev smoke` (#246).
-    pub const SUITE_SCRIPT: &'static str = "adapters/lyracore/run-suite.sh";
+    /// The SpacetimeDB module: the directory `spacetime publish -p` is pointed at, and the Cargo
+    /// package `preflight` builds under the deploy feature set.
+    pub const MODULE_DIR: &'static str = "module";
+    pub const MODULE_PACKAGE: &'static str = "lyracore-module";
+    /// The Cargo feature `publish` bakes in. `module/src/debug.rs` is only ever compiled by a
+    /// publish (or by `preflight`), and a plain build omits it — which makes `publish` report a
+    /// FALSE "Removed table" breaking change and abort.
+    pub const DEPLOY_FEATURES: &'static str = "--features=debug_reducers";
+
+    /// The workspace manifest and the toolchain file `preflight` reads the pinned versions out of.
+    pub const RUST_TOOLCHAIN: &'static str = "rust-toolchain.toml";
+    pub const SCRIPTS_DIR: &'static str = "scripts";
+
+    /// The pinned wire-harness release this checkout consumes (#246).
+    pub const WIRE_HARNESS_PIN: &'static str = ".wire-harness-rev";
+    /// Paths INSIDE a harness checkout. `dev smoke` drives the generic login smoke through the
+    /// harness's own adapter seam; a release that also carries a suite entrypoint is preferred.
+    pub const HARNESS_SMOKE_SEAM: &'static str = "adapters/lyracore/wire.sh";
+    pub const HARNESS_SUITE_SCRIPT: &'static str = "adapters/lyracore/run-suite.sh";
+    pub const HARNESS_CLIENT_BIN: &'static str = "vanilla-wire";
+    /// The fixture account and character the login smoke signs in as.
+    pub const SMOKE_ACCOUNT: &'static str = "TEST";
+    pub const SMOKE_CHARACTER: &'static str = "Ginger";
 
     // The database is loopback in every mode. Only the two client-facing ports follow the
     // `ClientBind` chosen by `dev up [--lan IP]`.
@@ -216,12 +236,34 @@ impl ProjectLayout {
         self.root.join(Self::GATEWAY_BIN)
     }
 
-    pub fn publish_script(&self) -> PathBuf {
-        self.root.join(Self::PUBLISH_SCRIPT)
+    pub fn module_dir(&self) -> PathBuf {
+        self.root.join(Self::MODULE_DIR)
     }
 
-    pub fn suite_script(&self) -> PathBuf {
-        self.root.join(Self::SUITE_SCRIPT)
+    pub fn module_manifest(&self) -> PathBuf {
+        self.module_dir().join("Cargo.toml")
+    }
+
+    pub fn module_sources(&self) -> PathBuf {
+        self.module_dir().join("src")
+    }
+
+    pub fn rust_toolchain_file(&self) -> PathBuf {
+        self.root.join(Self::RUST_TOOLCHAIN)
+    }
+
+    pub fn scripts_dir(&self) -> PathBuf {
+        self.root.join(Self::SCRIPTS_DIR)
+    }
+
+    pub fn wire_harness_pin(&self) -> PathBuf {
+        self.root.join(Self::WIRE_HARNESS_PIN)
+    }
+
+    /// Where pinned harness releases are cached — inside the git-ignored state directory, so a
+    /// harness checkout can never appear in the server repo's `git status`.
+    pub fn harness_cache(&self) -> PathBuf {
+        self.state_dir.join("wire-harness")
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {

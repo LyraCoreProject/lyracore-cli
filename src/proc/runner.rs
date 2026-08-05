@@ -9,6 +9,13 @@ pub trait ProcessRunner {
     /// Run to completion, returning stdout.
     fn run_and_wait(&self, cmd: &CommandSpec) -> Result<String>;
 
+    /// Run to completion, returning stdout AND stderr together.
+    ///
+    /// For `--version` banners only: `rustc` prints its to stdout and `spacetime` prints parts of
+    /// its to stderr, so a version gate that read one stream would report "unknown version" for a
+    /// perfectly good tool — and the shell preflight this ports (`2>&1`) never had that hazard.
+    fn run_capturing_stderr(&self, cmd: &CommandSpec) -> Result<String>;
+
     /// Run to completion, feeding `secret` to the child's stdin. The secret is never an argument,
     /// never rendered, and never logged.
     fn run_with_secret_stdin(&self, cmd: &CommandSpec, secret: &[u8]) -> Result<String>;
@@ -45,6 +52,20 @@ impl ProcessRunner for RealProcessRunner {
     fn run_and_wait(&self, cmd: &CommandSpec) -> Result<String> {
         let output = cmd.build().stdin(Stdio::null()).output()?;
         Self::finish(cmd, output)
+    }
+
+    fn run_capturing_stderr(&self, cmd: &CommandSpec) -> Result<String> {
+        let output = cmd.build().stdin(Stdio::null()).output()?;
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        if output.status.success() {
+            return Ok(text);
+        }
+        Err(Error::SubprocessFailed {
+            command: cmd.render(),
+            code: output.status.code().unwrap_or(1),
+            message: text.trim().to_string(),
+        })
     }
 
     fn run_with_secret_stdin(&self, cmd: &CommandSpec, secret: &[u8]) -> Result<String> {
