@@ -1,4 +1,4 @@
-<p align="center"><img src="./lyracore-icon-light.svg" alt="LyraCore" width="120"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/LyraCoreProject/LyraCore/refs/heads/main/lyracore-icon-light.svg" alt="LyraCore" width="120"></p>
 
 # lyracore-cli
 
