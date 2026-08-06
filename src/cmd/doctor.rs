@@ -7,7 +7,7 @@ use crate::cmd::import;
 use crate::config::Config;
 use crate::project::ProjectLayout;
 use crate::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// The SpacetimeDB version LyraCore is pinned to. `doctor` asks it as a **floor** (`>=`) — it only
@@ -99,6 +99,7 @@ pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
             "Cargo ships with Rust — see https://rustup.rs/",
         ),
         check_spacetime(),
+        check_spacetime_server(),
         check_wasm_target(),
         check_ports(),
         check_client_data(layout.as_ref().ok()),
@@ -197,6 +198,134 @@ fn check_spacetime() -> Check {
             format!("could not read a version from `spacetime --version`; expected {REQUIRED_SPACETIME}"),
         ),
     }
+}
+
+/// The spacetime CLI's own configuration file.
+///
+/// Per-USER and shared by every SpacetimeDB project on the machine — there is no per-checkout
+/// override, and `spacetime sql` takes no environment variable for the server, only `-s`. That is
+/// why a setting made for someone else's project reaches into this one.
+fn spacetime_cli_config() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".config/spacetime/cli.toml"))
+}
+
+/// The `(nickname, host)` that `default_server` resolves to in a spacetime `cli.toml`.
+///
+/// A line scanner, not a TOML parser: this crate carries no TOML dependency, and the three keys
+/// needed (`default_server`, plus the `nickname`/`host` pair inside each `[[server_configs]]`) are
+/// written one per line by the CLI that owns the file. The `ecdsa_public_key` heredoc rides
+/// through harmlessly — no base64 line starts with `host` or `nickname`.
+///
+/// Ceiling: an inline-table spelling of `server_configs` reads as "nothing resolved", which the
+/// caller reports as unknown rather than as a mismatch. This never invents a verdict out of a
+/// parse it did not manage — a doctor check that cries wolf on a file it misread is worse than one
+/// that stays quiet.
+pub fn default_server_host(toml: &str) -> Option<(String, String)> {
+    let mut default: Option<String> = None;
+    let mut servers: Vec<(String, String)> = Vec::new();
+    let (mut in_server, mut nickname, mut host) = (false, None, None);
+
+    let mut flush = |nickname: &mut Option<String>, host: &mut Option<String>| {
+        if let (Some(n), Some(h)) = (nickname.take(), host.take()) {
+            servers.push((n, h));
+        }
+    };
+    for line in toml.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            flush(&mut nickname, &mut host);
+            in_server = line.starts_with("[[server_configs]]");
+            continue;
+        }
+        if let Some(value) = quoted_value(line, "default_server") {
+            default = Some(value);
+        }
+        if in_server {
+            if let Some(value) = quoted_value(line, "nickname") {
+                nickname = Some(value);
+            }
+            if let Some(value) = quoted_value(line, "host") {
+                host = Some(value);
+            }
+        }
+    }
+    flush(&mut nickname, &mut host);
+
+    let default = default?;
+    servers.into_iter().find(|(n, _)| *n == default)
+}
+
+/// `key = "value"` on one line, or `None`. The `=` is required immediately after the key (modulo
+/// whitespace) so `host` does not also match a `hostname` key.
+fn quoted_value(line: &str, key: &str) -> Option<String> {
+    let rest = line.strip_prefix(key)?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let inner = rest.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(inner[..end].to_string())
+}
+
+/// Does this `host` name the loopback node `dev up` runs? Accepts the spellings the spacetime CLI
+/// stores (bare `host:port`) as well as a scheme-qualified one, since users hand-edit this file.
+fn targets_local_node(host: &str) -> bool {
+    let host = host.trim().trim_end_matches('/');
+    let host = host
+        .strip_prefix("http://")
+        .or_else(|| host.strip_prefix("https://"))
+        .unwrap_or(host);
+    let Some(name) = host.strip_suffix(&format!(":{}", ProjectLayout::STDB_PORT)) else {
+        return false;
+    };
+    matches!(name, "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" | "[::1]")
+}
+
+/// Does the spacetime CLI's `default_server` point at the node this checkout uses?
+///
+/// Never launch-blocking, and deliberately so: `dev up`, `publish` and the importer binary all pass
+/// `-s local` explicitly, so they are immune to whatever the default is. The one thing that is not
+/// is `import-world.sh`'s post-run verification queries, which call bare `spacetime sql`. Pointed at
+/// a different node those cannot read a single row, and the import ends in a wall of FAIL lines for
+/// content that landed perfectly well — worse, the low-floor assertions PASS on the connection
+/// error's own output, so the run reads as a partial regression rather than as a broken connection.
+fn check_spacetime_server() -> Check {
+    const LABEL: &str = "default server";
+    let Some(path) = spacetime_cli_config() else {
+        return Check::pass(LABEL, "no HOME set — spacetime's config was not looked for");
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        // A fresh machine has not written one yet; spacetime's built-in default is used. Nothing
+        // to warn about, and nothing read, so say only what is true.
+        return Check::pass(LABEL, format!("{} not written yet", path.display()));
+    };
+    let Some((nickname, host)) = default_server_host(&text) else {
+        return Check::pass(
+            LABEL,
+            format!("no default_server resolved in {}", path.display()),
+        );
+    };
+    if targets_local_node(&host) {
+        return Check::pass(LABEL, format!("{nickname} → {host}"));
+    }
+    misdirected_default(&nickname, &host)
+}
+
+/// The warning for a `default_server` pointing somewhere other than this checkout's node. Split out
+/// so a test can read the text without depending on the developer's own `cli.toml`.
+fn misdirected_default(nickname: &str, host: &str) -> Check {
+    Check::warn(
+        "default server",
+        format!(
+            "spacetime's default server is `{nickname}` ({host}), not {listen} — `dev up` and \
+             `publish` are unaffected (they pass `-s {alias}`), but `lyracore import`'s \
+             verification queries call bare `spacetime sql` and will read the wrong node, ending \
+             the run in FAILs for content that imported fine. Fix with `spacetime server \
+             set-default {alias}` — but note this file is per-user and shared with your other \
+             SpacetimeDB projects.",
+            listen = ProjectLayout::stdb_listen(),
+            alias = ProjectLayout::STDB_SERVER,
+        ),
+    )
 }
 
 fn check_wasm_target() -> Check {
@@ -380,6 +509,124 @@ mod tests {
     fn a_broken_layout_is_the_blocking_failure() {
         let broken = Err(crate::Error::ProjectLayout("not a checkout".to_string()));
         assert!(check_layout(&broken).is_blocking());
+    }
+
+    // ---- the spacetime default-server check ----
+
+    /// The real shape the spacetime CLI writes, heredoc and all — the parser has to survive it.
+    const REAL_CLI_TOML: &str = r#"
+default_server = "self-hosted"
+spacetimedb_token = "ey.redacted"
+
+[[server_configs]]
+nickname = "maincloud"
+host = "maincloud.spacetimedb.com"
+protocol = "https"
+
+[[server_configs]]
+nickname = "local"
+host = "127.0.0.1:3000"
+protocol = "http"
+
+[[server_configs]]
+nickname = "self-hosted"
+host = "127.0.0.1:3001"
+protocol = "http"
+ecdsa_public_key = """
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEm+jebVpyB5H2HKjZWSZjnZYips6I
+SymPuOuWJw2rsEea8mztm8/KOQEzzCl/h3Ed8WuUZ7kTmr3mkYHlFgeTPg==
+-----END PUBLIC KEY-----
+"""
+"#;
+
+    #[test]
+    fn the_default_server_is_resolved_through_its_nickname_to_a_host() {
+        assert_eq!(
+            default_server_host(REAL_CLI_TOML),
+            Some(("self-hosted".to_string(), "127.0.0.1:3001".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_last_server_block_in_the_file_is_not_dropped() {
+        // `self-hosted` above is the final block AND the one that matters — a flush that only ran
+        // on the next `[` would resolve nothing and the check would go quiet exactly when it is
+        // needed. Pinned separately from the happy path so a refactor cannot lose only this.
+        let trailing = "default_server = \"only\"\n[[server_configs]]\nnickname = \"only\"\nhost = \"127.0.0.1:3000\"\n";
+        assert_eq!(
+            default_server_host(trailing),
+            Some(("only".to_string(), "127.0.0.1:3000".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_default_naming_no_configured_server_resolves_to_nothing() {
+        let orphan = "default_server = \"ghost\"\n[[server_configs]]\nnickname = \"local\"\nhost = \"127.0.0.1:3000\"\n";
+        assert_eq!(default_server_host(orphan), None);
+        // And a file with no default at all.
+        assert_eq!(
+            default_server_host("[[server_configs]]\nnickname = \"local\"\nhost = \"x:3000\"\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_key_that_merely_starts_with_host_is_not_read_as_host() {
+        assert_eq!(quoted_value("hostname = \"nope\"", "host"), None);
+        assert_eq!(
+            quoted_value("host = \"127.0.0.1:3000\"", "host"),
+            Some("127.0.0.1:3000".to_string())
+        );
+    }
+
+    #[test]
+    fn only_a_host_on_the_projects_own_port_counts_as_local() {
+        for good in [
+            "127.0.0.1:3000",
+            "localhost:3000",
+            "0.0.0.0:3000",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3000/",
+        ] {
+            assert!(targets_local_node(good), "{good} should count as local");
+        }
+        // 3001 is the case this whole check exists for: same loopback host, wrong node.
+        for bad in [
+            "127.0.0.1:3001",
+            "maincloud.spacetimedb.com",
+            "192.168.1.50:3000",
+            "127.0.0.1",
+        ] {
+            assert!(!targets_local_node(bad), "{bad} should not count as local");
+        }
+    }
+
+    #[test]
+    fn a_misdirected_default_server_warns_and_never_blocks_a_launch() {
+        // The real check reads the developer's own config, so assert the property that must hold
+        // for every machine: this can inform, but it must never fail `dev up`.
+        assert!(!check_spacetime_server().is_blocking());
+    }
+
+    #[test]
+    fn the_warning_names_the_offender_the_fix_and_what_it_actually_breaks() {
+        let (nickname, host) = default_server_host(REAL_CLI_TOML).expect("fixture must resolve");
+        assert!(!targets_local_node(&host), "the fixture is the bad case");
+
+        let Check::Warn { guidance, .. } = misdirected_default(&nickname, &host) else {
+            panic!("a misdirected default must warn");
+        };
+        // What is wrong, where it points, and the exact command that repairs it.
+        assert!(guidance.contains("self-hosted"), "{guidance}");
+        assert!(guidance.contains("127.0.0.1:3001"), "{guidance}");
+        assert!(
+            guidance.contains("spacetime server set-default local"),
+            "{guidance}"
+        );
+        // The two things a reader most needs: which command breaks, and that the fix is global.
+        assert!(guidance.contains("lyracore import"), "{guidance}");
+        assert!(guidance.contains("per-user"), "{guidance}");
     }
 
     // ---- the client-data check ----
