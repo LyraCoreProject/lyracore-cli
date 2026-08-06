@@ -1,9 +1,12 @@
 pub mod account;
+pub mod character;
+pub mod config;
 pub mod dev;
 pub mod doctor;
 pub mod import;
 pub mod preflight;
 pub mod publish;
+pub mod update;
 
 use crate::project::{ClientBind, Component, Topology};
 use crate::{Error, Result};
@@ -40,6 +43,13 @@ USAGE:
                                                for consent first, every time
   lyracore import --accept                     the same, with the consent answered in
                                                advance (scripted runs)
+  lyracore config                              show the persisted client-data path (or \"(unset)\")
+  lyracore config set client-data PATH         validate and remember your 1.12.1 client's Data/
+                                               directory, so `import` and `doctor` stop asking
+  lyracore character gm NAME true|false        grant (true) or revoke (false) GM level for a
+                                               character — tries every world shard in turn
+  lyracore update                              pull the latest checkout in place and restart the
+                                               local dev stack (refuses over a dirty working tree)
 
 The password is read from stdin with --password-stdin, otherwise from a hidden terminal
 prompt. It is never passed as a command-line argument.";
@@ -67,6 +77,15 @@ pub enum Command {
         source: PasswordSource,
     },
     Import(ImportOptions),
+    ConfigShow,
+    ConfigSetClientData {
+        path: String,
+    },
+    CharacterGm {
+        name: String,
+        enabled: bool,
+    },
+    Update,
     Help,
 }
 
@@ -137,6 +156,40 @@ impl Command {
             // somebody will type first (`lyracore import /games/wow/Data`), so it is refused by
             // NAME rather than as "unknown command".
             ["import", rest @ ..] => parse_import(rest),
+
+            ["config"] => Ok(Command::ConfigShow),
+            ["config", "set", "client-data", path] => Ok(Command::ConfigSetClientData {
+                path: (*path).to_string(),
+            }),
+            ["config", "set", "client-data"] => Err(Error::Usage(
+                "`config set client-data` needs a path".to_string(),
+            )),
+            ["config", ..] => Err(Error::Usage(
+                "`config` supports: (bare, to show) or set client-data PATH".to_string(),
+            )),
+
+            // Only `gm` today, but the catch-all below names it as ONE arm among future
+            // `character` verbs rather than "unknown command" — the shape this whole surface is
+            // meant to grow into.
+            ["character", "gm", name, "true"] => Ok(Command::CharacterGm {
+                name: (*name).to_string(),
+                enabled: true,
+            }),
+            ["character", "gm", name, "false"] => Ok(Command::CharacterGm {
+                name: (*name).to_string(),
+                enabled: false,
+            }),
+            ["character", "gm", _name, other] => Err(Error::Usage(format!(
+                "`character gm` takes true or false (got '{other}')"
+            ))),
+            ["character", ..] => Err(Error::Usage(
+                "`character` supports: gm NAME true|false".to_string(),
+            )),
+
+            ["update"] => Ok(Command::Update),
+            ["update", other, ..] => Err(Error::Usage(format!(
+                "`update` takes no arguments (got '{other}')"
+            ))),
 
             [other, ..] => Err(Error::Usage(format!("unknown command '{other}'"))),
         }
@@ -488,5 +541,92 @@ mod tests {
         // The old `gateway provision USER PASSWORD` shape must not be silently accepted here,
         // or the password would land in argv again.
         assert!(parse("account create TEST hunter2").is_err());
+    }
+
+    // ---- config ----
+
+    #[test]
+    fn bare_config_shows_and_set_client_data_takes_a_path() {
+        assert_eq!(parse("config").unwrap(), Command::ConfigShow);
+        assert_eq!(
+            parse("config set client-data /games/wow/Data").unwrap(),
+            Command::ConfigSetClientData {
+                path: "/games/wow/Data".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn config_set_client_data_without_a_path_is_a_usage_error() {
+        let error = parse("config set client-data").unwrap_err();
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
+    }
+
+    #[test]
+    fn an_unknown_config_key_names_client_data_as_the_only_one() {
+        for line in ["config set nonsense value", "config wipe"] {
+            let error = parse(line).unwrap_err().to_string();
+            assert!(error.contains("client-data"), "{line}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_help_text_documents_config() {
+        assert!(USAGE.contains("lyracore config"), "{USAGE}");
+        assert!(USAGE.contains("client-data"), "{USAGE}");
+    }
+
+    // ---- character gm ----
+
+    #[test]
+    fn character_gm_parses_true_and_false() {
+        assert_eq!(
+            parse("character gm Ginger true").unwrap(),
+            Command::CharacterGm {
+                name: "Ginger".to_string(),
+                enabled: true,
+            }
+        );
+        assert_eq!(
+            parse("character gm Ginger false").unwrap(),
+            Command::CharacterGm {
+                name: "Ginger".to_string(),
+                enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn character_gm_refuses_anything_but_true_or_false() {
+        for line in ["character gm Ginger 1", "character gm Ginger yes"] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+        }
+    }
+
+    #[test]
+    fn character_without_a_recognised_verb_names_gm_as_the_one_that_exists() {
+        for line in ["character", "character gm", "character gm Ginger", "character sideways"] {
+            let error = parse(line).unwrap_err().to_string();
+            assert!(error.contains("gm"), "{line}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_help_text_documents_character_gm() {
+        assert!(USAGE.contains("character gm"), "{USAGE}");
+    }
+
+    // ---- update ----
+
+    #[test]
+    fn update_takes_no_arguments() {
+        assert_eq!(parse("update").unwrap(), Command::Update);
+        assert!(parse("update origin").is_err());
+    }
+
+    #[test]
+    fn the_help_text_documents_update() {
+        assert!(USAGE.contains("lyracore update"), "{USAGE}");
     }
 }

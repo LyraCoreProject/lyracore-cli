@@ -516,6 +516,12 @@ impl ProjectLayout {
         self.state_dir.join("coordinator-token")
     }
 
+    /// Persisted CLI config (`config.rs`) — currently just the 1.12.1 client's `Data/` directory,
+    /// remembered so `lyracore import` and `lyracore doctor` stop asking for it every run.
+    pub fn config_file(&self) -> PathBuf {
+        self.state_dir.join("config.json")
+    }
+
     pub fn log_file(&self, component: Component) -> PathBuf {
         self.logs_dir.join(format!("{}.log", component.as_str()))
     }
@@ -618,6 +624,7 @@ mod tests {
             layout.log_file(Component::Gateway),
             tmp.path().join(".lyracore/logs/gateway.log")
         );
+        assert_eq!(layout.config_file(), tmp.path().join(".lyracore/config.json"));
     }
 
     // ---- the `--lan` bind contract ----

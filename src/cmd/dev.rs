@@ -953,7 +953,7 @@ fn claim_command(database: &str) -> CommandSpec {
 /// identity the `spacetime` CLI does not hold — and the only way `dev up` calls the three it needs
 /// (`claim_operator`, `import_map_regions`, `set_region_assignment`), because a claim made by one
 /// identity and a write made by another is the lock-out this path exists to avoid.
-fn reducer_url(database: &str, reducer: &str) -> String {
+pub(crate) fn reducer_url(database: &str, reducer: &str) -> String {
     format!(
         "{}/v1/database/{database}/call/{reducer}",
         ProjectLayout::stdb_uri()

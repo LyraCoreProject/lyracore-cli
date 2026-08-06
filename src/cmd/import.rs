@@ -169,7 +169,7 @@ pub fn run(
 
     // ---- stage 2: the client ------------------------------------------------------------------
     stage(2, "locating your 1.12.1 client data");
-    let client_data = resolve_client_data(prompt, options)?;
+    let client_data = resolve_client_data(project, prompt, options)?;
     println!("   client data: {}", client_data.display());
 
     // ---- stage 3: the world ETL ---------------------------------------------------------------
@@ -234,40 +234,84 @@ fn consent(prompt: &dyn Prompt, accept: bool) -> Result<()> {
     Ok(())
 }
 
-/// Stage 2: the flag if there is one, otherwise ask. Either way the answer is validated before it
-/// is used, and the result is absolute — the scripts run from the checkout root, not from here.
-fn resolve_client_data(prompt: &dyn Prompt, options: &ImportOptions) -> Result<PathBuf> {
-    let raw = match &options.client_data {
-        Some(raw) => raw.clone(),
-        None => {
-            println!("   Where is your 1.12.1 client's Data/ directory?");
-            println!(
-                "   (the one containing dbc.MPQ and terrain.MPQ — e.g. /games/WoW-1.12.1/Data)"
-            );
-            let answer = prompt.ask("   Path: ")?;
-            if answer.is_empty() {
-                return Err(Error::Usage(
-                    "no client data path given. LyraCore does not supply a client; point \
-                     --client-data at the Data/ directory of a 1.12.1 install you own."
-                        .to_string(),
-                ));
+/// Stage 2: the flag if there is one, otherwise the persisted config, otherwise ask — and save a
+/// freshly prompted-for answer so the NEXT run does not have to ask again.
+///
+/// The chain, in order: `--client-data` wins outright (a typo in it is a usage mistake `run`
+/// already refused before consent was spent); the `config.json` value is used if it still
+/// validates, and reported-then-abandoned if it does not (a stale config must not turn into a
+/// silent prompt-less failure); the interactive prompt is the fallback of last resort, and its
+/// answer is written back to `config.json` once it validates.
+fn resolve_client_data(
+    project: &ProjectLayout,
+    prompt: &dyn Prompt,
+    options: &ImportOptions,
+) -> Result<PathBuf> {
+    if let Some(raw) = &options.client_data {
+        let path = Path::new(raw);
+        validate_client_data(path)?;
+        // Canonicalize AFTER validating, so the diagnostics above quote what the operator typed.
+        return Ok(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    }
+
+    let config_path = project.config_file();
+    let mut config = crate::config::Config::load(&config_path)?;
+    if let Some(raw) = config.client_data.clone() {
+        let path = Path::new(&raw);
+        match inspect_client_data(path) {
+            Ok(notes) => {
+                for note in notes {
+                    println!("{note}");
+                }
+                println!("   client data (from {}): {}", config_path.display(), raw);
+                return Ok(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
             }
-            answer
+            Err(e) => println!(
+                "   the configured client data ({raw}) is no longer valid: {e}\n   (re-set it \
+                 with `lyracore config set client-data <path>`) — asking instead."
+            ),
         }
-    };
-    let path = Path::new(&raw);
+    }
+
+    println!("   Where is your 1.12.1 client's Data/ directory?");
+    println!("   (the one containing dbc.MPQ and terrain.MPQ — e.g. /games/WoW-1.12.1/Data)");
+    let answer = prompt.ask("   Path: ")?;
+    if answer.is_empty() {
+        return Err(Error::Usage(
+            "no client data path given. LyraCore does not supply a client; point \
+             --client-data at the Data/ directory of a 1.12.1 install you own."
+                .to_string(),
+        ));
+    }
+    let path = Path::new(&answer);
     validate_client_data(path)?;
-    // Canonicalize AFTER validating, so the diagnostics above quote what the operator typed.
-    Ok(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    config.client_data = Some(canonical.to_string_lossy().to_string());
+    config.save(&config_path)?;
+    println!("   saved to {} — won't ask again.", config_path.display());
+    Ok(canonical)
 }
 
-/// Does this look like the `Data/` directory of a 1.12.1 client?
+/// Does this look like the `Data/` directory of a 1.12.1 client? The printing wrapper around
+/// [`inspect_client_data`] — same checks, same error strings, but the optional-archive notes go
+/// straight to stdout instead of coming back as data.
+fn validate_client_data(path: &Path) -> Result<()> {
+    for note in inspect_client_data(path)? {
+        println!("{note}");
+    }
+    Ok(())
+}
+
+/// The pure form of [`validate_client_data`]: does this look like the `Data/` directory of a
+/// 1.12.1 client, and if so, what should the operator be told about it?
 ///
 /// Cheap checks only, but the three that matter: it exists, it is the Data directory rather than
 /// the install directory ABOVE it (by far the most common mistake), and it is vanilla rather than
 /// a later expansion (whose merged archives would otherwise fail as an inscrutable DBC parse error
-/// several minutes in).
-fn validate_client_data(path: &Path) -> Result<()> {
+/// several minutes in). `Ok` carries the optional-archive notes rather than printing them, so
+/// `lyracore doctor` can ask the same question without a `check_client_data` that talks to a
+/// terminal.
+pub fn inspect_client_data(path: &Path) -> Result<Vec<String>> {
     if !path.exists() {
         return Err(Error::Usage(format!(
             "no such directory: {}. Point --client-data at your 1.12.1 client's Data/ directory.",
@@ -328,16 +372,17 @@ fn validate_client_data(path: &Path) -> Result<()> {
         )));
     }
 
+    let mut notes = Vec::new();
     for name in OPTIONAL_ARCHIVES {
         if !path.join(name).exists() {
-            println!(
+            notes.push(format!(
                 "   NOTE: no {name} in {} — the navigation/line-of-sight grid will be built from \
                  whatever geometry is available, which may be less than the full world.",
                 path.display()
-            );
+            ));
         }
     }
-    Ok(())
+    Ok(notes)
 }
 
 // ---- the four invocations -----------------------------------------------------------------
@@ -827,6 +872,126 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("--client-data"), "{error}");
+    }
+
+    // ---- the config fallback chain ----
+
+    #[test]
+    fn a_client_data_flag_wins_over_a_configured_path_and_leaves_it_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let flagged = client_data(&tmp);
+        let configured = tmp.path().join("configured-elsewhere");
+        crate::config::Config {
+            client_data: Some(configured.to_string_lossy().to_string()),
+        }
+        .save(&project.config_file())
+        .unwrap();
+
+        let stack = FakeStack::new();
+        run(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&flagged),
+        )
+        .unwrap();
+
+        // A flag never even reads config.json, let alone overwrites it.
+        let config = crate::config::Config::load(&project.config_file()).unwrap();
+        assert_eq!(
+            config.client_data.as_deref(),
+            Some(configured.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn a_configured_path_is_used_without_prompting_when_no_flag_is_given() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        crate::config::Config {
+            client_data: Some(data.to_string_lossy().to_string()),
+        }
+        .save(&project.config_file())
+        .unwrap();
+
+        let stack = FakeStack::new();
+        let prompt = ScriptedPrompt::new(&["yes"]); // asking for a path would error: no 2nd answer
+        run(
+            &project,
+            &stack.runner(),
+            &prompt,
+            &ImportOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prompt.asked().len(),
+            1,
+            "a valid configured path must not be prompted for: {:?}",
+            prompt.asked()
+        );
+    }
+
+    #[test]
+    fn a_prompted_path_is_persisted_so_the_next_run_does_not_ask() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let stack = FakeStack::new();
+        let prompt = ScriptedPrompt::new(&["yes", &data.to_string_lossy()]);
+
+        run(
+            &project,
+            &stack.runner(),
+            &prompt,
+            &ImportOptions::default(),
+        )
+        .unwrap();
+
+        let canonical = std::fs::canonicalize(&data).unwrap();
+        let config = crate::config::Config::load(&project.config_file()).unwrap();
+        assert_eq!(
+            config.client_data.as_deref(),
+            Some(canonical.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn an_invalid_configured_path_reports_why_and_falls_back_to_the_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        crate::config::Config {
+            client_data: Some(tmp.path().join("nope").to_string_lossy().to_string()),
+        }
+        .save(&project.config_file())
+        .unwrap();
+
+        let stack = FakeStack::new();
+        let prompt = ScriptedPrompt::new(&["yes", &data.to_string_lossy()]);
+        run(
+            &project,
+            &stack.runner(),
+            &prompt,
+            &ImportOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prompt.asked().len(),
+            2,
+            "an invalid configured path must still fall back to asking: {:?}",
+            prompt.asked()
+        );
+        // ...and the good answer replaces the bad one, so the NEXT run does not hit this again.
+        let canonical = std::fs::canonicalize(&data).unwrap();
+        let config = crate::config::Config::load(&project.config_file()).unwrap();
+        assert_eq!(
+            config.client_data.as_deref(),
+            Some(canonical.to_string_lossy().as_ref())
+        );
     }
 
     // ---- failure surfacing ----

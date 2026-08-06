@@ -3,8 +3,11 @@
 //! Exits nonzero only for *launch-blocking* failures. A busy port or a missing WASM target is a
 //! warning: informative, but not a reason to fail a script that only wanted the report.
 
+use crate::cmd::import;
+use crate::config::Config;
 use crate::project::ProjectLayout;
 use crate::Result;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// The SpacetimeDB version LyraCore is pinned to. `doctor` asks it as a **floor** (`>=`) — it only
@@ -98,6 +101,7 @@ pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
         check_spacetime(),
         check_wasm_target(),
         check_ports(),
+        check_client_data(layout.as_ref().ok()),
     ]
 }
 
@@ -247,6 +251,43 @@ fn check_ports() -> Check {
     )
 }
 
+/// Is a 1.12.1 client mapped, and does it still look right? Never launch-blocking: a client is
+/// needed only for `lyracore import`, and `dev up`'s seed fixture needs none at all.
+fn check_client_data(project: Option<&ProjectLayout>) -> Check {
+    let Some(project) = project else {
+        return Check::warn(
+            "client data",
+            "not set — only needed for `lyracore import`; set with `lyracore config set \
+             client-data <path>`",
+        );
+    };
+    let config = match Config::load(&project.config_file()) {
+        Ok(config) => config,
+        Err(e) => {
+            return Check::warn(
+                "client data",
+                format!(
+                    "{e} — re-set with `lyracore config set client-data <path>`"
+                ),
+            )
+        }
+    };
+    let Some(raw) = config.client_data else {
+        return Check::warn(
+            "client data",
+            "not set — only needed for `lyracore import`; set with `lyracore config set \
+             client-data <path>`",
+        );
+    };
+    match import::inspect_client_data(Path::new(&raw)) {
+        Ok(_notes) => Check::pass("client data", raw),
+        Err(e) => Check::warn(
+            "client data",
+            format!("{e} — re-set with `lyracore config set client-data <path>`"),
+        ),
+    }
+}
+
 pub fn report(checks: &[Check]) -> bool {
     for check in checks {
         match check {
@@ -268,6 +309,12 @@ pub fn report(checks: &[Check]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn workspace(tmp: &TempDir) -> ProjectLayout {
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        ProjectLayout::from_root(tmp.path()).unwrap()
+    }
 
     #[test]
     fn versions_are_read_out_of_real_banners() {
@@ -333,6 +380,75 @@ mod tests {
     fn a_broken_layout_is_the_blocking_failure() {
         let broken = Err(crate::Error::ProjectLayout("not a checkout".to_string()));
         assert!(check_layout(&broken).is_blocking());
+    }
+
+    // ---- the client-data check ----
+
+    #[test]
+    fn client_data_unset_warns_with_the_set_hint_and_never_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let project = workspace(&tmp);
+        let check = check_client_data(Some(&project));
+        assert!(!check.is_blocking());
+        match check {
+            Check::Warn { guidance, .. } => assert!(
+                guidance.contains("lyracore config set client-data"),
+                "{guidance}"
+            ),
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_data_missing_project_layout_also_warns_unset_rather_than_panicking() {
+        assert!(!check_client_data(None).is_blocking());
+    }
+
+    #[test]
+    fn client_data_invalid_warns_with_the_specific_problem_and_the_reset_hint() {
+        let tmp = TempDir::new().unwrap();
+        let project = workspace(&tmp);
+        crate::config::Config {
+            client_data: Some(tmp.path().join("nope").to_string_lossy().to_string()),
+        }
+        .save(&project.config_file())
+        .unwrap();
+
+        let check = check_client_data(Some(&project));
+        assert!(!check.is_blocking());
+        match check {
+            Check::Warn { guidance, .. } => {
+                assert!(guidance.contains("no such directory"), "{guidance}");
+                assert!(
+                    guidance.contains("lyracore config set client-data"),
+                    "{guidance}"
+                );
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_data_valid_passes_and_shows_the_path() {
+        let tmp = TempDir::new().unwrap();
+        let project = workspace(&tmp);
+        let data = tmp.path().join("wow/Data");
+        std::fs::create_dir_all(&data).unwrap();
+        for name in ["dbc.MPQ", "terrain.MPQ"] {
+            std::fs::write(data.join(name), "").unwrap();
+        }
+        crate::config::Config {
+            client_data: Some(data.to_string_lossy().to_string()),
+        }
+        .save(&project.config_file())
+        .unwrap();
+
+        match check_client_data(Some(&project)) {
+            Check::Pass { detail, .. } => {
+                assert!(detail.contains("wow/Data"), "{detail}");
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
     }
 
     #[test]

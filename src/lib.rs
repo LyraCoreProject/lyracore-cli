@@ -4,6 +4,7 @@
 //! seam, and transfer topology is Phase C's and is deliberately untouched here.
 
 pub mod cmd;
+pub mod config;
 pub mod error;
 pub mod harness;
 pub mod http;

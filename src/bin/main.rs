@@ -80,5 +80,14 @@ fn run(args: &[String]) -> Result<i32> {
             let project = ProjectLayout::discover()?;
             cmd::account::create(&project, &user, source, &runner).map(|_| EXIT_OK)
         }
+        Command::ConfigShow => cmd::config::show(&ProjectLayout::discover()?).map(|_| EXIT_OK),
+        Command::ConfigSetClientData { path } => {
+            cmd::config::set_client_data(&ProjectLayout::discover()?, &path).map(|_| EXIT_OK)
+        }
+        Command::CharacterGm { name, enabled } => {
+            let project = ProjectLayout::discover()?;
+            cmd::character::gm(&project, &runner, &http, &name, enabled).map(|_| EXIT_OK)
+        }
+        Command::Update => cmd::update::run(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK),
     }
 }
