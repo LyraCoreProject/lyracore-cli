@@ -8,6 +8,20 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::process::Command;
 use std::time::Duration;
 
+/// The portion of an `identity()` string that survives an `exec` in the same process.
+///
+/// `identity()` joins `lstart` and `comm` into one whitespace-separated string, with `comm` last
+/// (it is a single token — executable names never contain spaces). SpacetimeDB's version-manager
+/// shim keeps its PID and start time across the `exec` into the versioned binary, but that `exec`
+/// **replaces** `comm` (`spacetime` -> kernel-truncated `spacetimedb-sta`). A caller pinned to the
+/// startup window — before the process has settled into whatever it is going to run as — must
+/// compare only this prefix, or an ordinary `exec` reads as the process having died (#431).
+pub fn start_signature(identity: &str) -> &str {
+    identity
+        .rsplit_once(' ')
+        .map_or(identity, |(start, _comm)| start)
+}
+
 pub trait ProcessInspector {
     /// A stable identity for a live PID, or `None` if no such process exists.
     fn identity(&self, pid: u32) -> Option<String>;
@@ -69,6 +83,21 @@ mod tests {
         let inspector = RealProcessInspector;
         let ours = std::process::id();
         assert_eq!(inspector.identity(ours), inspector.identity(ours));
+    }
+
+    #[test]
+    fn start_signature_ignores_only_the_trailing_comm_token() {
+        // The exact shape #431 is about: same start time, `comm` replaced by an `exec`.
+        assert_eq!(
+            start_signature("Thu Aug  7 10:23:45 2026 spacetime"),
+            start_signature("Thu Aug  7 10:23:45 2026 spacetimedb-sta")
+        );
+        // A different start time is a different process (dead PID reused by someone else), even
+        // with the same `comm` — this must NOT collapse to equal.
+        assert_ne!(
+            start_signature("Thu Aug  7 10:23:45 2026 spacetime"),
+            start_signature("Fri Aug  8 09:00:00 2026 spacetime")
+        );
     }
 
     #[test]
