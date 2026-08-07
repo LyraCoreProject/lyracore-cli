@@ -180,10 +180,14 @@ pub fn resolve(
             .map_err(|e| {
                 let _ = std::fs::remove_dir_all(&dir);
                 Error::Process(format!(
-                "could not clone {remote} at {} — the wire-harness repository is private, so this \
-                 needs your git credentials ({e})",
-                pin.tag
-            ))
+                    "could not reach the wire-harness release {} at {remote}: {e}\n  \
+                     `lyracore dev smoke` is currently maintainer-only — the wire-harness \
+                     repository is private, so a clone of it needs credentials most checkouts of \
+                     this project do not have.\n  If you have access, point at a remote you can \
+                     reach with {REMOTE_VAR}, or skip the clone with an existing local checkout \
+                     via {OVERRIDE_VAR}.",
+                    pin.tag
+                ))
             })?;
     }
 
@@ -363,6 +367,29 @@ mod tests {
             !clone.contains("main") && !clone.contains("HEAD"),
             "a branch must never be cloned: {clone}"
         );
+    }
+
+    #[test]
+    fn an_unreachable_harness_names_the_cause_and_both_overrides() {
+        // #429: the default remote is `ssh://` against a private repository, so this is the
+        // ordinary failure for every external user — not an edge case. The old message ("needs
+        // your git credentials") did not say `dev smoke` is maintainer-only, and did not mention
+        // that `LYRACORE_WIRE_HARNESS_DIR`/`LYRACORE_WIRE_HARNESS_REMOTE` exist as a way out.
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp, &format!("v0.1.0-alpha.2 {SHA}\n"));
+        let stack = FakeStack::new().fail_on(
+            "clone",
+            "Permission denied (publickey).\nfatal: Could not read from remote repository.",
+        );
+
+        let error = resolve(&project, &stack.runner(), None, DEFAULT_REMOTE).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("maintainer-only"), "{message}");
+        assert!(message.contains(OVERRIDE_VAR), "{message}");
+        assert!(message.contains(REMOTE_VAR), "{message}");
+        // The underlying git failure is still present, for whoever needs it — just not the WHOLE
+        // message.
+        assert!(message.contains("Permission denied"), "{message}");
     }
 
     #[test]
