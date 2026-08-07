@@ -15,7 +15,8 @@
 //!   ANNOUNCED on stderr every time, because a stale local checkout silently substituted for the
 //!   pin is a measurement nobody can reproduce.
 //!
-//! The clone uses ssh and the caller's existing git credentials (the repository is private).
+//! The clone is anonymous HTTPS: `wire-harness` is a public repository, and anonymous HTTPS is
+//! what lets a fresh checkout of THIS repository fetch it with no GitHub account and no key.
 //! Nothing here embeds a token.
 
 use crate::proc::{CommandSpec, ProcessRunner};
@@ -27,7 +28,13 @@ use std::path::{Path, PathBuf};
 pub const OVERRIDE_VAR: &str = "LYRACORE_WIRE_HARNESS_DIR";
 /// Where the pinned release is cloned from. Overridable for mirrors and tests.
 pub const REMOTE_VAR: &str = "LYRACORE_WIRE_HARNESS_REMOTE";
-pub const DEFAULT_REMOTE: &str = "ssh://git@github.com/LyraCoreProject/wire-harness.git";
+/// Anonymous HTTPS, because `wire-harness` is a public repository: git's own HTTPS fetcher needs
+/// no credentials, no SSH key and no `CARGO_NET_GIT_FETCH_WITH_CLI` escape hatch for a public
+/// clone. This URL was `ssh://git@github.com/...`, which requires a GitHub account and key even
+/// against a public repository — a fresh checkout has neither, so the very first `dev smoke` after
+/// `lyracore dev up` failed on the fetch. Do not put it back (#429, mirroring the same fix already
+/// made for this CLI's own installer in #302).
+pub const DEFAULT_REMOTE: &str = "https://github.com/LyraCoreProject/wire-harness.git";
 
 /// One `<tag> <sha>` pin line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,11 +188,11 @@ pub fn resolve(
                 let _ = std::fs::remove_dir_all(&dir);
                 Error::Process(format!(
                     "could not reach the wire-harness release {} at {remote}: {e}\n  \
-                     `lyracore dev smoke` is currently maintainer-only — the wire-harness \
-                     repository is private, so a clone of it needs credentials most checkouts of \
-                     this project do not have.\n  If you have access, point at a remote you can \
-                     reach with {REMOTE_VAR}, or skip the clone with an existing local checkout \
-                     via {OVERRIDE_VAR}.",
+                     This is a network or pin problem, not a permissions one — the wire-harness \
+                     repository is public. Check connectivity and that {remote} and the pin in \
+                     .wire-harness-rev are correct.\n  If you need a different remote, set \
+                     {REMOTE_VAR}; to skip the clone with an existing local checkout, set \
+                     {OVERRIDE_VAR}.",
                     pin.tag
                 ))
             })?;
@@ -237,8 +244,8 @@ fn clone_command(remote: &str, pin: &Pin, dir: &Path) -> CommandSpec {
         .arg(&pin.tag)
         .arg(remote)
         .arg(dir.to_string_lossy().to_string())
-        // The repository is private: let git use the CLI's own credential handling, exactly like
-        // the `./lyracore` shim does for this crate.
+        // Fail fast instead of hanging on an interactive credential prompt if the remote or pin is
+        // ever wrong in a way that makes git think auth is the problem.
         .env("GIT_TERMINAL_PROMPT", "0")
 }
 
@@ -371,25 +378,27 @@ mod tests {
 
     #[test]
     fn an_unreachable_harness_names_the_cause_and_both_overrides() {
-        // #429: the default remote is `ssh://` against a private repository, so this is the
-        // ordinary failure for every external user — not an edge case. The old message ("needs
-        // your git credentials") did not say `dev smoke` is maintainer-only, and did not mention
+        // #429: wire-harness is now public and the default remote is `https://`, so an unreachable
+        // clone is a network or pin problem, not a permissions one — the message must not suggest
+        // `dev smoke` is maintainer-only or that the repository is private. It must still mention
         // that `LYRACORE_WIRE_HARNESS_DIR`/`LYRACORE_WIRE_HARNESS_REMOTE` exist as a way out.
         let tmp = TempDir::new().unwrap();
         let project = project(&tmp, &format!("v0.1.0-alpha.2 {SHA}\n"));
         let stack = FakeStack::new().fail_on(
             "clone",
-            "Permission denied (publickey).\nfatal: Could not read from remote repository.",
+            "fatal: unable to access 'https://github.com/LyraCoreProject/wire-harness.git/': \
+             Could not resolve host: github.com",
         );
 
         let error = resolve(&project, &stack.runner(), None, DEFAULT_REMOTE).unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("maintainer-only"), "{message}");
+        assert!(!message.contains("maintainer-only"), "{message}");
+        assert!(!message.contains("private"), "{message}");
         assert!(message.contains(OVERRIDE_VAR), "{message}");
         assert!(message.contains(REMOTE_VAR), "{message}");
         // The underlying git failure is still present, for whoever needs it — just not the WHOLE
         // message.
-        assert!(message.contains("Permission denied"), "{message}");
+        assert!(message.contains("Could not resolve host"), "{message}");
     }
 
     #[test]
