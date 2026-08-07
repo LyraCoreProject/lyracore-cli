@@ -6,5 +6,5 @@ mod runner;
 pub mod fake;
 
 pub use command::CommandSpec;
-pub use inspect::{ProcessInspector, RealProcessInspector};
+pub use inspect::{start_signature, ProcessInspector, RealProcessInspector};
 pub use runner::{ProcessRunner, RealProcessRunner};

@@ -40,6 +40,16 @@ struct Inner {
     /// A spawned gateway's whole log file, in place of the one derived from its environment. For
     /// the case the derivation cannot express: a build that never logs its shard connections.
     log_override: Option<String>,
+    /// A spawn whose render matches `needle` (0) models a version-manager shim's `exec` (#431):
+    /// `identity()` reports `before` (1) on its first read for that PID and `after` (2) on every
+    /// read after. See [`FakeStack::with_shim_exec`].
+    shim: Option<(String, String, String)>,
+    /// How many times `identity()` has been read for each PID currently modelling a shim.
+    shim_reads: HashMap<u32, u32>,
+    /// The endpoint a shimmed PID would have opened at spawn time, held back until its identity
+    /// settles (its second read) — modelling how the shim's `exec` and the port opening land
+    /// close together in practice, not before the parent's first identity poll.
+    shim_pending_endpoint: HashMap<u32, String>,
 }
 
 /// A fake machine: which processes exist, which ports answer, and what was run.
@@ -61,6 +71,20 @@ impl FakeStack {
             .unwrap()
             .processes
             .insert(pid, identity.to_string());
+        self
+    }
+
+    /// Model the exact race #431 is shaped around: a spawn whose render contains `needle` is a
+    /// version-manager shim, not the final process. `identity()` reports `before` (the shim) on
+    /// the first read for that PID and `after` (the settled, post-`exec` process) on every read
+    /// after that — and the endpoint it would open does not appear until that second read.
+    ///
+    /// Without this, `spawn_logged` inserts both the identity and the endpoint synchronously, so
+    /// `wait_for_port`'s liveness poll never runs at all and the identity-changed branch it
+    /// exists to guard is untested — which is why the bug shipped.
+    pub fn with_shim_exec(self, needle: &str, before: &str, after: &str) -> Self {
+        self.0.lock().unwrap().shim =
+            Some((needle.to_string(), before.to_string(), after.to_string()));
         self
     }
 
@@ -382,10 +406,24 @@ impl ProcessRunner for FakeProcessRunner {
         let mut inner = self.0.lock().unwrap();
         inner.next_pid += 1;
         let pid = inner.next_pid;
-        inner.processes.insert(pid, format!("fake-start {render}"));
-        if let Some(endpoint) = endpoint {
-            inner.endpoints.insert(endpoint.clone());
-            inner.listeners.insert(pid, endpoint);
+
+        let is_shim = inner
+            .shim
+            .as_ref()
+            .is_some_and(|(needle, ..)| render.contains(needle.as_str()));
+        if is_shim {
+            // Identity and endpoint are held back — `FakeProcessInspector::identity` supplies
+            // them once the shim has "settled", per `with_shim_exec`.
+            inner.shim_reads.insert(pid, 0);
+            if let Some(endpoint) = endpoint {
+                inner.shim_pending_endpoint.insert(pid, endpoint);
+            }
+        } else {
+            inner.processes.insert(pid, format!("fake-start {render}"));
+            if let Some(endpoint) = endpoint {
+                inner.endpoints.insert(endpoint.clone());
+                inner.listeners.insert(pid, endpoint);
+            }
         }
         Ok(pid)
     }
@@ -394,6 +432,8 @@ impl ProcessRunner for FakeProcessRunner {
         self.record(Call::Terminate(pid), "kill")?;
         let mut inner = self.0.lock().unwrap();
         inner.processes.remove(&pid);
+        inner.shim_reads.remove(&pid);
+        inner.shim_pending_endpoint.remove(&pid);
         if let Some(endpoint) = inner.listeners.remove(&pid) {
             inner.endpoints.remove(&endpoint);
         }
@@ -405,7 +445,24 @@ pub struct FakeProcessInspector(Arc<Mutex<Inner>>);
 
 impl ProcessInspector for FakeProcessInspector {
     fn identity(&self, pid: u32) -> Option<String> {
-        self.0.lock().unwrap().processes.get(&pid).cloned()
+        let mut inner = self.0.lock().unwrap();
+        if let Some(reads) = inner.shim_reads.get_mut(&pid) {
+            *reads += 1;
+            let settled = *reads > 1;
+            let (_, before, after) = inner
+                .shim
+                .clone()
+                .expect("a PID in shim_reads implies with_shim_exec was called");
+            if !settled {
+                return Some(before);
+            }
+            if let Some(endpoint) = inner.shim_pending_endpoint.remove(&pid) {
+                inner.listeners.insert(pid, endpoint.clone());
+                inner.endpoints.insert(endpoint);
+            }
+            return Some(after);
+        }
+        inner.processes.get(&pid).cloned()
     }
 
     fn serving(&self, host: &str, port: u16) -> bool {

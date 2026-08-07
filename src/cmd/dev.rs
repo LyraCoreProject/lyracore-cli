@@ -22,7 +22,7 @@
 use crate::cmd::{preflight, publish};
 use crate::harness::{self, Harness};
 use crate::http::HttpClient;
-use crate::proc::{CommandSpec, ProcessInspector, ProcessRunner};
+use crate::proc::{start_signature, CommandSpec, ProcessInspector, ProcessRunner};
 use crate::project::{
     region_menu_arguments, ClientBind, Component, ProjectLayout, SeamAssignment, Topology,
 };
@@ -621,16 +621,48 @@ impl DevManager {
         Ok(ProcessRecord { pid, identity })
     }
 
-    fn wait_for_port(&self, component: Component, inspector: &dyn ProcessInspector) -> Result<()> {
+    fn wait_for_port(
+        &mut self,
+        component: Component,
+        inspector: &dyn ProcessInspector,
+    ) -> Result<()> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let host = component.health_host(&self.bind);
         while Instant::now() < deadline {
             if inspector.serving(&host, component.health_port()) {
+                // The process may have `exec`'d since we captured its identity right after
+                // spawning it (see the died-during-startup check below) — SpacetimeDB's
+                // version-manager shim keeps the PID and start time but replaces `comm`. Refresh
+                // the persisted identity to the settled one now, so a later `dev down`/`dev
+                // status` — which reads `comm` long after the exec has happened — compares
+                // against the process that is actually running rather than a shim that no longer
+                // exists (#431).
+                if let Some(record) = self.state.record(component) {
+                    if let Some(settled) = inspector.identity(record.pid) {
+                        if settled != record.identity {
+                            let pid = record.pid;
+                            self.state.set(
+                                component,
+                                Some(ProcessRecord {
+                                    pid,
+                                    identity: settled,
+                                }),
+                            );
+                        }
+                    }
+                }
                 return Ok(());
             }
-            // Died during startup — fail now rather than after the full timeout.
+            // Died during startup — fail now rather than after the full timeout. Compared on
+            // only the start-time prefix, not the full identity: the version-manager shim
+            // `exec`s into the versioned binary sometime during this poll loop, which changes
+            // `comm` while preserving PID and start time. Comparing the full identity here reads
+            // that ordinary `exec` as the process having died (#431).
             if let Some(record) = self.state.record(component) {
-                if inspector.identity(record.pid).as_deref() != Some(record.identity.as_str()) {
+                let alive = inspector.identity(record.pid).is_some_and(|live| {
+                    start_signature(&live) == start_signature(&record.identity)
+                });
+                if !alive {
                     return Err(Error::Process(format!(
                         "{} exited during startup; see {}",
                         component.as_str(),
@@ -1173,6 +1205,39 @@ mod tests {
         dev.down(&stack.runner(), &stack.inspector(), true).unwrap();
         assert!(stack.terminated().is_empty());
         assert!(dev.state.record(Component::Gateway).is_none());
+    }
+
+    #[test]
+    fn a_shim_exec_during_startup_is_not_read_as_a_death() {
+        // #431: on a cold host, SpacetimeDB's version-manager shim is still running (comm =
+        // `spacetime`) at the instant `spawn_recorded` captures its identity, then `exec`s into
+        // the versioned binary (comm = `spacetimedb-sta`, kernel-truncated to 15 chars) before
+        // the port opens. The old died-during-startup check compared the FULL identity and read
+        // that ordinary `exec` as the process having exited.
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new().with_shim_exec(
+            "spacetime start",
+            "Thu Aug  7 10:23:45 2026 spacetime",
+            "Thu Aug  7 10:23:45 2026 spacetimedb-sta",
+        );
+
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+            Topology::Single,
+        )
+        .unwrap();
+
+        // The persisted identity must also have been refreshed to the settled (post-exec) one —
+        // otherwise a LATER `dev status`/`dev down`, which reads `comm` long after the exec has
+        // happened, would see today's `comm` and wrongly conclude the PID had been reused.
+        assert_eq!(
+            dev.status_for(Component::Spacetime, &stack.inspector()),
+            ComponentStatus::Healthy
+        );
     }
 
     #[test]
