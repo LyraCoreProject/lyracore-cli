@@ -22,6 +22,8 @@ lyracore — run a local LyraCore vanilla WoW server
 USAGE:
   lyracore doctor          check whether your machine has what `dev up` needs
   lyracore dev up          start the local server (or reconnect to one already running)
+  lyracore account create USER
+                           create a login account so you can connect a 1.12.1 client
   lyracore dev status      show whether the server is running
   lyracore dev down        stop the server
   lyracore import          replace the placeholder starter data with the real game
@@ -683,6 +685,7 @@ mod tests {
         for command in [
             "doctor",
             "dev up",
+            "account create",
             "dev status",
             "dev down",
             "lyracore import",
@@ -690,11 +693,14 @@ mod tests {
             assert!(USAGE.contains(command), "{USAGE}");
         }
         assert!(USAGE.contains("lyracore help --all"), "{USAGE}");
+        // account create is required to log in at all — it's step 2 of the documented
+        // quickstart, not a contributor-only command — so it belongs in the short form even
+        // though `--password-stdin` (its scripted-run variant) does not.
+        assert!(!USAGE.contains("--password-stdin"), "{USAGE}");
         // The contributor-facing surface must not leak into the short form.
         for absent in [
             "preflight",
             "lyracore publish",
-            "account create",
             "lyracore config",
             "character gm",
             "lyracore update",
