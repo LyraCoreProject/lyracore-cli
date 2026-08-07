@@ -100,6 +100,7 @@ pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
         ),
         check_spacetime(),
         check_wasm_target(),
+        check_wasm_opt(),
         check_ports(),
         check_client_data(layout.as_ref().ok()),
     ]
@@ -213,6 +214,20 @@ fn check_wasm_target() -> Check {
         None => Check::warn(
             "WASM target",
             "could not query rustup; ensure wasm32-unknown-unknown is installed",
+        ),
+    }
+}
+
+/// Does `wasm-opt` optimise the published module? Never launch-blocking: `spacetime publish`
+/// runs fine without it — it just falls back to an unoptimised module, silently, on every publish.
+fn check_wasm_opt() -> Check {
+    match version_output("wasm-opt", &["--version"]) {
+        Some(text) => Check::pass("wasm-opt", text.trim().to_string()),
+        None => Check::warn(
+            "wasm-opt",
+            "not found — `spacetime publish` will still work, but ships an unoptimised module; \
+             install with `apt-get install -y binaryen` (Debian/Ubuntu) or `brew install binaryen` \
+             (macOS)",
         ),
     }
 }
@@ -380,6 +395,37 @@ mod tests {
     fn a_broken_layout_is_the_blocking_failure() {
         let broken = Err(crate::Error::ProjectLayout("not a checkout".to_string()));
         assert!(check_layout(&broken).is_blocking());
+    }
+
+    // ---- the wasm-opt check ----
+
+    #[test]
+    fn wasm_opt_missing_warns_and_never_blocks() {
+        // The real check shells out to a binary named `wasm-opt`, which does not exist under
+        // that name in this test environment either way — but the point being asserted is the
+        // Check *variant*, not the environment, so drive it through the same shape check_wasm_opt
+        // produces on a miss.
+        let check = Check::warn(
+            "wasm-opt",
+            "not found — `spacetime publish` will still work, but ships an unoptimised module; \
+             install with `apt-get install -y binaryen` (Debian/Ubuntu) or `brew install binaryen` \
+             (macOS)",
+        );
+        assert!(!check.is_blocking());
+        match check {
+            Check::Warn { guidance, .. } => {
+                assert!(guidance.contains("binaryen"), "{guidance}");
+                assert!(guidance.contains("spacetime publish"), "{guidance}");
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wasm_opt_check_itself_is_never_blocking_on_this_machine() {
+        // Exercises the real function (whichever branch this CI host takes): present or absent,
+        // a missing wasm-opt must never fail `doctor`.
+        assert!(!check_wasm_opt().is_blocking());
     }
 
     // ---- the client-data check ----
