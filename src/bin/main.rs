@@ -7,10 +7,20 @@ use lyracore_cli::Result;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `dev up` is the one command whose failures are usually a missing prerequisite rather than a
+    // bug — so on failure only (never on success, and never for any other command) it gets one
+    // extra line pointing at `doctor`. Parsed here, ahead of `run`, so a bad-flags usage error
+    // (which never reaches `dev up`'s own logic) doesn't earn the hint.
+    let is_dev_up = matches!(Command::parse(&args), Ok(Command::DevUp { .. }));
     std::process::exit(match run(&args) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("lyracore: {e}");
+            if is_dev_up {
+                eprintln!(
+                    "lyracore: if this looks like a missing prerequisite, run `lyracore doctor`"
+                );
+            }
             e.exit_code()
         }
     });
@@ -26,6 +36,10 @@ fn run(args: &[String]) -> Result<i32> {
     match command {
         Command::Help => {
             println!("{}", cmd::USAGE);
+            Ok(EXIT_OK)
+        }
+        Command::HelpAll => {
+            println!("{}", cmd::USAGE_ALL);
             Ok(EXIT_OK)
         }
         // `doctor` reports a broken layout as a check rather than failing before it can print —

@@ -13,20 +13,42 @@ use crate::{Error, Result};
 use account::PasswordSource;
 use import::ImportOptions;
 
+/// The default help: just enough to get a newcomer from a fresh checkout to a running server.
+/// Everything else — the commands you only need once you're developing LyraCore itself — lives in
+/// [`USAGE_ALL`], reached with `lyracore help --all`.
 pub const USAGE: &str = "\
+lyracore — run a local LyraCore vanilla WoW server
+
+USAGE:
+  lyracore doctor          check whether your machine has what `dev up` needs
+  lyracore dev up          start the local server (or reconnect to one already running)
+  lyracore dev status      show whether the server is running
+  lyracore dev down        stop the server
+  lyracore import          replace the placeholder starter data with the real game
+                           world — quests, creatures, items — pulled from public game
+                           data and your own 1.12.1 client
+
+Run `lyracore help --all` to see every command, including the ones for working on
+LyraCore itself.";
+
+/// The full command surface, including the contributor-facing corners `USAGE` leaves out.
+pub const USAGE_ALL: &str = "\
 lyracore — local LyraCore development
 
 USAGE:
-  lyracore doctor                              check prerequisites for `dev up`
+  lyracore doctor                              check whether your machine is ready for `dev up`
   lyracore preflight                           the offline deploy gate: build, schema, filters
   lyracore publish [DATABASE ...]              preflight, then publish the module (default:
-                                               the fixture database). Takes database NAMES;
-                                               every flag is refused, including the -c wipe
-  lyracore publish --skip-preflight [DB ...]   publish without the gate (say why in the PR)
+                                               the fixture database). Takes database NAMES
+                                               only — SpacetimeDB's data-wiping -c flag is
+                                               deliberately not exposed here
+  lyracore publish --skip-preflight [DB ...]   publish without running the offline checks
+                                               (preflight) first
   lyracore dev up                              start (or reuse) the local realm: four databases
                                                with a live shard seam across Elwynn
-  lyracore dev up --single                     the one-database fixture instead — no seam, no
-                                               realm-core, every topology variable unset
+  lyracore dev up --single                     a one-database setup instead, for a quicker
+                                               local test — skips the multi-database sharded
+                                               configuration
   lyracore dev up --lan <IP>                   also serve clients on this machine's private-LAN
                                                address (SpacetimeDB stays on loopback)
   lyracore dev status                          report each component's state, and each
@@ -87,6 +109,7 @@ pub enum Command {
     },
     Update,
     Help,
+    HelpAll,
 }
 
 impl Command {
@@ -95,6 +118,10 @@ impl Command {
         match args.as_slice() {
             [] => Ok(Command::Help),
             ["-h"] | ["--help"] | ["help"] => Ok(Command::Help),
+            ["help", "--all"] => Ok(Command::HelpAll),
+            ["help", other, ..] => Err(Error::Usage(format!(
+                "`lyracore help` takes no arguments other than --all (got '{other}')"
+            ))),
 
             ["doctor"] => Ok(Command::Doctor),
             ["preflight"] => Ok(Command::Preflight),
@@ -395,7 +422,7 @@ mod tests {
 
     #[test]
     fn the_help_text_documents_the_topology_flag() {
-        assert!(USAGE.contains("--single"), "{USAGE}");
+        assert!(USAGE_ALL.contains("--single"), "{USAGE_ALL}");
     }
 
     #[test]
@@ -513,9 +540,12 @@ mod tests {
 
     #[test]
     fn the_help_text_documents_import() {
+        // `import` is one of the first-five-minutes commands, so the short help names it too —
+        // but its options are contributor-depth detail and only show up in the full listing.
         assert!(USAGE.contains("lyracore import"), "{USAGE}");
-        assert!(USAGE.contains("--client-data"), "{USAGE}");
-        assert!(USAGE.contains("--accept"), "{USAGE}");
+        assert!(USAGE_ALL.contains("lyracore import"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("--client-data"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("--accept"), "{USAGE_ALL}");
     }
 
     #[test]
@@ -572,8 +602,8 @@ mod tests {
 
     #[test]
     fn the_help_text_documents_config() {
-        assert!(USAGE.contains("lyracore config"), "{USAGE}");
-        assert!(USAGE.contains("client-data"), "{USAGE}");
+        assert!(USAGE_ALL.contains("lyracore config"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("client-data"), "{USAGE_ALL}");
     }
 
     // ---- character gm ----
@@ -614,7 +644,7 @@ mod tests {
 
     #[test]
     fn the_help_text_documents_character_gm() {
-        assert!(USAGE.contains("character gm"), "{USAGE}");
+        assert!(USAGE_ALL.contains("character gm"), "{USAGE_ALL}");
     }
 
     // ---- update ----
@@ -627,6 +657,84 @@ mod tests {
 
     #[test]
     fn the_help_text_documents_update() {
-        assert!(USAGE.contains("lyracore update"), "{USAGE}");
+        assert!(USAGE_ALL.contains("lyracore update"), "{USAGE_ALL}");
+    }
+
+    // ---- help ----
+
+    #[test]
+    fn help_all_parses_and_bare_help_still_shows_the_short_form() {
+        assert_eq!(parse("help").unwrap(), Command::Help);
+        assert_eq!(parse("-h").unwrap(), Command::Help);
+        assert_eq!(parse("--help").unwrap(), Command::Help);
+        assert_eq!(parse("help --all").unwrap(), Command::HelpAll);
+    }
+
+    #[test]
+    fn help_rejects_anything_else() {
+        for line in ["help --bogus", "help --all extra", "help me"] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_short_help_covers_only_the_first_five_minutes() {
+        for command in [
+            "doctor",
+            "dev up",
+            "dev status",
+            "dev down",
+            "lyracore import",
+        ] {
+            assert!(USAGE.contains(command), "{USAGE}");
+        }
+        assert!(USAGE.contains("lyracore help --all"), "{USAGE}");
+        // The contributor-facing surface must not leak into the short form.
+        for absent in [
+            "preflight",
+            "lyracore publish",
+            "account create",
+            "lyracore config",
+            "character gm",
+            "lyracore update",
+            "dev logs",
+            "dev smoke",
+            "--single",
+        ] {
+            assert!(!USAGE.contains(absent), "{USAGE}");
+        }
+        assert!(USAGE.lines().count() <= 15, "{USAGE}");
+    }
+
+    #[test]
+    fn the_full_help_still_covers_everything() {
+        for command in [
+            "lyracore doctor",
+            "lyracore preflight",
+            "lyracore publish",
+            "lyracore dev up",
+            "lyracore dev status",
+            "lyracore dev logs",
+            "lyracore dev smoke",
+            "lyracore dev down",
+            "lyracore account create",
+            "lyracore import",
+            "lyracore config",
+            "lyracore character gm",
+            "lyracore update",
+            "--password-stdin",
+        ] {
+            assert!(USAGE_ALL.contains(command), "{USAGE_ALL}");
+        }
+    }
+
+    #[test]
+    fn the_full_help_no_longer_carries_the_insider_asides() {
+        // These phrases assumed the reader is working ON this project (danger-zone doc,
+        // PR etiquette, shard-seam jargon) rather than someone running a server with it.
+        for gone in ["say why in the PR", "no seam, no realm-core"] {
+            assert!(!USAGE_ALL.contains(gone), "{USAGE_ALL}");
+        }
     }
 }
