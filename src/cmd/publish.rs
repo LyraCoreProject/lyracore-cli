@@ -97,6 +97,23 @@ pub fn publish_command(project: &ProjectLayout, database: &str) -> Result<Comman
         .arg(database))
 }
 
+/// The post-publish repair call: `spacetime call <db> debug_repair_after_publish`.
+///
+/// SpacetimeDB's `init` reducer runs only on a database's FIRST-EVER publish, so every seed and
+/// scheduled-reducer row it inserts is silently absent after a plain auto-migrate republish — an
+/// unarmed `game_motion_publish_schedule` row means the movement relay stages packets forever and
+/// relays none of them (spacetime-core#465's merge blocker; `scripts/publish-module.sh` has made
+/// this same call since #378).
+pub fn repair_command(database: &str) -> Result<CommandSpec> {
+    validate_database(database)?;
+    Ok(CommandSpec::new("spacetime")
+        .arg("call")
+        .arg("-s")
+        .arg(ProjectLayout::STDB_SERVER)
+        .arg(database)
+        .arg("debug_repair_after_publish"))
+}
+
 /// Publish to each database in turn, stopping at the first failure.
 ///
 /// Fail-fast is deliberate: a half-published realm is the state the gateway reports as an unrelated
@@ -120,6 +137,16 @@ pub fn run(
         println!();
         println!("==> publishing to {database}");
         runner.run_streaming(&publish_command(project, database)?)?;
+        // Re-arm what `init` would have seeded on a fresh database (see `repair_command`). Gated
+        // by `require_operator`, so on a FIRST-EVER publish it fails with "operator not claimed" —
+        // expected and harmless there (`init` just seeded everything); warn and continue.
+        println!("==> repairing {database} (debug_repair_after_publish)");
+        if let Err(e) = runner.run_streaming(&repair_command(database)?) {
+            println!(
+                "    NOTE: debug_repair_after_publish did not run on {database} (expected on a \
+                 brand-new database before claim_operator has run there). Continuing. ({e})"
+            );
+        }
     }
 
     println!();
@@ -302,6 +329,52 @@ mod tests {
                 "every shard gets the deploy features, not just the first: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn every_publish_is_followed_by_the_repair_call_on_the_same_database() {
+        // The #465 merge blocker: `init` never re-runs on an auto-migrate republish, so an
+        // existing database's schedule rows stay unarmed unless something re-seeds them. That
+        // something is debug_repair_after_publish, once per published database, publish-then-repair.
+        let tmp = TempDir::new().unwrap();
+        let stack = FakeStack::new();
+        let wanted = names(&["lyracore", "lyracore-world-1"]);
+        run(&healthy(&tmp), &stack.runner(), &wanted, true).unwrap();
+
+        let rendered = stack.rendered();
+        for database in &wanted {
+            let publish = rendered
+                .iter()
+                .position(|r| r.starts_with("spacetime publish") && r.ends_with(database))
+                .unwrap_or_else(|| panic!("no publish for {database}: {rendered:?}"));
+            let repair = rendered
+                .iter()
+                .position(|r| {
+                    r.starts_with("spacetime call")
+                        && r.contains(database)
+                        && r.ends_with("debug_repair_after_publish")
+                })
+                .unwrap_or_else(|| panic!("no repair for {database}: {rendered:?}"));
+            assert!(publish < repair, "repair must follow its publish: {rendered:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_repair_warns_and_continues_rather_than_aborting_the_publish_train() {
+        // require_operator makes the repair fail with "operator not claimed" on a database's
+        // first-ever publish — expected there (`init` just seeded everything), so it must never
+        // stop the remaining shards from publishing.
+        let tmp = TempDir::new().unwrap();
+        let stack = FakeStack::new().fail_on("debug_repair_after_publish", "operator not claimed");
+        let wanted = names(&["lyracore", "lyracore-world-1"]);
+        run(&healthy(&tmp), &stack.runner(), &wanted, true).unwrap();
+
+        let published: Vec<String> = stack
+            .rendered()
+            .into_iter()
+            .filter(|r| r.starts_with("spacetime publish"))
+            .collect();
+        assert_eq!(published.len(), 2, "both shards still publish: {published:?}");
     }
 
     #[test]
