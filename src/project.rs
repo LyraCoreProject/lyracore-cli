@@ -75,65 +75,21 @@ impl ClientBind {
 /// child gateway is handed (or has actively unset).
 ///
 /// The default is [`Sharded`](Topology::Sharded) (#11): a contributor's first `dev up` produces a
-/// realm with a live seam, because a seam that only production has is a seam nobody develops
+/// multi-database realm, because a topology that only production has is a topology nobody develops
 /// against. [`Single`](Topology::Single) is `dev up --single`, and is the pre-#11 fixture unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Topology {
-    /// Four databases: the default world shard, a map-0 region shard, a map-1 shard, and
-    /// realm-core.
+    /// Three databases: the default world shard, a map-1 shard, and realm-core.
+    ///
+    /// There is no region shard here any more. LyraCore's alpha topology reversal (2026-08-08)
+    /// dropped location/region sharding, and the gateway stopped reading `LYRACORE_REGION_SHARDS`
+    /// and `game_map_region` with it — so a fourth database in this list was one the gateway would
+    /// publish, claim and then never connect, which `verify_topology` correctly reports as a
+    /// collapsed realm on every single `dev up`.
     Sharded,
     /// One database. Every topology variable is actively unset for the child, so a contributor with
     /// the production recipe exported still gets the fixture.
     Single,
-}
-
-/// One `set_region_assignment` call the sharded fixture writes on realm-core: which database owns
-/// a region of the seam menu, at which epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SeamAssignment {
-    pub map_id: u32,
-    pub region_id: u32,
-    pub shard: &'static str,
-    pub epoch: u64,
-}
-
-impl SeamAssignment {
-    /// `set_region_assignment(map_id, region_id, shard, epoch)`'s argument list, in the reducer's
-    /// own order (`module/src/region.rs`), as the JSON array the node's `/call/` endpoint takes.
-    ///
-    /// `epoch` is rendered as a JSON NUMBER, which is safe only because the fixture's epochs are
-    /// tiny: SpacetimeDB's JSON codec is `f64`-backed, and a `u64` past 2^53 loses precision. The
-    /// fixture never writes one — but a caller that starts generating epochs from a timestamp
-    /// would, and this is where it would have to change.
-    pub fn call_arguments(&self) -> String {
-        format!(
-            "[{},{},{},{}]",
-            self.map_id,
-            self.region_id,
-            json_string(self.shard),
-            self.epoch
-        )
-    }
-}
-
-/// `import_map_regions(packed: String)`'s single argument, as the JSON array the node's `/call/`
-/// endpoint takes: the seam menu file's bytes, escaped, and nothing else.
-///
-/// This CLI never parses, filters or reformats the menu. The rectangles are content data owned by
-/// the server checkout (core #327); shipping anything but the file's own bytes would put a second,
-/// silently-diverging copy of the realm's geometry in a repository that has no way to check it.
-pub fn region_menu_arguments(packed: &str) -> String {
-    format!("[{}]", json_string(packed))
-}
-
-/// A Rust string as a JSON string literal — quotes, escapes and all.
-///
-/// `serde_json` is already a dependency (`state.json`), so this is its `to_string` on a `&str` and
-/// not a hand-rolled escaper: the one argument that goes through it is a whole file of prose
-/// comments, quotes and newlines, and getting that wrong would send the module a truncated seam
-/// menu that still parses.
-fn json_string(value: &str) -> String {
-    serde_json::to_string(value).expect("a string always serializes")
 }
 
 impl Topology {
@@ -141,7 +97,7 @@ impl Topology {
     /// `account create` all describe the stack that is actually running.
     ///
     /// Anything unrecognised — including the empty string a pre-#11 `state.json` has — reads back
-    /// as the DEFAULT. A stale single-database state file then reports the three unpublished
+    /// as the DEFAULT. A stale single-database state file then reports the other unpublished
     /// databases as unreachable, which is exactly the advice a contributor needs after the default
     /// changed under them; the one answer that would be wrong is "everything is fine".
     pub fn from_recorded(recorded: &str) -> Self {
@@ -160,14 +116,11 @@ impl Topology {
 
     /// Every database this fixture publishes, claims the operator on, and reports the health of —
     /// in the ORDER the gateway builds its own list (`ShardMap::databases`: the default database,
-    /// then the databases shard-map rules name, then the region shards, then realm-core).
+    /// then the databases shard-map rules name, then realm-core).
     ///
-    /// ⚠ The default world shard being FIRST is load-bearing, twice. The gateway reads the seam
-    /// menu from the first entry of its world-shard list (`Coordinator::region_db_for` →
-    /// `world_shards().first()`), so a region shard sorting ahead of `lyracore` would make it read
-    /// an empty menu and switch region routing off — silently, with every database published,
-    /// claimed and connected. And a publish walks this list in order, so the database whose failure
-    /// matters most is the one that fails first.
+    /// ⚠ The default world shard being FIRST is load-bearing: a publish walks this list in order,
+    /// so the database whose failure matters most is the one that fails first, and it is the
+    /// `LYRACORE_DATABASE` every other lookup collapses to.
     pub fn databases(&self) -> Vec<&'static str> {
         let mut dbs = self.world_shards();
         dbs.extend(self.realm_core());
@@ -175,15 +128,11 @@ impl Topology {
     }
 
     /// The world shards — the databases that hold characters — in the gateway's own order: the
-    /// default, then what a shard-map rule names, then the region shards.
+    /// default, then what a shard-map rule names.
     pub fn world_shards(&self) -> Vec<&'static str> {
         match self {
             Topology::Single => vec![ProjectLayout::DATABASE],
-            Topology::Sharded => vec![
-                ProjectLayout::DATABASE,
-                ProjectLayout::KALIMDOR_SHARD,
-                ProjectLayout::REGION_SHARD,
-            ],
+            Topology::Sharded => vec![ProjectLayout::DATABASE, ProjectLayout::KALIMDOR_SHARD],
         }
     }
 
@@ -198,10 +147,9 @@ impl Topology {
         }
     }
 
-    /// `LYRACORE_SHARD_MAP` — the (map, instance-bucket) → database rules. Kalimdor only: the
-    /// map-0 seam is expressed as regions, which is precisely the decision a shard-map rule cannot
-    /// take (a `0:*=` rule would hand the region shard every map-0 location the menu does NOT
-    /// cover — all of Eastern Kingdoms, on a database holding none of it).
+    /// `LYRACORE_SHARD_MAP` — the (map, instance-bucket) → database rules. Kalimdor only: map 0 is
+    /// Eastern Kingdoms in one piece on the default database, which is what a `0:*=` rule could
+    /// never express without handing a second database every map-0 location there is.
     pub fn shard_map(&self) -> Option<String> {
         match self {
             Topology::Single => None,
@@ -210,58 +158,6 @@ impl Topology {
                 ProjectLayout::KALIMDOR_MAP,
                 ProjectLayout::KALIMDOR_SHARD
             )),
-        }
-    }
-
-    /// `LYRACORE_REGION_SHARDS` — world shards a REGION assignment may name, connected but never
-    /// routed to by the shard map itself. The only way to say "connect to this database, and let
-    /// the region overlay decide who goes there".
-    pub fn region_shards(&self) -> Option<&'static str> {
-        match self {
-            Topology::Single => None,
-            Topology::Sharded => Some(ProjectLayout::REGION_SHARD),
-        }
-    }
-
-    /// Which shards the seam menu is imported on: every WORLD shard a region of the menu can be
-    /// assigned to, the first of which is also where the gateway reads `game_map_region` from
-    /// (`Coordinator::region_db_for`).
-    ///
-    /// The map-1 shard is deliberately not one. The fixture menu draws map-0 regions only, so a
-    /// database that can never own one of them has nothing to resolve, and the import is a
-    /// replace-the-whole-menu write — a needless one on a database is a needless way to fail.
-    pub fn region_menu_shards(&self) -> Vec<&'static str> {
-        match self {
-            Topology::Single => Vec::new(),
-            Topology::Sharded => vec![ProjectLayout::DATABASE, ProjectLayout::REGION_SHARD],
-        }
-    }
-
-    /// The seam the fixture activates (core #327): region `0:1` is Northshire Valley and STAYS on
-    /// the default database, so a fresh character — who spawns there — never begins with a handoff;
-    /// region `0:2` is the rest of Elwynn and moves to the region shard, so walking the road out of
-    /// the valley is a real shard crossing.
-    ///
-    /// Both at epoch 1. The first assignment for a region accepts any epoch, and a re-run writes
-    /// the same epoch again — which the module refuses as a stale retry, by design (an equal epoch
-    /// is a race, not a flip). `DevManager::assign_regions` reads that refusal as "already wired".
-    pub fn seam_assignments(&self) -> Vec<SeamAssignment> {
-        match self {
-            Topology::Single => Vec::new(),
-            Topology::Sharded => vec![
-                SeamAssignment {
-                    map_id: ProjectLayout::SEAM_MAP,
-                    region_id: ProjectLayout::NORTHSHIRE_REGION,
-                    shard: ProjectLayout::DATABASE,
-                    epoch: 1,
-                },
-                SeamAssignment {
-                    map_id: ProjectLayout::SEAM_MAP,
-                    region_id: ProjectLayout::ELWYNN_REGION,
-                    shard: ProjectLayout::REGION_SHARD,
-                    epoch: 1,
-                },
-            ],
         }
     }
 
@@ -277,17 +173,22 @@ impl Topology {
     ///
     /// - `Single` unsets all four, which is the pre-#11 fixture exactly — a contributor with the
     ///   production recipe exported still gets one database.
-    /// - `Sharded` SETS the three it means and unsets `LYRACORE_SHARD_MAP_FILE`, which the env var
-    ///   would win over anyway; leaving it inherited would only make a stale file look load-bearing.
+    /// - `Sharded` SETS the two it means and unsets the other two. `LYRACORE_SHARD_MAP_FILE` the
+    ///   env var would win over anyway; leaving it inherited would only make a stale file look
+    ///   load-bearing. `LYRACORE_REGION_SHARDS` names a topology this fixture no longer builds and
+    ///   the gateway no longer reads — but an inherited one is still a string this CLI did not
+    ///   decide, and the whole point of this function is that there are none of those.
     ///
     /// A variable is never both set and removed: `CommandSpec::build` applies the removals last, so
     /// that combination would silently unset it.
     pub fn apply_env(&self, cmd: CommandSpec) -> CommandSpec {
-        let mut cmd = cmd.env_remove("LYRACORE_SHARD_MAP_FILE");
+        let mut cmd = cmd
+            .env_remove("LYRACORE_SHARD_MAP_FILE")
+            .env_remove("LYRACORE_REGION_SHARDS");
         match self {
             Topology::Single => {
                 for var in ProjectLayout::TOPOLOGY_VARS {
-                    if var != "LYRACORE_SHARD_MAP_FILE" {
+                    if !cmd.removes_env(var) {
                         cmd = cmd.env_remove(var);
                     }
                 }
@@ -295,11 +196,7 @@ impl Topology {
             Topology::Sharded => {
                 cmd = cmd
                     .env("LYRACORE_SHARD_MAP", self.shard_map().expect("sharded"))
-                    .env("LYRACORE_REALM_CORE", self.realm_core().expect("sharded"))
-                    .env(
-                        "LYRACORE_REGION_SHARDS",
-                        self.region_shards().expect("sharded"),
-                    );
+                    .env("LYRACORE_REALM_CORE", self.realm_core().expect("sharded"));
             }
         }
         cmd
@@ -355,35 +252,15 @@ pub struct ProjectLayout {
 impl ProjectLayout {
     // ---- the #241 rename seam: internal names live here and nowhere else ----
 
-    /// The DEFAULT WORLD SHARD: Eastern Kingdoms, the database that holds the seam menu, and the
-    /// only database the `--single` fixture has. It is `LYRACORE_DATABASE` in every topology, and
-    /// it is first in every list of databases this CLI builds (see [`Topology::databases`]).
+    /// The DEFAULT WORLD SHARD: Eastern Kingdoms in one piece, and the only database the `--single`
+    /// fixture has. It is `LYRACORE_DATABASE` in every topology, and it is first in every list of
+    /// databases this CLI builds (see [`Topology::databases`]).
     pub const DATABASE: &'static str = "lyracore";
-    /// The map-0 REGION shard: the far side of the seam, holding everything in Elwynn outside
-    /// Northshire Valley. Wired only through `LYRACORE_REGION_SHARDS` and a region assignment —
-    /// never a shard-map rule.
-    pub const REGION_SHARD: &'static str = "lyracore-elwynn";
     /// The map-1 shard, reached by an ordinary `LYRACORE_SHARD_MAP` rule.
     pub const KALIMDOR_SHARD: &'static str = "lyracore-kalimdor";
     pub const KALIMDOR_MAP: u32 = 1;
-    /// Realm-core: accounts, sessions, the character→shard index, and the region assignments.
+    /// Realm-core: accounts, sessions, and the character→shard index.
     pub const REALM_CORE: &'static str = "lyracore-realm";
-
-    /// The seam the fixture draws, as `content/regions/fixture.regions` defines it: two map-0
-    /// regions, one per world shard. The geometry itself is NOT here and must never be — the
-    /// rectangles are content data belonging to the server checkout, and this CLI only ever ships
-    /// that file's bytes to `import_map_regions`.
-    pub const SEAM_MAP: u32 = 0;
-    /// Northshire Valley — where a new character spawns, and where the fixture seeds its whole
-    /// spatial content. Stays on [`DATABASE`](Self::DATABASE).
-    pub const NORTHSHIRE_REGION: u32 = 1;
-    /// The rest of Elwynn. Moves to [`REGION_SHARD`](Self::REGION_SHARD).
-    pub const ELWYNN_REGION: u32 = 2;
-
-    /// The seam menu the sharded fixture imports, relative to the checkout root. Content data that
-    /// belongs to the server repo (core #327), so a checkout older than this CLI simply does not
-    /// have it — which is a skip with a message, never a half-wired realm.
-    pub const REGION_FIXTURE: &'static str = "content/regions/fixture.regions";
 
     /// Every variable that decides a child's database topology — see [`Topology::apply_env`],
     /// which is the only thing allowed to act on them.
@@ -391,6 +268,11 @@ impl ProjectLayout {
     /// ONE list. `cmd/dev.rs` and `cmd/account.rs` each used to carry their own copy, one as a
     /// constant and one as four inline `env_remove` calls, and that is exactly how they drifted:
     /// the gateway's fixture was hermetic and the provisioning child's was not.
+    ///
+    /// `LYRACORE_REGION_SHARDS` is still on the list although nothing sets it any more: the alpha
+    /// topology reversal retired region sharding, but a variable this CLI stopped writing is
+    /// exactly the one an old exported recipe can still smuggle in, so it stays something we
+    /// actively unset rather than something we merely no longer mention.
     pub const TOPOLOGY_VARS: [&'static str; 4] = [
         "LYRACORE_SHARD_MAP",
         "LYRACORE_SHARD_MAP_FILE",
@@ -570,13 +452,6 @@ impl ProjectLayout {
         self.root.join(Self::WIRE_HARNESS_PIN)
     }
 
-    /// The checkout's seam menu, if it ships one. `None` is version skew (a core checkout older
-    /// than this CLI), not an error.
-    pub fn region_fixture(&self) -> Option<PathBuf> {
-        let path = self.root.join(Self::REGION_FIXTURE);
-        path.is_file().then_some(path)
-    }
-
     /// Where pinned harness releases are cached — inside the git-ignored state directory, so a
     /// harness checkout can never appear in the server repo's `git status`.
     pub fn harness_cache(&self) -> PathBuf {
@@ -696,33 +571,26 @@ mod tests {
 
     #[test]
     fn the_default_world_shard_is_first_in_every_database_list() {
-        // Not cosmetic: the gateway reads the seam menu from the FIRST world shard in its own list
-        // (`Coordinator::region_db_for`). A region shard sorting ahead of `lyracore` would make the
-        // gateway read an empty menu and switch region routing off — silently, with all four
-        // databases published, claimed and connected.
+        // Not cosmetic: `LYRACORE_DATABASE` is what every lookup the shard map does not answer
+        // collapses to, and a publish walks this list in order — so the database whose failure
+        // matters most is the one that fails first.
         for topology in [Topology::Sharded, Topology::Single] {
             assert_eq!(topology.databases()[0], ProjectLayout::DATABASE);
             assert_eq!(topology.world_shards()[0], ProjectLayout::DATABASE);
         }
         // ...and the rest is the gateway's own construction order (`ShardMap::databases`: default,
-        // rule targets, region shards, realm-core), so a per-database report reads in the same
-        // order as the gateway log it is checked against.
+        // rule targets, realm-core), so a per-database report reads in the same order as the
+        // gateway log it is checked against.
         assert_eq!(
             Topology::Sharded.databases(),
-            vec![
-                "lyracore",
-                "lyracore-kalimdor",
-                "lyracore-elwynn",
-                "lyracore-realm"
-            ]
+            vec!["lyracore", "lyracore-kalimdor", "lyracore-realm"]
         );
         assert_eq!(Topology::Single.databases(), vec!["lyracore"]);
     }
 
     #[test]
     fn realm_core_is_last_because_it_is_not_a_world_shard() {
-        // It owns accounts and sessions, never characters. The gateway drops it from
-        // `LYRACORE_REGION_SHARDS` for exactly that reason, so a list that treated it as a world
+        // It owns accounts and sessions, never characters, so a list that treated it as a world
         // shard would be describing a topology the gateway refuses to build.
         let world = Topology::Sharded.world_shards();
         assert!(!world.contains(&ProjectLayout::REALM_CORE), "{world:?}");
@@ -743,26 +611,20 @@ mod tests {
     }
 
     #[test]
-    fn the_region_shard_is_never_named_by_a_shard_map_rule() {
-        // `0:*=lyracore-elwynn` would hand the region shard every map-0 location the seam menu does
-        // NOT cover — all of Eastern Kingdoms, on a database holding none of it. The region overlay
-        // is its only way in, and `LYRACORE_REGION_SHARDS` is the only var that says so.
+    fn map_zero_is_never_named_by_a_shard_map_rule() {
+        // Eastern Kingdoms stays whole on the default database. A `0:*=` rule would hand a second
+        // database every map-0 location there is, which is the one thing the fixture's geography
+        // cannot survive — and after the alpha topology reversal there is no second map-0 database
+        // for it to name anyway.
         let rules = Topology::Sharded.shard_map().unwrap();
         assert_eq!(rules, "1:*=lyracore-kalimdor");
-        assert!(!rules.contains(ProjectLayout::REGION_SHARD), "{rules}");
-        assert_eq!(
-            Topology::Sharded.region_shards(),
-            Some(ProjectLayout::REGION_SHARD)
-        );
+        assert!(!rules.starts_with("0:"), "{rules}");
     }
 
     #[test]
     fn the_single_topology_expresses_no_topology_at_all() {
         assert_eq!(Topology::Single.shard_map(), None);
-        assert_eq!(Topology::Single.region_shards(), None);
         assert_eq!(Topology::Single.realm_core(), None);
-        assert!(Topology::Single.region_menu_shards().is_empty());
-        assert!(Topology::Single.seam_assignments().is_empty());
     }
 
     // ---- the environment a child is handed ----
@@ -779,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sharded_topology_sets_the_three_it_means_and_never_both_sets_and_removes_one() {
+    fn the_sharded_topology_sets_the_two_it_means_and_never_both_sets_and_removes_one() {
         // `CommandSpec::build` applies removals AFTER assignments, so a variable that is both set
         // and removed reaches the child unset — a silent collapse to one database with every
         // string exported exactly as intended.
@@ -789,20 +651,20 @@ mod tests {
             Some("1:*=lyracore-kalimdor")
         );
         assert_eq!(cmd.env_value("LYRACORE_REALM_CORE"), Some("lyracore-realm"));
-        assert_eq!(
-            cmd.env_value("LYRACORE_REGION_SHARDS"),
-            Some("lyracore-elwynn")
-        );
         for var in ProjectLayout::TOPOLOGY_VARS {
             assert!(
                 cmd.env_value(var).is_none() || !cmd.removes_env(var),
                 "{var} is both set and removed, so the child sees it unset"
             );
         }
-        // ...and the file form is unset in BOTH modes: the env var wins over it anyway, so leaving
-        // a stale `LYRACORE_SHARD_MAP_FILE` inherited only makes it look load-bearing.
-        assert!(cmd.removes_env("LYRACORE_SHARD_MAP_FILE"));
-        assert_eq!(cmd.env_value("LYRACORE_SHARD_MAP_FILE"), None);
+        // The two this mode does NOT set are unset rather than inherited. The env var wins over a
+        // stale `LYRACORE_SHARD_MAP_FILE` anyway; `LYRACORE_REGION_SHARDS` names databases the
+        // retired region topology had and this fixture never publishes, so an inherited one is a
+        // realm the gateway would be asked to connect and the CLI would then report as collapsed.
+        for var in ["LYRACORE_SHARD_MAP_FILE", "LYRACORE_REGION_SHARDS"] {
+            assert!(cmd.removes_env(var), "{var} must be actively unset");
+            assert_eq!(cmd.env_value(var), None);
+        }
     }
 
     #[test]
@@ -812,10 +674,11 @@ mod tests {
         // the default, and otherwise behaves exactly like a healthy realm.
         let cmd = Topology::Sharded.apply_env(CommandSpec::new("gateway"));
         let published = Topology::Sharded.databases();
-        for var in ["LYRACORE_REALM_CORE", "LYRACORE_REGION_SHARDS"] {
-            let named = cmd.env_value(var).unwrap();
-            assert!(published.contains(&named), "{var}={named} is unpublished");
-        }
+        let named = cmd.env_value("LYRACORE_REALM_CORE").unwrap();
+        assert!(
+            published.contains(&named),
+            "LYRACORE_REALM_CORE={named} is unpublished"
+        );
         let rule = cmd.env_value("LYRACORE_SHARD_MAP").unwrap();
         let (_, target) = rule
             .split_once('=')
@@ -827,81 +690,15 @@ mod tests {
     }
 
     #[test]
-    fn the_seam_menu_lands_on_every_shard_a_region_can_route_to() {
-        // The gateway reads the menu from the first world shard; an assignment may name any of
-        // them. Both assignment targets must therefore be shards the menu was imported on.
-        let menu = Topology::Sharded.region_menu_shards();
-        assert_eq!(menu[0], ProjectLayout::DATABASE, "{menu:?}");
-        for assignment in Topology::Sharded.seam_assignments() {
-            assert!(
-                menu.contains(&assignment.shard),
-                "region {} routes to {}, which has no seam menu: {menu:?}",
-                assignment.region_id,
-                assignment.shard
-            );
-        }
-    }
-
-    #[test]
-    fn the_two_seam_assignments_split_map_zero_between_the_two_world_shards() {
-        let assignments = Topology::Sharded.seam_assignments();
-        assert_eq!(assignments.len(), 2);
-        assert!(assignments.iter().all(|a| a.map_id == 0 && a.epoch == 1));
-        // Region 1 is Northshire Valley, where a new character spawns — it STAYS on the default
-        // database, so a fresh login never begins with a handoff (core #327).
-        assert_eq!(assignments[0].region_id, 1);
-        assert_eq!(assignments[0].shard, ProjectLayout::DATABASE);
-        assert_eq!(assignments[1].region_id, 2);
-        assert_eq!(assignments[1].shard, "lyracore-elwynn");
-        // Region 0 is "the rest of the map" and is never assignable — the module refuses it.
-        assert!(assignments.iter().all(|a| a.region_id != 0));
-    }
-
-    #[test]
-    fn an_assignment_renders_the_reducers_four_arguments_in_its_own_order() {
-        // `set_region_assignment(map_id: u32, region_id: u32, shard: String, epoch: u64)`. Swapping
-        // the two u32s writes a real row for a region that does not exist, which routes nobody and
-        // reports nothing.
-        let assignment = Topology::Sharded.seam_assignments()[1];
-        assert_eq!(assignment.call_arguments(), r#"[0,2,"lyracore-elwynn",1]"#);
-    }
-
-    #[test]
-    fn a_seam_menu_argument_is_json_escaped_rather_than_concatenated() {
-        // The menu is a whole file of prose comments, quotes and newlines. Splicing it into a JSON
-        // array unescaped would send the module a truncated menu — and a truncated menu still
-        // parses, because `#` comments and blank lines are skipped.
-        assert_eq!(json_string("a \"quoted\" line\nand another"), {
-            let expected: &str = "\"a \\\"quoted\\\" line\\nand another\"";
-            expected.to_string()
-        });
-    }
-
-    #[test]
     fn a_recorded_topology_round_trips_and_anything_else_is_the_default() {
         for topology in [Topology::Sharded, Topology::Single] {
             assert_eq!(Topology::from_recorded(topology.as_str()), topology);
         }
         // A pre-#11 `state.json` has no field at all. It must read as the new default, so the
-        // three databases it never published are reported as unreachable rather than as fine.
-        for junk in ["", "SINGLE", "four", "sharded "] {
+        // other databases it never published are reported as unreachable rather than as fine.
+        for junk in ["", "SINGLE", "three", "sharded "] {
             assert_eq!(Topology::from_recorded(junk), Topology::Sharded);
         }
-    }
-
-    #[test]
-    fn a_checkout_without_a_seam_menu_reports_no_fixture_rather_than_a_path() {
-        // Version skew: a core checkout older than this CLI ships no `content/regions/`. That is a
-        // skip with a message, not a half-wired realm and not a crash.
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
-        let layout = ProjectLayout::from_root(tmp.path()).unwrap();
-        assert_eq!(layout.region_fixture(), None);
-
-        let fixture = tmp.path().join(ProjectLayout::REGION_FIXTURE);
-        std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
-        std::fs::write(&fixture, "0:1 = 512..524, 336..350\n").unwrap();
-        assert_eq!(layout.region_fixture(), Some(fixture));
     }
 
     #[test]
