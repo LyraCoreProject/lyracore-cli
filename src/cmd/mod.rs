@@ -46,8 +46,9 @@ USAGE:
                                                deliberately not exposed here
   lyracore publish --skip-preflight [DB ...]   publish without running the offline checks
                                                (preflight) first
-  lyracore dev up                              start (or reuse) the local realm: three databases
-                                               — Eastern Kingdoms, Kalimdor, and realm-core
+  lyracore dev up                              start (or reuse) the local realm: four databases
+                                               — Eastern Kingdoms, Kalimdor, the instance pool,
+                                               and realm-core
   lyracore dev up --single                     a one-database setup instead, for a quicker
                                                local test — skips the multi-database sharded
                                                configuration
@@ -63,8 +64,10 @@ USAGE:
   lyracore import [--client-data PATH]         build the REAL world in place of the seed
                                                fixture: pull cmangos' classic-db, read your
                                                own 1.12.1 client's Data/ archives, run the
-                                               world ETL and the class-spell import. Asks
-                                               for consent first, every time
+                                               world ETL and the class-spell import — on
+                                               every database the fixture populates, which
+                                               includes the instance pool. Asks for consent
+                                               first, every time
   lyracore import --accept                     the same, with the consent answered in
                                                advance (scripted runs)
   lyracore config                              show the persisted client-data path (or \"(unset)\")
@@ -638,7 +641,12 @@ mod tests {
 
     #[test]
     fn character_without_a_recognised_verb_names_gm_as_the_one_that_exists() {
-        for line in ["character", "character gm", "character gm Ginger", "character sideways"] {
+        for line in [
+            "character",
+            "character gm",
+            "character gm Ginger",
+            "character sideways",
+        ] {
             let error = parse(line).unwrap_err().to_string();
             assert!(error.contains("gm"), "{line}: {error}");
         }
