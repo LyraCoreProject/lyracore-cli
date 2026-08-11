@@ -323,13 +323,23 @@ impl ProjectLayout {
     pub const RUST_TOOLCHAIN: &'static str = "rust-toolchain.toml";
     pub const SCRIPTS_DIR: &'static str = "scripts";
 
-    /// The world-import ETL, which lives with the importer it drives rather than in the server
-    /// repo's private `scripts/`. These four are the shipped, documented tooling `lyracore import`
-    /// is a façade over — see the header of each one for what it does and what it needs.
+    /// The world-import tooling, which lives with the importer it belongs to rather than in the
+    /// server repo's private `scripts/`. Since #104 `lyracore import world` drives the importer
+    /// BINARY's modes itself and shells to only two of the scripts (the dump pull and the curated
+    /// class-spell overlay) plus the manifest of assertion floors. `import-world.sh` itself is no
+    /// longer driven — it stays in the checkout as the by-hand advanced path (several shards, a
+    /// non-default box, a second continent) until the Rust flow has proven parity on a fresh
+    /// provision, and this CLI deliberately does not address it.
     pub const IMPORTER_SCRIPTS_DIR: &'static str = "importer/scripts";
     pub const PULL_CLASSIC_DB_SCRIPT: &'static str = "importer/scripts/pull-classic-db.sh";
-    pub const IMPORT_WORLD_SCRIPT: &'static str = "importer/scripts/import-world.sh";
     pub const IMPORT_CLASS_SPELLS_SCRIPT: &'static str = "importer/scripts/import-class-spells.sh";
+    /// The FLOOR_* count minimums the post-import assertions compare against. A DATA file the
+    /// core repo tunes per dump — the CLI sources it fresh on every run rather than baking the
+    /// numbers in, so retuning a floor never needs a CLI release.
+    pub const IMPORT_MANIFEST_SCRIPT: &'static str = "importer/scripts/import-manifest.sh";
+    /// The importer binary `import world` / `import vmaps` build and drive — the machinery stays
+    /// in the core repo; this CLI only orders its modes.
+    pub const IMPORTER_BIN: &'static str = "target/debug/lyracore-importer";
 
     /// The pinned wire-harness release this checkout consumes (#246).
     pub const WIRE_HARNESS_PIN: &'static str = ".wire-harness-rev";
@@ -465,12 +475,16 @@ impl ProjectLayout {
         self.root.join(Self::PULL_CLASSIC_DB_SCRIPT)
     }
 
-    pub fn import_world_script(&self) -> PathBuf {
-        self.root.join(Self::IMPORT_WORLD_SCRIPT)
-    }
-
     pub fn import_class_spells_script(&self) -> PathBuf {
         self.root.join(Self::IMPORT_CLASS_SPELLS_SCRIPT)
+    }
+
+    pub fn import_manifest_script(&self) -> PathBuf {
+        self.root.join(Self::IMPORT_MANIFEST_SCRIPT)
+    }
+
+    pub fn importer_bin(&self) -> PathBuf {
+        self.root.join(Self::IMPORTER_BIN)
     }
 
     pub fn wire_harness_pin(&self) -> PathBuf {

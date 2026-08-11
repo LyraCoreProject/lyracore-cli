@@ -83,11 +83,18 @@ fn run(args: &[String]) -> Result<i32> {
             let mut dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
             dev.down(&runner, &inspector, forget).map(|_| EXIT_OK)
         }
-        Command::Import(options) => cmd::import::run(
+        Command::ImportWorld(options) => cmd::import::run_world(
             &ProjectLayout::discover()?,
             &runner,
             &cmd::import::TtyPrompt,
             &options,
+        )
+        .map(|_| EXIT_OK),
+        Command::ImportVmaps { client_data } => cmd::import::run_vmaps(
+            &ProjectLayout::discover()?,
+            &runner,
+            &cmd::import::TtyPrompt,
+            client_data.as_deref(),
         )
         .map(|_| EXIT_OK),
         Command::AccountCreate { user, source } => {
