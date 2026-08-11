@@ -62,11 +62,17 @@ USAGE:
                                                provision an account's SRP6 credentials
   lyracore import [--client-data PATH]         build the REAL world in place of the seed
                                                fixture: pull cmangos' classic-db, read your
-                                               own 1.12.1 client's Data/ archives, run the
-                                               world ETL and the class-spell import. Asks
-                                               for consent first, every time
-  lyracore import --accept                     the same, with the consent answered in
+                                               own 1.12.1 client's Data/ archives, drive the
+                                               importer's modes in order and assert the
+                                               FLOOR_* import floors. Asks for consent
+                                               first, every time
+  lyracore import world --accept               the same command by its full name (`import`
+                                               is its alias), with the consent answered in
                                                advance (scripted runs)
+  lyracore import vmaps [--client-data PATH]   exact model/WMO collision triangles for each
+                                               world shard, read from your own client's
+                                               archives — nothing is fetched, so there is
+                                               no consent gate
   lyracore config                              show the persisted client-data path (or \"(unset)\")
   lyracore config set client-data PATH         validate and remember your 1.12.1 client's Data/
                                                directory, so `import` and `doctor` stop asking
@@ -100,7 +106,10 @@ pub enum Command {
         user: String,
         source: PasswordSource,
     },
-    Import(ImportOptions),
+    ImportWorld(ImportOptions),
+    ImportVmaps {
+        client_data: Option<String>,
+    },
     ConfigShow,
     ConfigSetClientData {
         path: String,
@@ -181,10 +190,16 @@ impl Command {
                 "`account` supports: create USER [--password-stdin]".to_string(),
             )),
 
-            // `import` takes two options and no positional arguments. A bare path is the shape
+            // Two verbs since #104: `world` (the full import) and `vmaps` (collision only). Bare
+            // `import` is an ALIAS of `import world` rather than a separate arm: this parser is
+            // literal slice-matching, so the alias is one line, the two spellings cannot drift,
+            // and the command bare `import` has meant since it existed keeps meaning that.
+            ["import", "world", rest @ ..] => parse_import_world(rest),
+            ["import", "vmaps", rest @ ..] => parse_import_vmaps(rest),
+            // ...and `import` still takes no positional arguments. A bare path is the shape
             // somebody will type first (`lyracore import /games/wow/Data`), so it is refused by
             // NAME rather than as "unknown command".
-            ["import", rest @ ..] => parse_import(rest),
+            ["import", rest @ ..] => parse_import_world(rest),
 
             ["config"] => Ok(Command::ConfigShow),
             ["config", "set", "client-data", path] => Ok(Command::ConfigSetClientData {
@@ -263,7 +278,7 @@ fn parse_dev_up(args: &[&str]) -> Result<Command> {
     Ok(Command::DevUp { bind, topology })
 }
 
-fn parse_import(args: &[&str]) -> Result<Command> {
+fn parse_import_world(args: &[&str]) -> Result<Command> {
     let mut options = ImportOptions::default();
     let mut rest = args;
     while let Some((head, tail)) = rest.split_first() {
@@ -293,13 +308,51 @@ fn parse_import(args: &[&str]) -> Result<Command> {
             }
             other => {
                 return Err(Error::Usage(format!(
-                    "`import` takes no positional arguments (got '{other}'). Name the client \
-                     directory with --client-data {other}"
+                    "`import` takes no positional arguments other than the verbs world and vmaps \
+                     (got '{other}'). Name the client directory with --client-data {other}"
                 )))
             }
         }
     }
-    Ok(Command::Import(options))
+    Ok(Command::ImportWorld(options))
+}
+
+/// `import vmaps [--client-data PATH]`. No `--accept`, deliberately: there is no consent question
+/// to answer in advance — the vmaps import fetches nothing and reads only the operator's own
+/// client, so a flag that implied otherwise would misdescribe the command.
+fn parse_import_vmaps(args: &[&str]) -> Result<Command> {
+    let mut client_data = None;
+    let mut rest = args;
+    while let Some((head, tail)) = rest.split_first() {
+        match *head {
+            "--client-data" => match tail.split_first() {
+                Some((path, after)) if !path.starts_with('-') => {
+                    client_data = Some((*path).to_string());
+                    rest = after;
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "`import vmaps --client-data` needs the path to your 1.12.1 client's \
+                         Data/ directory, e.g. `--client-data /games/WoW-1.12.1/Data`"
+                            .to_string(),
+                    ))
+                }
+            },
+            other if other.starts_with('-') => {
+                return Err(Error::Usage(format!(
+                    "unknown `import vmaps` option '{other}' — the only one is --client-data PATH \
+                     (there is no consent to --accept: nothing is fetched)"
+                )))
+            }
+            other => {
+                return Err(Error::Usage(format!(
+                    "`import vmaps` takes no positional arguments (got '{other}'). Name the \
+                     client directory with --client-data {other}"
+                )))
+            }
+        }
+    }
+    Ok(Command::ImportVmaps { client_data })
 }
 
 #[cfg(test)]
@@ -492,29 +545,71 @@ mod tests {
     fn import_parses_its_two_options_in_any_order() {
         assert_eq!(
             parse("import").unwrap(),
-            Command::Import(import::ImportOptions::default())
+            Command::ImportWorld(import::ImportOptions::default())
         );
         assert_eq!(
             parse("import --accept").unwrap(),
-            Command::Import(import::ImportOptions {
+            Command::ImportWorld(import::ImportOptions {
                 accept: true,
                 client_data: None,
             })
         );
         assert_eq!(
             parse("import --client-data /games/wow/Data --accept").unwrap(),
-            Command::Import(import::ImportOptions {
+            Command::ImportWorld(import::ImportOptions {
                 accept: true,
                 client_data: Some("/games/wow/Data".to_string()),
             })
         );
         assert_eq!(
             parse("import --accept --client-data /games/wow/Data").unwrap(),
-            Command::Import(import::ImportOptions {
+            Command::ImportWorld(import::ImportOptions {
                 accept: true,
                 client_data: Some("/games/wow/Data".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn bare_import_is_an_alias_of_import_world() {
+        // One command, two spellings — the parser routes both through the same arm, so the two
+        // cannot drift apart.
+        for line in ["", " --accept", " --accept --client-data /games/wow/Data"] {
+            assert_eq!(
+                parse(&format!("import{line}")).unwrap(),
+                parse(&format!("import world{line}")).unwrap(),
+                "`import{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn import_vmaps_takes_only_the_client_data_option() {
+        assert_eq!(
+            parse("import vmaps").unwrap(),
+            Command::ImportVmaps { client_data: None }
+        );
+        assert_eq!(
+            parse("import vmaps --client-data /games/wow/Data").unwrap(),
+            Command::ImportVmaps {
+                client_data: Some("/games/wow/Data".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn import_vmaps_refuses_accept_because_it_has_no_consent_question() {
+        let error = parse("import vmaps --accept").unwrap_err();
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
+        assert!(error.to_string().contains("--client-data"), "{error}");
+    }
+
+    #[test]
+    fn import_vmaps_refuses_a_bare_path_by_naming_the_flag_it_wanted() {
+        for line in ["import vmaps /games/wow/Data", "import vmaps --client-data"] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+        }
     }
 
     #[test]
@@ -543,9 +638,12 @@ mod tests {
     #[test]
     fn the_help_text_documents_import() {
         // `import` is one of the first-five-minutes commands, so the short help names it too —
-        // but its options are contributor-depth detail and only show up in the full listing.
+        // but its options and verbs are contributor-depth detail and only show up in the full
+        // listing.
         assert!(USAGE.contains("lyracore import"), "{USAGE}");
         assert!(USAGE_ALL.contains("lyracore import"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("lyracore import world"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("lyracore import vmaps"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--client-data"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--accept"), "{USAGE_ALL}");
     }
