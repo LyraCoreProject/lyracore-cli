@@ -15,15 +15,20 @@
 //! exactly that. Nothing is fetched, read or written before the operator says yes (or passes
 //! `--accept`, for a scripted run).
 //!
-//! WHY A FAÇADE AND NOT RUST: the four stages below are shell scripts under `importer/scripts/`
-//! that have been run against real dumps for months, with post-ETL assertions tuned against real
-//! counts. Absorbing them into Rust is worth doing later — the same path `publish` took — but doing
-//! it in the same change that first makes them user-runnable would trade a tested pipeline for an
-//! untested one. What this command adds is the part the scripts do NOT have: an ordered,
-//! consent-gated, per-stage-diagnosable run that a first-time user can get through.
+//! WHY A FAÇADE AND NOT RUST: the stages below are shell scripts under `importer/scripts/` that
+//! have been run against real dumps for months, with post-ETL assertions tuned against real counts.
+//! Absorbing them into Rust is worth doing later — the same path `publish` took — but doing it in
+//! the same change that first makes them user-runnable would trade a tested pipeline for an untested
+//! one. What this command adds is the part the scripts do NOT have: an ordered, consent-gated,
+//! per-stage-diagnosable run that a first-time user can get through.
+//!
+//! HOW MANY STAGES: the pull, the client, then an ETL + a class-spell pass PER POPULATED DATABASE —
+//! four on `dev up --single`, six on the sharded fixture, which since #108 routes dungeons to
+//! `lyracore-instances` and therefore has to populate it. See [`populated_databases`].
 
 use crate::proc::{CommandSpec, ProcessRunner};
-use crate::project::ProjectLayout;
+use crate::project::{ProjectLayout, Topology};
+use crate::state::RuntimeState;
 use crate::{Error, Result};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -150,9 +155,18 @@ pub fn run(
         }
     }
 
+    // Which databases this import POPULATES, and therefore how many stages there are. Not
+    // `world_shards()`: `lyracore-kalimdor` is in that list and is deliberately not here, because
+    // map 1 has no content in the dump slice this ETL imports — importing it would be a long run
+    // that lands nothing.
+    let databases = populated_databases(RuntimeState::load(&project.state_file())?.topology());
+    // Two fixed stages, then an ETL + a class-spell pass per database.
+    let total = 2 + 2 * databases.len() as u8;
+
     // ---- stage 1: the world database dump -----------------------------------------------------
     stage(
         1,
+        total,
         "pulling cmangos/classic-db (pinned commit, checksum-verified)",
     );
     runner.run_streaming(&pull_command(project)).map_err(|e| {
@@ -168,44 +182,75 @@ pub fn run(
     })?;
 
     // ---- stage 2: the client ------------------------------------------------------------------
-    stage(2, "locating your 1.12.1 client data");
+    stage(2, total, "locating your 1.12.1 client data");
     let client_data = resolve_client_data(project, prompt, options)?;
     println!("   client data: {}", client_data.display());
 
-    // ---- stage 3: the world ETL ---------------------------------------------------------------
-    stage(
-        3,
-        "importing the world (creatures, quests, loot, vendors, terrain, navigation)",
-    );
-    println!(
-        "   this is the long one — tens of minutes, and it prints its own assertions at the end."
-    );
-    runner
-        .run_streaming(&world_command(project, &client_data))
-        .map_err(|e| stage_failure(
-            "importing the world",
-            "The ETL prints a FAIL line for every assertion that did not meet its floor; read those \
-             first — they say which family imported nothing. If it never got that far, check that \
-             the SpacetimeDB node is running and the module is published (`lyracore dev up`).",
-            e,
-        ))?;
-
-    // ---- stage 4: the curated class spells ----------------------------------------------------
-    // The world ETL runs this too, but swallows its exit status inside a reporting pipeline. Run
-    // it again as a stage of its own: it is idempotent (a surgical per-id delete+reload), and it
-    // is the difference between "no class can train past its starter kit" failing loudly here and
-    // failing silently in play.
-    stage(4, "importing the curated class spells (all nine classes)");
-    runner
-        .run_streaming(&class_spells_command(project, &client_data))
-        .map_err(|e| {
-            stage_failure(
-                "importing class spells",
-                "This reads Spell.dbc out of the client archives and writes trainer offerings. A \
-             \"requested N ids but matched M\" warning names ids your client build does not have.",
+    // ---- one ETL + one class-spell pass per database, INTERLEAVED -----------------------------
+    // Interleaved rather than all-ETLs-then-all-spells so a failure part way leaves one COMPLETE
+    // database rather than two half ones — and because ETL-then-spells is the order the scripts
+    // have been run in against real dumps.
+    for (i, database) in databases.iter().enumerate() {
+        let n = 3 + 2 * i as u8;
+        stage(
+            n,
+            total,
+            &format!(
+                "importing the world into {database} (creatures, quests, loot, vendors, terrain, \
+                 navigation)"
+            ),
+        );
+        if i == 0 {
+            println!(
+                "   this is the long one — tens of minutes, and it prints its own assertions at \
+                 the end."
+            );
+        } else {
+            // Why a second full run and not a map-36 slice: the ETL has no map-36-only mode, and
+            // adding one means teaching the terrain/nav assertion floors, the post-run one-continent
+            // re-assert AND `db_never_imported`'s fresh-shard signal to stand down — four ways to
+            // pass an import that imported nothing, to save wall time on a command that already
+            // asks for consent. The duplicated map-0 rows are inert: routing never reads them, and
+            // the creature tick's movement/AI passes are seeded from PLAYERS
+            // (`module/src/creatures/tick/mod.rs`, `active_cell_creatures`), so a playerless second
+            // copy of Elwynn costs one table scan per tick, not a second simulation.
+            println!(
+                "   the instance pool needs its OWN map-36 spawn rows — it is the database that \
+                 spawns\n   a Deadmines run's population, and nothing reports an empty instance at \
+                 runtime.\n   As long again as the pass above; the duplicated map-0 rows are never \
+                 routed to."
+            );
+        }
+        runner
+            .run_streaming(&world_command(project, &client_data, database))
+            .map_err(|e| stage_failure(
+                &format!("importing the world into {database}"),
+                "The ETL prints a FAIL line for every assertion that did not meet its floor; read those \
+                 first — they say which family imported nothing. If it never got that far, check that \
+                 the SpacetimeDB node is running and this database is published (`lyracore dev up`).",
                 e,
-            )
-        })?;
+            ))?;
+
+        // The world ETL runs this too, but swallows its exit status inside a reporting pipeline. Run
+        // it again as a stage of its own: it is idempotent (a surgical per-id delete+reload), and it
+        // is the difference between "no class can train past its starter kit" failing loudly here and
+        // failing silently in play.
+        stage(
+            n + 1,
+            total,
+            &format!("importing the curated class spells into {database} (all nine classes)"),
+        );
+        runner
+            .run_streaming(&class_spells_command(project, &client_data, database))
+            .map_err(|e| {
+                stage_failure(
+                    &format!("importing class spells into {database}"),
+                    "This reads Spell.dbc out of the client archives and writes trainer offerings. A \
+                 \"requested N ids but matched M\" warning names ids your client build does not have.",
+                    e,
+                )
+            })?;
+    }
 
     println!();
     println!(
@@ -213,6 +258,19 @@ pub fn run(
     );
     println!("Nothing produced here is redistributable — see the notice this command opened with.");
     Ok(())
+}
+
+/// The databases `import` populates, in the order it populates them.
+///
+/// The default world shard always, and the instance pool whenever the fixture routes dungeons there
+/// (#108) — because that database is the one that spawns a dungeon run's population, and a realm
+/// where it was skipped reports NOTHING: the entry is routed correctly and the instance comes up
+/// empty. `lyracore-kalimdor` is deliberately absent: map 1 has no content in this dump slice.
+fn populated_databases(topology: Topology) -> Vec<&'static str> {
+    match topology {
+        Topology::Single => vec![ProjectLayout::DATABASE],
+        Topology::Sharded => vec![ProjectLayout::DATABASE, ProjectLayout::INSTANCE_POOL],
+    }
 }
 
 /// Print the notice and require an affirmative answer. `--accept` answers it in advance; nothing
@@ -385,7 +443,7 @@ pub fn inspect_client_data(path: &Path) -> Result<Vec<String>> {
     Ok(notes)
 }
 
-// ---- the four invocations -----------------------------------------------------------------
+// ---- the script invocations -----------------------------------------------------------------
 
 /// Every stage runs from the CHECKOUT ROOT: the scripts resolve `.import/`, `target/debug/…` and
 /// each other relative to it, and `lyracore` is usable from any subdirectory of a checkout.
@@ -401,24 +459,31 @@ fn pull_command(project: &ProjectLayout) -> CommandSpec {
 
 /// The world ETL reads its target database and client path out of the environment; the canonical
 /// map-0 box and every other default is the script's own and is deliberately not overridden here.
-fn world_command(project: &ProjectLayout, client_data: &Path) -> CommandSpec {
+///
+/// That includes `INCLUDE_MAPS=36`, which is why the instance-pool pass is this same command with
+/// `DB` changed and nothing else: the pool wants exactly the default map set, not a narrower one.
+fn world_command(project: &ProjectLayout, client_data: &Path, database: &str) -> CommandSpec {
     from_root(project, project.import_world_script())
-        .env("DB", ProjectLayout::DATABASE)
+        .env("DB", database)
         .env("DBC", client_data.to_string_lossy().to_string())
 }
 
 /// The class-spell import takes the client path as its one argument and the database from `DB` —
 /// pass BOTH explicitly, because its `DB` default is the fixture database and a silent default is
 /// how a shard once had its spells written to a different database entirely.
-fn class_spells_command(project: &ProjectLayout, client_data: &Path) -> CommandSpec {
+fn class_spells_command(
+    project: &ProjectLayout,
+    client_data: &Path,
+    database: &str,
+) -> CommandSpec {
     from_root(project, project.import_class_spells_script())
         .arg(client_data.to_string_lossy().to_string())
-        .env("DB", ProjectLayout::DATABASE)
+        .env("DB", database)
 }
 
-fn stage(number: u8, what: &str) {
+fn stage(number: u8, total: u8, what: &str) {
     println!();
-    println!("==> [{number}/4] {what}");
+    println!("==> [{number}/{total}] {what}");
 }
 
 /// Wrap a stage failure with what to do about it, keeping the child's own diagnosis.
@@ -534,7 +599,11 @@ mod tests {
                 client_data: Some(data.to_string_lossy().to_string()),
             };
             run(&project, &stack.runner(), &prompt, &options).unwrap();
-            assert_eq!(stack.calls().len(), 3, "{answer:?}");
+            assert_eq!(
+                stack.calls().len(),
+                expected_calls(Topology::Sharded),
+                "{answer:?}"
+            );
         }
     }
 
@@ -549,6 +618,103 @@ mod tests {
 
         run(&project, &stack.runner(), &prompt, &accepted(&data)).unwrap();
         assert!(prompt.asked().is_empty(), "--accept must not prompt");
+    }
+
+    fn set_topology(project: &ProjectLayout, topology: Topology) {
+        crate::state::RuntimeState {
+            topology: topology.as_str().to_string(),
+            ..Default::default()
+        }
+        .save(&project.state_file())
+        .unwrap();
+    }
+
+    /// How many child processes a complete run spawns: the pull, then an ETL + a class-spell pass
+    /// per populated database. Derived, so growing the fixture never turns these into a hunt for
+    /// hardcoded 3s. A checkout with no `state.json` reads back as the DEFAULT topology.
+    fn expected_calls(topology: Topology) -> usize {
+        1 + 2 * populated_databases(topology).len()
+    }
+
+    /// Every `(script name, DB=)` pair the run handed out, in order.
+    fn imported_databases(stack: &FakeStack) -> Vec<(String, String)> {
+        stack
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Stream(spec) | Call::Wait(spec) => {
+                    let script = spec.args().first()?.rsplit('/').next()?.to_string();
+                    Some((script, spec.env_value("DB")?.to_string()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sharded_fixture_imports_the_instance_pool_too_and_single_does_not() {
+        // THE reason this loop exists. The sharded fixture routes map 36 to `lyracore-instances`,
+        // and that database — not the world shard — is what spawns a dungeon run's population. Skip
+        // it and a Deadmines entry is routed perfectly and comes up EMPTY, with no error on either
+        // side and nothing at runtime that reports it. There is no loud failure to fall back on, so
+        // the import has to be the thing that covers it.
+        for (topology, want) in [
+            (Topology::Single, vec![ProjectLayout::DATABASE]),
+            (
+                Topology::Sharded,
+                vec![ProjectLayout::DATABASE, ProjectLayout::INSTANCE_POOL],
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let project = checkout(&tmp);
+            let data = client_data(&tmp);
+            set_topology(&project, topology);
+            let stack = FakeStack::new();
+
+            run(
+                &project,
+                &stack.runner(),
+                &ScriptedPrompt::new(&[]),
+                &accepted(&data),
+            )
+            .unwrap();
+
+            let world: Vec<String> = imported_databases(&stack)
+                .into_iter()
+                .filter(|(script, _)| script == "import-world.sh")
+                .map(|(_, db)| db)
+                .collect();
+            assert_eq!(world, want, "{topology:?}");
+            // ...and the class-spell pass follows each ETL onto the SAME database. Its `DB` default
+            // is the fixture database, so an unset one writes a shard's spells into `lyracore`
+            // silently — the failure that made passing it explicitly a rule in the first place.
+            let spells: Vec<String> = imported_databases(&stack)
+                .into_iter()
+                .filter(|(script, _)| script == "import-class-spells.sh")
+                .map(|(_, db)| db)
+                .collect();
+            assert_eq!(spells, want, "{topology:?}");
+        }
+    }
+
+    #[test]
+    fn the_instance_pool_etl_is_the_default_one_with_only_the_database_changed() {
+        // It rides `import-world.sh`'s own defaults — crucially `INCLUDE_MAPS=36`, which is what
+        // puts the Deadmines interior on the pool. A narrowed box or map set here would be this CLI
+        // second-guessing an ETL whose assertion floors are tuned to those defaults.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let default = world_command(&project, &data, ProjectLayout::DATABASE);
+        let pool = world_command(&project, &data, ProjectLayout::INSTANCE_POOL);
+        assert_eq!(pool.env_value("DBC"), default.env_value("DBC"));
+        assert_eq!(pool.env_value("DB"), Some(ProjectLayout::INSTANCE_POOL));
+        assert_eq!(
+            pool.render()
+                .replace(ProjectLayout::INSTANCE_POOL, ProjectLayout::DATABASE),
+            default.render(),
+            "the two runs must differ in DB and nothing else"
+        );
     }
 
     #[test]
@@ -605,31 +771,39 @@ mod tests {
     }
 
     #[test]
-    fn the_stages_run_in_order_pull_then_world_then_spells() {
-        let tmp = TempDir::new().unwrap();
-        let project = checkout(&tmp);
-        let data = client_data(&tmp);
-        let stack = FakeStack::new();
+    fn the_stages_run_in_order_pull_then_world_then_spells_per_database() {
+        // Per database and INTERLEAVED: world then spells, world then spells. Not all-ETLs-then-all-
+        // spells — a failure part way must leave one COMPLETE database rather than two half ones,
+        // and ETL-then-spells is the order these scripts have been run in against real dumps.
+        for topology in [Topology::Single, Topology::Sharded] {
+            let tmp = TempDir::new().unwrap();
+            let project = checkout(&tmp);
+            let data = client_data(&tmp);
+            set_topology(&project, topology);
+            let stack = FakeStack::new();
 
-        run(
-            &project,
-            &stack.runner(),
-            &ScriptedPrompt::new(&[]),
-            &accepted(&data),
-        )
-        .unwrap();
+            run(
+                &project,
+                &stack.runner(),
+                &ScriptedPrompt::new(&[]),
+                &accepted(&data),
+            )
+            .unwrap();
 
-        let calls = rendered(&stack);
-        assert_eq!(calls.len(), 3, "{calls:?}");
-        assert!(calls[0].contains("pull-classic-db.sh"), "{calls:?}");
-        assert!(calls[1].contains("import-world.sh"), "{calls:?}");
-        assert!(calls[2].contains("import-class-spells.sh"), "{calls:?}");
-        // Every one of them streams: these are long, chatty children whose progress is the point.
-        assert!(
-            stack.calls().iter().all(|c| matches!(c, Call::Stream(_))),
-            "{:?}",
-            stack.calls()
-        );
+            let calls = rendered(&stack);
+            assert_eq!(calls.len(), expected_calls(topology), "{calls:?}");
+            assert!(calls[0].contains("pull-classic-db.sh"), "{calls:?}");
+            for pair in calls[1..].chunks(2) {
+                assert!(pair[0].contains("import-world.sh"), "{calls:?}");
+                assert!(pair[1].contains("import-class-spells.sh"), "{calls:?}");
+            }
+            // Every one of them streams: these are long, chatty children whose progress is the point.
+            assert!(
+                stack.calls().iter().all(|c| matches!(c, Call::Stream(_))),
+                "{:?}",
+                stack.calls()
+            );
+        }
     }
 
     #[test]
@@ -779,7 +953,7 @@ mod tests {
         assert_eq!(asked.len(), 2, "{asked:?}");
         assert!(asked[0].contains("Proceed"), "{asked:?}");
         assert!(asked[1].contains("Path"), "{asked:?}");
-        assert_eq!(rendered(&stack).len(), 3);
+        assert_eq!(rendered(&stack).len(), expected_calls(Topology::Sharded));
     }
 
     #[test]
