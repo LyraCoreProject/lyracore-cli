@@ -1950,7 +1950,7 @@ mod tests {
         // those warns once parsed as 258 connections to a shard named "`". (b) The log appends
         // across runs, so a previous gateway's connect lines must not vouch for this one.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         dev.topology = Topology::Sharded;
         dev.verify_timeout = Duration::from_millis(50);
         std::fs::create_dir_all(&dev.project.logs_dir).unwrap();
@@ -1984,7 +1984,7 @@ mod tests {
         dev.gateway_log_start = stale_len;
         let error = dev.verify_topology().unwrap_err();
         assert!(
-            error.to_string().contains("1 of 4 databases"),
+            error.to_string().contains("1 of 3 databases"),
             "a previous run's connect lines must not pass a collapsed gateway: {error}"
         );
     }
