@@ -106,6 +106,12 @@ pub struct DevManager {
     /// rather than the constant itself so a test of the COLLAPSED case — the one that can only
     /// ever end at the deadline — does not spend ten real seconds proving it.
     verify_timeout: Duration,
+    /// Byte length of the gateway log at the moment THIS run spawned the gateway. The log is
+    /// opened append (`spawn_logged`), so it accumulates runs; verifying against the whole file
+    /// let a PREVIOUS run's connect lines pass a collapsed gateway, and a previous run's
+    /// diagnostics false-alarm a healthy one (core #541). Zero = no spawn this run (reuse paths):
+    /// verify reads the whole file, the pre-fix behavior, which is right for a log we didn't add to.
+    gateway_log_start: u64,
 }
 
 impl DevManager {
@@ -119,6 +125,7 @@ impl DevManager {
             bind,
             topology,
             verify_timeout: TOPOLOGY_VERIFY_TIMEOUT,
+            gateway_log_start: 0,
         })
     }
 
@@ -506,11 +513,20 @@ impl DevManager {
         // Re-read until every wanted database has appeared, or the deadline. A COMPLETE realm
         // therefore costs one read; only a collapsed one waits, which is the right way round.
         let deadline = Instant::now() + self.verify_timeout;
-        let mut text = std::fs::read_to_string(&log).unwrap_or_default();
+        // Only THIS run's lines: slice off everything written before our spawn (append-mode log,
+        // core #541). A shrunken file (rotated/removed underneath us) falls back to the start.
+        let this_run = |full: String| -> String {
+            let at = usize::try_from(self.gateway_log_start).unwrap_or(0);
+            match full.get(at..) {
+                Some(tail) => tail.to_string(),
+                None => full,
+            }
+        };
+        let mut text = this_run(std::fs::read_to_string(&log).unwrap_or_default());
         while connected_shards(&text).len() < wanted.len() && Instant::now() < deadline {
             sleep(Duration::from_millis(200));
             if let Ok(reread) = std::fs::read_to_string(&log) {
-                text = reread;
+                text = this_run(reread);
             }
         }
 
@@ -604,6 +620,11 @@ impl DevManager {
             ProjectLayout::world_bind(&self.bind),
             self.topology.databases().len()
         );
+        // The log appends across runs; remember where THIS run starts so verify_topology never
+        // reads a previous gateway's lines (core #541).
+        self.gateway_log_start = std::fs::metadata(self.project.log_file(Component::Gateway))
+            .map(|m| m.len())
+            .unwrap_or(0);
         let command = gateway_command(&self.project, &self.bind, credential.token(), self.topology);
         let record = self.spawn_recorded(Component::Gateway, &command, runner, inspector)?;
         self.state.set(Component::Gateway, Some(record));
@@ -1014,11 +1035,27 @@ fn describe_command(database: &str) -> CommandSpec {
 /// The databases a gateway log says the coordinator actually connected to, in the order it
 /// connected them.
 fn connected_shards(log: &str) -> Vec<String> {
-    log.lines()
+    let mut seen = Vec::new();
+    for name in log
+        .lines()
         .filter_map(|line| line.split_once(CONNECTED_MARKER))
         .filter_map(|(_, tail)| tail.split_whitespace().next())
-        .map(str::to_string)
-        .collect()
+        // The marker phrase also appears QUOTED inside the gateway's own diagnostics (the
+        // motion-relay warn cites "`coordinator connected to shard`" as advice) — there the next
+        // token is a lone backtick, and 43 minutes of a degraded gateway once read as "258 of 4
+        // databases". Only a plausible database name counts as a connection line.
+        .filter(|t| {
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+    {
+        // Dedup, order-preserving: a reconnecting coordinator logs the line again.
+        if !seen.iter().any(|s| s == name) {
+            seen.push(name.to_string());
+        }
+    }
+    seen
 }
 
 /// A list of database names for a human: `a, b and c`, or `none` for an empty one — which is a real
@@ -2175,6 +2212,52 @@ mod tests {
         assert!(
             message.contains("dev down"),
             "the gateway is still running, so say how to stop it: {message}"
+        );
+    }
+
+    #[test]
+    fn verify_reads_only_real_connect_lines_and_only_this_runs_log() {
+        // core #541, both halves. (a) The gateway's own diagnostics QUOTE the marker phrase — the
+        // motion-relay warn cites "`coordinator connected to shard`" as advice — and 43 minutes of
+        // those warns once parsed as 258 connections to a shard named "`". (b) The log appends
+        // across runs, so a previous gateway's connect lines must not vouch for this one.
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        dev.topology = Topology::Sharded;
+        dev.verify_timeout = Duration::from_millis(50);
+        std::fs::create_dir_all(&dev.project.logs_dir).unwrap();
+
+        // (a) A healthy realm whose log also carries the quoting diagnostics, twice, plus a
+        // duplicated connect line from a coordinator reconnect: still exactly the wanted set.
+        let warn = "WARN MOTION RELAY LOOKS DEAD: check the log for a `shared AOI dispatch` \
+                    panic line, and that `coordinator connected to shard` was printed for every \
+                    database. Restart the gateway to recover play.\n";
+        let healthy: String = Topology::Sharded
+            .databases()
+            .iter()
+            .map(|db| format!("coordinator connected to shard {db}\n"))
+            .chain([warn.to_string(), warn.to_string()])
+            .chain(["coordinator connected to shard lyracore\n".to_string()])
+            .collect();
+        std::fs::write(dev.project.log_file(Component::Gateway), &healthy).unwrap();
+        assert!(
+            dev.verify_topology().is_ok(),
+            "quoted marker text and duplicate connects must not read as extra databases"
+        );
+
+        // (b) A previous run connected all four; this run's gateway only reached the default
+        // shard. The stale lines sit before gateway_log_start and must not vouch for it.
+        let stale_len = std::fs::metadata(dev.project.log_file(Component::Gateway))
+            .unwrap()
+            .len();
+        let mut appended = healthy.clone();
+        appended.push_str("coordinator connected to shard lyracore\n");
+        std::fs::write(dev.project.log_file(Component::Gateway), &appended).unwrap();
+        dev.gateway_log_start = stale_len;
+        let error = dev.verify_topology().unwrap_err();
+        assert!(
+            error.to_string().contains("1 of 4 databases"),
+            "a previous run's connect lines must not pass a collapsed gateway: {error}"
         );
     }
 
