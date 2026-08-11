@@ -32,6 +32,11 @@ use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long `dev down` waits for a signalled process to exit and release its port. SpacetimeDB
+/// answers its listener during graceful shutdown; returning before the port closes hands the race
+/// to a scripted `dev down && dev up` (core #542).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How long [`DevManager::verify_topology`] waits for the coordinator lines to appear in the
 /// gateway log.
 ///
@@ -826,6 +831,27 @@ impl DevManager {
                 StopAction::Stop(pid) => {
                     println!("· stopping {} (PID {pid})...", component.as_str());
                     runner.terminate(pid)?;
+                    // Wait for the process to actually exit AND release its port. `terminate` only
+                    // delivers SIGTERM; SpacetimeDB keeps its listener answering while it shuts
+                    // down, so a scripted `dev down && dev up` used to probe :3000 mid-shutdown,
+                    // classify the dying node External, "reuse" it — and publish against a corpse
+                    // (core #542). "Stopped" must mean gone, not signalled.
+                    let host = component.health_host(&self.bind);
+                    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+                    while (inspector.identity(pid).is_some()
+                        || inspector.serving(&host, component.health_port()))
+                        && Instant::now() < deadline
+                    {
+                        sleep(Duration::from_millis(100));
+                    }
+                    if inspector.identity(pid).is_some() {
+                        println!(
+                            "  {} (PID {pid}) is taking longer than {}s to exit — it was \
+                             signalled and will finish on its own; wait for it before `dev up`.",
+                            component.as_str(),
+                            SHUTDOWN_TIMEOUT.as_secs()
+                        );
+                    }
                     self.state.set(component, None);
                 }
                 StopAction::Refuse {
