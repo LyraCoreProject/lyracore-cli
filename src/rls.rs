@@ -245,11 +245,16 @@ pub fn find_filters(module_dir: &Path) -> (Vec<FilterSql>, Vec<String>) {
         }
     }
 
-    if filters.is_empty() && errors.is_empty() {
-        errors.push(format!(
-            "{}: no #[client_visibility_filter] declarations found; parser or source layout drifted",
-            module_dir.display()
-        ));
+    // ZERO is the expected state since #483: no client-identity subscription exists to evaluate a
+    // filter, so every rule is dead security surface. A filter REAPPEARING is the drift worth
+    // flagging — it is still validated below (typos still fail), but call it out loudly.
+    if !filters.is_empty() {
+        eprintln!(
+            "NOTE: {} client_visibility_filter declaration(s) found — the client\n      \
+             subscription plane was deleted (#483), so these rules never evaluate. If this\n      \
+             is deliberate, re-litigate the visibility model; otherwise remove them.",
+            filters.len()
+        );
     }
     (filters, errors)
 }
@@ -848,18 +853,15 @@ mod tests {
     }
 
     #[test]
-    fn a_module_with_no_filters_at_all_is_an_error_not_a_pass() {
-        // The parser drifting away from the source layout must never read as "nothing to check".
+    fn a_module_with_no_filters_at_all_is_a_pass_since_483() {
+        // #483 deleted every RLS rule alongside the client subscription plane — zero declarations
+        // is the EXPECTED state, not parser drift. (A filter reappearing is what gets flagged,
+        // via the loud NOTE in find_filters; it is still validated so typos still fail.)
         let tmp = TempDir::new().unwrap();
         let (bindings, module) = fixture(tmp.path(), "SELECT * FROM game_character", "#[table]");
         let (count, errors) = validate(&bindings, &module);
         assert_eq!(count, 0);
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("parser or source layout drifted")),
-            "{errors:?}"
-        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
