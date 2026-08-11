@@ -34,9 +34,14 @@
 //! curated overlay whose spell-id lists are core-repo data). `import-manifest.sh` is sourced, not
 //! run: it is a data file of floors the core repo tunes per dump, read fresh on every import so a
 //! retuned floor never needs a CLI release.
+//!
+//! HOW MANY STAGES: the pull, the client, the importer build, then the modes + the re-arm + the
+//! floors PER POPULATED DATABASE — six on `dev up --single`, nine on the sharded fixture, which
+//! since #108 routes dungeons to `lyracore-instances` and therefore has to populate it. See
+//! [`populated_databases`].
 
 use crate::proc::{CommandSpec, ProcessRunner};
-use crate::project::ProjectLayout;
+use crate::project::{ProjectLayout, Topology};
 use crate::state::RuntimeState;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -166,8 +171,6 @@ const CASTER_SPELL_IDS: &str = "53,133,143,1776,145,744,745,3149,3150,3238,3248,
                                 15572,15652,15657,15661,16144,16244,20712,20714,20720,20746,\
                                 20793,20808,23114,23260,23504,28265";
 
-const TOTAL_STAGES: u8 = 6;
-
 // =============================================================================================
 //  `import world`
 // =============================================================================================
@@ -215,9 +218,18 @@ pub fn run_world(
         ProjectLayout::IMPORT_MANIFEST_SCRIPT
     );
 
+    // Which databases this import POPULATES, and therefore how many stages there are. Not
+    // `world_shards()`: `lyracore-kalimdor` is in that list and is deliberately not here, because
+    // map 1 has no content in the dump slice this ETL imports — importing it would be a long run
+    // that lands nothing.
+    let databases = populated_databases(RuntimeState::load(&project.state_file())?.topology());
+    // Three fixed stages, then the modes + the re-arm + the floors per database.
+    let total = 3 + 3 * databases.len() as u8;
+
     // ---- stage 1: the world database dump -----------------------------------------------------
     stage(
         1,
+        total,
         "pulling cmangos/classic-db (pinned commit, checksum-verified)",
     );
     runner.run_streaming(&pull_command(project)).map_err(|e| {
@@ -244,12 +256,12 @@ pub fn run_world(
     }
 
     // ---- stage 2: the client ------------------------------------------------------------------
-    stage(2, "locating your 1.12.1 client data");
+    stage(2, total, "locating your 1.12.1 client data");
     let client_data = resolve_client_data(project, prompt, options.client_data.as_deref())?;
     println!("   client data: {}", client_data.display());
 
     // ---- stage 3: the importer binary ---------------------------------------------------------
-    stage(3, "building the importer (cargo build --bin lyracore-importer)");
+    stage(3, total, "building the importer (cargo build --bin lyracore-importer)");
     runner
         .run_and_wait(&build_importer_command(project))
         .map_err(|e| {
@@ -261,42 +273,81 @@ pub fn run_world(
             )
         })?;
 
-    // ---- stage 4: the importer's modes, in the bash flow's order ------------------------------
-    stage(
-        4,
-        "importing the world (creatures, quests, loot, vendors, terrain, navigation, spells)",
-    );
-    println!("   this is the long one — tens of minutes; each mode prints its own progress.");
-    for (what, advice, command) in world_etl_commands(project, &client_data) {
-        println!();
-        println!("   -> {what}");
-        runner
-            .run_streaming(&command)
-            .map_err(|e| stage_failure(what, advice, e))?;
-    }
+    // ---- the modes, the re-arm and the floors, PER POPULATED DATABASE, INTERLEAVED ------------
+    // Interleaved rather than all-modes-then-all-floors so a failure part way leaves one COMPLETE
+    // database rather than two half ones — and because modes-then-floors is the order the bash
+    // flow was run in, per database, against real dumps.
+    for (i, database) in databases.iter().enumerate() {
+        let n = 4 + 3 * i as u8;
 
-    // ---- stage 5: re-arm the realm ------------------------------------------------------------
-    // The bash flow swallowed these two calls' exit status (`>/dev/null 2>&1`, no guard). The port
-    // checks them deliberately: an un-rearmed creature tick or an unarmed gather pool is invisible
-    // to every floor below and only surfaces in play, which is exactly the silent-success shape
-    // this pipeline exists to refuse.
-    stage(5, "re-arming the realm (creature tick, fixtures, gather pools)");
-    for reducer in ["debug_repair_after_publish", "arm_all_pools"] {
-        runner
-            .run_and_wait(&call_command(project, reducer))
-            .map_err(|e| {
-                stage_failure(
-                    reducer,
-                    "Both reducers are operator-gated — `lyracore dev up` publishes the module \
-                     and claims the operator; is the stack up (`lyracore dev status`)?",
-                    e,
-                )
-            })?;
-    }
+        // ---- the importer's modes, in the bash flow's order ------------------------------------
+        stage(
+            n,
+            total,
+            &format!(
+                "importing the world into {database} (creatures, quests, loot, vendors, terrain, \
+                 navigation, spells)"
+            ),
+        );
+        if i == 0 {
+            println!(
+                "   this is the long one — tens of minutes; each mode prints its own progress."
+            );
+        } else {
+            // Why a second full run and not a map-36 slice: the mode list has no map-36-only
+            // shape, and narrowing one means teaching the terrain/nav assertion floors AND
+            // `db_never_imported`'s fresh-shard signal to stand down — ways to pass an import
+            // that imported nothing, to save wall time on a command that already asks for
+            // consent. The duplicated map-0 rows are inert: routing never reads them, and the
+            // creature tick's movement/AI passes are seeded from PLAYERS
+            // (`module/src/creatures/tick/mod.rs`, `active_cell_creatures`), so a playerless
+            // second copy of Elwynn costs one table scan per tick, not a second simulation.
+            println!(
+                "   the instance pool needs its OWN map-36 spawn rows — it is the database that \
+                 spawns\n   a Deadmines run's population, and nothing reports an empty instance at \
+                 runtime.\n   As long again as the pass above; the duplicated map-0 rows are never \
+                 routed to."
+            );
+        }
+        for (what, advice, command) in world_etl_commands(project, &client_data, database) {
+            println!();
+            println!("   -> {what}");
+            runner
+                .run_streaming(&command)
+                .map_err(|e| stage_failure(what, advice, e))?;
+        }
 
-    // ---- stage 6: the FLOOR_* assertions ------------------------------------------------------
-    stage(6, "asserting the import floors (the FLOOR_* manifest)");
-    assert_floors(project, runner, &floors)?;
+        // ---- re-arm this database --------------------------------------------------------------
+        // The bash flow swallowed these two calls' exit status (`>/dev/null 2>&1`, no guard). The
+        // port checks them deliberately: an un-rearmed creature tick or an unarmed gather pool is
+        // invisible to every floor below and only surfaces in play, which is exactly the
+        // silent-success shape this pipeline exists to refuse.
+        stage(
+            n + 1,
+            total,
+            &format!("re-arming {database} (creature tick, fixtures, gather pools)"),
+        );
+        for reducer in ["debug_repair_after_publish", "arm_all_pools"] {
+            runner
+                .run_and_wait(&call_command(project, database, reducer))
+                .map_err(|e| {
+                    stage_failure(
+                        reducer,
+                        "Both reducers are operator-gated — `lyracore dev up` publishes the \
+                         module and claims the operator; is the stack up (`lyracore dev status`)?",
+                        e,
+                    )
+                })?;
+        }
+
+        // ---- the FLOOR_* assertions ------------------------------------------------------------
+        stage(
+            n + 2,
+            total,
+            &format!("asserting the import floors on {database} (the FLOOR_* manifest)"),
+        );
+        assert_floors(project, runner, database, &floors)?;
+    }
 
     println!();
     println!(
@@ -304,6 +355,19 @@ pub fn run_world(
     );
     println!("Nothing produced here is redistributable — see the notice this command opened with.");
     Ok(())
+}
+
+/// The databases `import` populates, in the order it populates them.
+///
+/// The default world shard always, and the instance pool whenever the fixture routes dungeons there
+/// (#108) — because that database is the one that spawns a dungeon run's population, and a realm
+/// where it was skipped reports NOTHING: the entry is routed correctly and the instance comes up
+/// empty. `lyracore-kalimdor` is deliberately absent: map 1 has no content in this dump slice.
+fn populated_databases(topology: Topology) -> Vec<&'static str> {
+    match topology {
+        Topology::Single => vec![ProjectLayout::DATABASE],
+        Topology::Sharded => vec![ProjectLayout::DATABASE, ProjectLayout::INSTANCE_POOL],
+    }
 }
 
 /// Print the notice and require an affirmative answer. `--accept` answers it in advance; nothing
@@ -599,10 +663,10 @@ fn build_importer_command(project: &ProjectLayout) -> CommandSpec {
 /// A base importer invocation: the pinned binary, the target database named EXPLICITLY. The
 /// importer's own `--db` default is the fixture database too, but a silent default is how a shard
 /// once had rows written to a different database entirely — so nothing here is left to one.
-fn importer_command(project: &ProjectLayout) -> CommandSpec {
+fn importer_command(project: &ProjectLayout, database: &str) -> CommandSpec {
     CommandSpec::new(project.importer_bin().to_string_lossy().to_string())
         .arg("--db")
-        .arg(ProjectLayout::DATABASE)
+        .arg(database)
         .cwd(project.root.clone())
 }
 
@@ -617,6 +681,7 @@ fn importer_command(project: &ProjectLayout) -> CommandSpec {
 fn world_etl_commands(
     project: &ProjectLayout,
     client_data: &Path,
+    database: &str,
 ) -> Vec<(&'static str, &'static str, CommandSpec)> {
     let data = client_data.to_string_lossy().to_string();
     vec![
@@ -626,7 +691,7 @@ fn world_etl_commands(
              loaded; re-run after fixing the cause. `no spawns matched the filter` means the \
              canonical box does not fit your dump: derive yours with --print-extents and use the \
              by-hand path, importer/scripts/import-world.sh.",
-            importer_command(project)
+            importer_command(project, database)
                 .arg("--dump")
                 .arg(DUMP_PATH)
                 .arg("--dbc")
@@ -645,7 +710,7 @@ fn world_etl_commands(
             "terrain heightmap (ground-z)",
             "Reads terrain.MPQ. A self-check failure is an axis/interpolation regression, not a \
              missing file — do not re-run past it.",
-            importer_command(project)
+            importer_command(project, database)
                 .arg("--terrain")
                 .arg(&data)
                 .arg("--map")
@@ -658,7 +723,7 @@ fn world_etl_commands(
             "nav grid (walkability / line of sight)",
             "Reads model.MPQ/wmo.MPQ. A handful of M2 parse warnings is expected (decorative \
              props); a calibration failure means transform drift and must not be re-run past.",
-            importer_command(project)
+            importer_command(project, database)
                 .arg("--nav")
                 .arg(&data)
                 .arg("--map")
@@ -671,7 +736,7 @@ fn world_etl_commands(
             "character-creation + faction DBC tables",
             "Reads dbc.MPQ. Without this pass non-Warrior classes inherit the Warrior loadout — \
              it must not be skipped.",
-            importer_command(project)
+            importer_command(project, database)
                 .arg("--dbc")
                 .arg(&data)
                 .arg("--apply"),
@@ -680,7 +745,7 @@ fn world_etl_commands(
             "real talent trees (TalentTab.dbc + Talent.dbc)",
             "Reads dbc.MPQ. Without this the demo talent ids do not match what the 5875 client \
              sends, and talent clicks silently no-op.",
-            importer_command(project)
+            importer_command(project, database)
                 .arg("--dbc")
                 .arg(&data)
                 .arg("--talents")
@@ -690,7 +755,7 @@ fn world_etl_commands(
             "full Spell.dbc import (every non-zero row)",
             "Reads dbc.MPQ. The long tail lands as scripted no-ops by design; a parse failure \
              here is a client-build problem, not that.",
-            importer_command(project)
+            importer_command(project, database)
                 .arg("--dbc")
                 .arg(&data)
                 .arg("--spells")
@@ -700,13 +765,13 @@ fn world_etl_commands(
             "curated class spells (all nine classes)",
             "This reads Spell.dbc out of the client archives and writes trainer offerings. A \
              \"requested N ids but matched M\" warning names ids your client build does not have.",
-            class_spells_command(project, client_data),
+            class_spells_command(project, client_data, database),
         ),
         (
             "caster-mob spells (the Elwynn/Westfall --only allowlist)",
             "Additive --only import. A \"requested N ids but matched M\" warning is a wrong or \
              typo'd id in the allowlist — correct the id rather than shipping a mute caster.",
-            importer_command(project)
+            importer_command(project, database)
                 .arg("--dbc")
                 .arg(&data)
                 .arg("--spells")
@@ -720,32 +785,36 @@ fn world_etl_commands(
 /// The class-spell import takes the client path as its one argument and the database from `DB` —
 /// pass BOTH explicitly, because its `DB` default is the fixture database and a silent default is
 /// how a shard once had its spells written to a different database entirely.
-fn class_spells_command(project: &ProjectLayout, client_data: &Path) -> CommandSpec {
+fn class_spells_command(
+    project: &ProjectLayout,
+    client_data: &Path,
+    database: &str,
+) -> CommandSpec {
     from_root(project, project.import_class_spells_script())
         .arg(client_data.to_string_lossy().to_string())
-        .env("DB", ProjectLayout::DATABASE)
+        .env("DB", database)
 }
 
 /// `spacetime call`, pinned to the loopback node — bare `spacetime call` inherits the CLI's
 /// AMBIENT default server, which on a fresh machine is maincloud, not the node `dev up` started
 /// (the #440 class of failure the bash flow's `SPACETIME_SERVER` chokepoint exists for).
-fn call_command(project: &ProjectLayout, reducer: &str) -> CommandSpec {
+fn call_command(project: &ProjectLayout, database: &str, reducer: &str) -> CommandSpec {
     CommandSpec::new("spacetime")
         .arg("call")
         .arg("--server")
         .arg(ProjectLayout::stdb_uri())
-        .arg(ProjectLayout::DATABASE)
+        .arg(database)
         .arg(reducer)
         .cwd(project.root.clone())
 }
 
 /// `spacetime sql`, pinned to the loopback node for the same #440 reason as [`call_command`].
-fn sql_command(project: &ProjectLayout, query: &str) -> CommandSpec {
+fn sql_command(project: &ProjectLayout, database: &str, query: &str) -> CommandSpec {
     CommandSpec::new("spacetime")
         .arg("sql")
         .arg("--server")
         .arg(ProjectLayout::stdb_uri())
-        .arg(ProjectLayout::DATABASE)
+        .arg(database)
         .arg(query)
         .cwd(project.root.clone())
 }
@@ -764,9 +833,9 @@ fn vmap_command(project: &ProjectLayout, shard: &str, client_data: &Path) -> Com
         .cwd(project.root.clone())
 }
 
-fn stage(number: u8, what: &str) {
+fn stage(number: u8, total: u8, what: &str) {
     println!();
-    println!("==> [{number}/{TOTAL_STAGES}] {what}");
+    println!("==> [{number}/{total}] {what}");
 }
 
 /// Wrap a stage failure with what to do about it, keeping the child's own diagnosis.
@@ -997,6 +1066,7 @@ fn table_cells(output: &str) -> Vec<Vec<String>> {
 struct Assertions<'a> {
     project: &'a ProjectLayout,
     runner: &'a dyn ProcessRunner,
+    database: &'a str,
     floors: &'a Floors,
     failed: usize,
 }
@@ -1007,14 +1077,14 @@ impl Assertions<'_> {
     /// FAILs — so the first failure aborts the whole pass instead of reading as a count of 0.
     fn sql(&self, query: &str) -> Result<String> {
         self.runner
-            .run_and_wait(&sql_command(self.project, query))
+            .run_and_wait(&sql_command(self.project, self.database, query))
             .map_err(|e| {
                 Error::Process(format!(
                     "a verification query against '{db}' failed — a failed query is NOT zero \
                      rows, so no further assertion is reported. Check the node is up and '{db}' \
                      is published (`lyracore dev status`), then re-run `lyracore import world`.\n  \
                      ({e})",
-                    db = ProjectLayout::DATABASE
+                    db = self.database
                 ))
             })
     }
@@ -1133,17 +1203,20 @@ fn audit_service(
 /// against cannot be expressed here) and every MAP/BOX/CENTER knob. The service-coverage audit is
 /// PORTED, natively — the bash needed python3 for it and skipped it when absent; this pass has no
 /// skip path.
-fn assert_floors(project: &ProjectLayout, runner: &dyn ProcessRunner, floors: &Floors) -> Result<()> {
+fn assert_floors(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    database: &str,
+    floors: &Floors,
+) -> Result<()> {
     let mut a = Assertions {
         project,
         runner,
+        database,
         floors,
         failed: 0,
     };
-    println!(
-        "   assertions (map {CANONICAL_MAP} → {}):",
-        ProjectLayout::DATABASE
-    );
+    println!("   assertions (map {CANONICAL_MAP} → {database}):");
 
     a.chk_count(
         "FLOOR_CLASS_TRAINERS",
@@ -1701,6 +1774,115 @@ mod tests {
         assert!(prompt.asked().is_empty(), "--accept must not prompt");
     }
 
+    fn set_topology(project: &ProjectLayout, topology: Topology) {
+        crate::state::RuntimeState {
+            topology: topology.as_str().to_string(),
+            ..Default::default()
+        }
+        .save(&project.state_file())
+        .unwrap();
+    }
+
+    /// The `--db` value of every world-slice (`--dump`) importer invocation, in order.
+    fn dump_databases(stack: &FakeStack) -> Vec<String> {
+        stack
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Stream(spec) | Call::Wait(spec) => {
+                    let args = spec.args();
+                    args.iter().any(|a| a == "--dump").then(|| args[1].clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `(script name, DB=)` pair the run handed out, in order.
+    fn imported_databases(stack: &FakeStack) -> Vec<(String, String)> {
+        stack
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Stream(spec) | Call::Wait(spec) => {
+                    let script = spec.args().first()?.rsplit('/').next()?.to_string();
+                    Some((script, spec.env_value("DB")?.to_string()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sharded_fixture_imports_the_instance_pool_too_and_single_does_not() {
+        // THE reason this loop exists. The sharded fixture routes map 36 to `lyracore-instances`,
+        // and that database — not the world shard — is what spawns a dungeon run's population. Skip
+        // it and a Deadmines entry is routed perfectly and comes up EMPTY, with no error on either
+        // side and nothing at runtime that reports it. There is no loud failure to fall back on, so
+        // the import has to be the thing that covers it.
+        for (topology, want) in [
+            (Topology::Single, vec![ProjectLayout::DATABASE]),
+            (
+                Topology::Sharded,
+                vec![ProjectLayout::DATABASE, ProjectLayout::INSTANCE_POOL],
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let project = checkout(&tmp);
+            let data = client_data(&tmp);
+            set_topology(&project, topology);
+            let stack = healthy();
+
+            run_world(
+                &project,
+                &stack.runner(),
+                &ScriptedPrompt::new(&[]),
+                &accepted(&data),
+            )
+            .unwrap();
+
+            let world = dump_databases(&stack);
+            assert_eq!(world, want, "{topology:?}");
+            // ...and the class-spell pass follows each ETL onto the SAME database. Its `DB` default
+            // is the fixture database, so an unset one writes a shard's spells into `lyracore`
+            // silently — the failure that made passing it explicitly a rule in the first place.
+            let spells: Vec<String> = imported_databases(&stack)
+                .into_iter()
+                .filter(|(script, _)| script == "import-class-spells.sh")
+                .map(|(_, db)| db)
+                .collect();
+            assert_eq!(spells, want, "{topology:?}");
+        }
+    }
+
+    #[test]
+    fn the_instance_pool_modes_are_the_default_ones_with_only_the_database_changed() {
+        // The pool rides the same canonical mode list — crucially `--include-map 36`, which is
+        // what puts the Deadmines interior on the pool. A narrowed box or map set here would be
+        // this CLI second-guessing modes whose assertion floors are tuned to those defaults.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let default = world_etl_commands(&project, &data, ProjectLayout::DATABASE);
+        let pool = world_etl_commands(&project, &data, ProjectLayout::INSTANCE_POOL);
+        assert_eq!(default.len(), pool.len());
+        for ((_, _, d), (_, _, p)) in default.iter().zip(pool.iter()) {
+            assert_eq!(
+                p.render()
+                    .replace(ProjectLayout::INSTANCE_POOL, ProjectLayout::DATABASE),
+                d.render(),
+                "the two passes must differ in the database and nothing else"
+            );
+        }
+        // The class-spell overlay's database rides env, not argv — assert it separately.
+        let spells = pool
+            .iter()
+            .find(|(what, _, _)| what.contains("class spells"))
+            .map(|(_, _, c)| c)
+            .expect("the pool's mode list lost the class-spell overlay");
+        assert_eq!(spells.env_value("DB"), Some(ProjectLayout::INSTANCE_POOL));
+    }
+
     #[test]
     fn the_notice_names_the_source_its_licence_and_who_supplies_the_client() {
         for needle in [
@@ -1755,6 +1937,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let data = client_data(&tmp);
+        // One database, so the expected list below stays exact — the sharded default would run
+        // the same modes a second time against the instance pool.
+        set_topology(&project, Topology::Single);
         let stack = healthy();
 
         run_world(
@@ -1841,6 +2026,44 @@ mod tests {
     }
 
     #[test]
+    fn the_databases_import_one_at_a_time_each_completed_before_the_next() {
+        // Per database and INTERLEAVED: modes, re-arm, floors — then the next database. Not
+        // all-modes-then-all-floors: a failure part way must leave one COMPLETE database rather
+        // than two half ones, the order the bash flow was run in per database.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        set_topology(&project, Topology::Sharded);
+        let stack = healthy();
+
+        run_world(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap();
+
+        let calls = rendered(&stack);
+        // The default shard's floors assert BEFORE the instance pool's first mode runs. The
+        // trailing space matters: "lyracore " must not match "lyracore-instances".
+        let sql_prefix = format!(
+            "spacetime sql --server {} {} ",
+            ProjectLayout::stdb_uri(),
+            ProjectLayout::DATABASE
+        );
+        let world_floors = calls
+            .iter()
+            .position(|c| c.starts_with(&sql_prefix))
+            .expect("the default shard's floors never ran");
+        let pool_first_mode = calls
+            .iter()
+            .position(|c| c.contains("--dump") && c.contains(ProjectLayout::INSTANCE_POOL))
+            .expect("the instance pool's ETL never ran");
+        assert!(world_floors < pool_first_mode, "{calls:?}");
+    }
+
+    #[test]
     fn import_world_never_runs_the_retired_bash_orchestrator() {
         // The headline of #104: the ORCHESTRATION is native now. import-world.sh stays in the
         // checkout as the by-hand advanced path, and this flow must not touch it.
@@ -1918,6 +2141,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let data = client_data(&tmp);
+        // One database: the per-call assertions below name the fixture database explicitly; the
+        // per-database delivery is `a_sharded_fixture_imports_the_instance_pool_too...`'s job.
+        set_topology(&project, Topology::Single);
         let stack = healthy();
 
         run_world(

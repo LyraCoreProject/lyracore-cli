@@ -1,7 +1,8 @@
 //! The local realm lifecycle: `dev up | status | logs | smoke | down`.
 //!
-//! Scope is the seeded loopback fixture, which since #11 is **sharded by default**: three databases
-//! — the default world shard, the map-1 shard, and realm-core (`Topology::Sharded`). `dev up
+//! Scope is the seeded loopback fixture, which since #11 is **sharded by default**: four databases
+//! — the default world shard, the map-1 shard, the instance pool (#108) and realm-core
+//! (`Topology::Sharded`), one per production tier in core `docs/architecture.md` §3.1. `dev up
 //! --single` is the pre-#11 one-database fixture, unchanged down to the hard unset of every
 //! topology variable.
 //!
@@ -1785,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gateway_runs_against_exactly_the_three_databases_the_fixture_published() {
+    fn the_gateway_runs_against_exactly_the_databases_the_fixture_published() {
         // The sharded half of the same contract: every database the environment names is one this
         // CLI publishes and claims, and the default world shard is `LYRACORE_DATABASE`.
         let tmp = TempDir::new().unwrap();
@@ -1801,7 +1802,7 @@ mod tests {
         );
         assert_eq!(
             cmd.env_value("LYRACORE_SHARD_MAP"),
-            Some("1:*=lyracore-kalimdor")
+            Some("1:*=lyracore-kalimdor, 36:*=lyracore-instances")
         );
         assert_eq!(cmd.env_value("LYRACORE_REALM_CORE"), Some("lyracore-realm"));
         // The two this mode does not set are still unset, in this mode too: the env var wins over
@@ -1847,8 +1848,13 @@ mod tests {
             .collect();
         assert_eq!(
             published,
-            vec!["lyracore", "lyracore-kalimdor", "lyracore-realm"],
-            "every database, and the default one first"
+            vec![
+                "lyracore",
+                "lyracore-kalimdor",
+                "lyracore-instances",
+                "lyracore-realm"
+            ],
+            "every database, the default one first and realm-core last"
         );
 
         // Claimed once each, with the SAME identity: a shard claimed by nobody refuses the
@@ -1900,7 +1906,7 @@ mod tests {
         // thing that knows.
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
-        // Fail only the SECOND publish: one lands, one breaks, one is never attempted.
+        // Fail only the SECOND publish: one lands, one breaks, the rest are never attempted.
         let stack = FakeStack::new().fail_on(
             &format!("--yes {}", ProjectLayout::KALIMDOR_SHARD),
             "migration rejected: Removed table game_creature",
@@ -1910,15 +1916,20 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("migration rejected"), "{message}");
         assert!(message.contains("Published so far: lyracore."), "{message}");
-        assert!(message.contains("Still to do: lyracore-realm"), "{message}");
         assert!(
-            !stack
-                .rendered()
-                .iter()
-                .any(|r| r.contains("--yes lyracore-realm")),
-            "the run must stop at the failure: {:?}",
-            stack.rendered()
+            message.contains("Still to do: lyracore-instances and lyracore-realm"),
+            "every database that is now stale, not just the next one: {message}"
         );
+        for untried in [ProjectLayout::INSTANCE_POOL, ProjectLayout::REALM_CORE] {
+            assert!(
+                !stack
+                    .rendered()
+                    .iter()
+                    .any(|r| r.contains(&format!("--yes {untried}"))),
+                "the run must stop at the failure: {:?}",
+                stack.rendered()
+            );
+        }
     }
 
     #[test]
@@ -1958,9 +1969,9 @@ mod tests {
 
         let error = dev.verify_topology().unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("1 of 3 databases"), "{message}");
+        assert!(message.contains("1 of 4 databases"), "{message}");
         assert!(
-            message.contains("lyracore-kalimdor and lyracore-realm"),
+            message.contains("lyracore-kalimdor, lyracore-instances and lyracore-realm"),
             "the refusal must name exactly which ones are missing: {message}"
         );
         assert!(
@@ -1999,8 +2010,8 @@ mod tests {
             "quoted marker text and duplicate connects must not read as extra databases"
         );
 
-        // (b) A previous run connected all four; this run's gateway only reached the default
-        // shard. The stale lines sit before gateway_log_start and must not vouch for it.
+        // (b) A previous run connected every database; this run's gateway only reached the
+        // default shard. The stale lines sit before gateway_log_start and must not vouch for it.
         let stale_len = std::fs::metadata(dev.project.log_file(Component::Gateway))
             .unwrap()
             .len();
@@ -2010,7 +2021,7 @@ mod tests {
         dev.gateway_log_start = stale_len;
         let error = dev.verify_topology().unwrap_err();
         assert!(
-            error.to_string().contains("1 of 3 databases"),
+            error.to_string().contains("1 of 4 databases"),
             "a previous run's connect lines must not pass a collapsed gateway: {error}"
         );
     }
@@ -2155,7 +2166,7 @@ mod tests {
         let stack = FakeStack::new().with_gateway_log("coordinator connected to shard lyracore\n");
 
         let error = sharded_up(&mut dev, &stack, &FakeHttp::new()).unwrap_err();
-        assert!(error.to_string().contains("1 of 3 databases"), "{error}");
+        assert!(error.to_string().contains("1 of 4 databases"), "{error}");
         assert!(dev.state.record(Component::Gateway).is_some());
         let saved = RuntimeState::load(&dev.project.state_file()).unwrap();
         assert!(saved.record(Component::Gateway).is_some(), "{saved:?}");
@@ -2637,16 +2648,21 @@ mod tests {
                 );
                 assert!(rendered.contains("--yes"), "{rendered}");
             }
-            // The PRODUCTION realm's databases are not this fixture's, in either mode.
-            for production in [
+            // Databases the fixture does NOT have, in either mode. Not "the production realm's
+            // names": the fixture shares `lyracore`, `lyracore-realm` and — since #108 —
+            // `lyracore-instances` with production, and what keeps the two apart is the NODE a
+            // publish goes to (`-s local`, loopback:3000), never the name. These four have no
+            // fixture counterpart at all: production's other world shards, a second instance-pool
+            // member, and the realm-core name this fixture deliberately does not use.
+            for absent in [
                 "lyracore-world-1",
                 "lyracore-world-2",
-                "lyracore-instances",
+                "lyracore-instances-2",
                 "realm-core",
             ] {
                 assert!(
-                    !publishes.iter().any(|r| r.ends_with(production)),
-                    "the fixture must not touch {production}: {publishes:?}"
+                    !publishes.iter().any(|r| r.ends_with(absent)),
+                    "the fixture must not touch {absent}: {publishes:?}"
                 );
             }
         }

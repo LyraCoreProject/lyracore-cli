@@ -73,13 +73,15 @@ remembered: a schema change needs all of them, and the gateway reports a shard l
 
 ## What `dev up` does
 
-`dev up` brings up a **sharded** realm by default — three databases, so the topology a contributor
-develops against is the one production has rather than a single-database simplification:
+`dev up` brings up a **sharded** realm by default — four databases, one per production tier, so the
+topology a contributor develops against is the one production has rather than a single-database
+simplification:
 
 | database | role | wired by |
 | --- | --- | --- |
 | `lyracore` | default world shard: map 0, Eastern Kingdoms | `LYRACORE_DATABASE` |
 | `lyracore-kalimdor` | map 1 | `LYRACORE_SHARD_MAP="1:*=lyracore-kalimdor"` |
+| `lyracore-instances` | instance pool: every dungeon run (map 36, Deadmines) | `LYRACORE_SHARD_MAP="36:*=lyracore-instances"` |
 | `lyracore-realm` | realm-core: accounts, sessions, the character→shard index | `LYRACORE_REALM_CORE` |
 
 Realm-core is **mandatory**, not optional: a gateway serving more than one world shard with no
@@ -87,12 +89,35 @@ realm-core refuses to serve them. And `lyracore` is first in every list this CLI
 is what every lookup no shard-map rule answers collapses to, and because a publish walks the list in
 order — so the database whose failure matters most is the one that fails first.
 
+The instance pool joined in #108, for the reason the region shard left: it is a production tier a
+fresh clone could not exercise at all, so instance routing was the one split nobody developed
+against. Both shard-map rules are the same shape — an instance map routes exactly like a continent
+one, and the bucket half of a rule exists to spread ONE map's instances over a pool of several
+databases, which a one-database pool does not need.
+
+Three names here — `lyracore`, `lyracore-instances`, `lyracore-realm` — are also production's. What
+keeps a fixture off a production node is the **node**, not the name: every publish this CLI renders
+is `-s local`, against the SpacetimeDB on loopback:3000 that `dev up` starts.
+
 There is no map-0 region shard here any more. LyraCore's alpha topology reversal (2026-08-08)
 retired location/region sharding, and the gateway stopped reading `LYRACORE_REGION_SHARDS` and
-`game_map_region` with it — so a fourth database in this fixture was one `dev up` published,
-claimed, and then reported as a collapsed realm on every single run, because the gateway never
-connected it. `LYRACORE_REGION_SHARDS` is still *actively unset* for the child in both modes, so an
-old recipe exported in your shell cannot put it back.
+`game_map_region` with it — so a database for it was one `dev up` published, claimed, and then
+reported as a collapsed realm on every single run, because the gateway never connected it.
+`LYRACORE_REGION_SHARDS` is still *actively unset* for the child in both modes, so an old recipe
+exported in your shell cannot put it back.
+
+**Dungeon populations spawn on the world shard until you say otherwise.** Routing map 36 off
+`lyracore` does not by itself move the spawning: `game_config.hosts_instances` is a per-database
+flag that defaults to on everywhere, so the gateway logs one WARNING per start saying every
+Deadmines entry spawns its ~207 creatures on the world writer and evicts them again after the
+transfer. The run works. To model the production Phase A split, turn the flag off on the world
+shard once — it survives a republish:
+
+```
+spacetime sql -s local lyracore "UPDATE game_config SET hosts_instances = false WHERE id = 0"
+```
+
+Leave it alone under `dev up --single`, where the one database has to host its own dungeons.
 
 The steps:
 

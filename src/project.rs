@@ -79,13 +79,14 @@ impl ClientBind {
 /// against. [`Single`](Topology::Single) is `dev up --single`, and is the pre-#11 fixture unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Topology {
-    /// Three databases: the default world shard, a map-1 shard, and realm-core.
+    /// Four databases: the default world shard, a map-1 shard, the instance pool, and realm-core —
+    /// one per production tier in core `docs/architecture.md` §3.1.
     ///
-    /// There is no region shard here any more. LyraCore's alpha topology reversal (2026-08-08)
-    /// dropped location/region sharding, and the gateway stopped reading `LYRACORE_REGION_SHARDS`
-    /// and `game_map_region` with it — so a fourth database in this list was one the gateway would
-    /// publish, claim and then never connect, which `verify_topology` correctly reports as a
-    /// collapsed realm on every single `dev up`.
+    /// The instance pool joined in #108, for the reason the region shard left: a tier that only
+    /// production has is a tier nobody develops against, and instance routing was the one split a
+    /// fresh clone could not exercise at all. It is a real fourth CONNECTION, unlike the retired
+    /// region shard — the gateway routes map 36 to it from an ordinary shard-map rule, so
+    /// `verify_topology` sees it connect rather than reporting a collapsed realm.
     Sharded,
     /// One database. Every topology variable is actively unset for the child, so a contributor with
     /// the production recipe exported still gets the fixture.
@@ -132,7 +133,11 @@ impl Topology {
     pub fn world_shards(&self) -> Vec<&'static str> {
         match self {
             Topology::Single => vec![ProjectLayout::DATABASE],
-            Topology::Sharded => vec![ProjectLayout::DATABASE, ProjectLayout::KALIMDOR_SHARD],
+            Topology::Sharded => vec![
+                ProjectLayout::DATABASE,
+                ProjectLayout::KALIMDOR_SHARD,
+                ProjectLayout::INSTANCE_POOL,
+            ],
         }
     }
 
@@ -147,16 +152,24 @@ impl Topology {
         }
     }
 
-    /// `LYRACORE_SHARD_MAP` — the (map, instance-bucket) → database rules. Kalimdor only: map 0 is
-    /// Eastern Kingdoms in one piece on the default database, which is what a `0:*=` rule could
-    /// never express without handing a second database every map-0 location there is.
+    /// `LYRACORE_SHARD_MAP` — the (map, instance-bucket) → database rules. Two of them, and map 0 is
+    /// in NEITHER: Eastern Kingdoms is one piece on the default database, which is what a `0:*=`
+    /// rule could never express without handing a second database every map-0 location there is.
+    ///
+    /// Both rules are the same shape, `<map>:*=<db>`, because an instance map routes exactly like a
+    /// continent one — the bucket half of a rule splits ONE map's instances across a pool of several
+    /// databases, and a one-database pool needs no split (gateway `config.rs`, `instance_pool`). The
+    /// `*` covers bucket 0, which for a dungeon map is the open-world instance id nothing ever
+    /// stands in; the map-36 rows it routes are the spawn TEMPLATES `create_instance` copies.
     pub fn shard_map(&self) -> Option<String> {
         match self {
             Topology::Single => None,
             Topology::Sharded => Some(format!(
-                "{}:*={}",
+                "{}:*={}, {}:*={}",
                 ProjectLayout::KALIMDOR_MAP,
-                ProjectLayout::KALIMDOR_SHARD
+                ProjectLayout::KALIMDOR_SHARD,
+                ProjectLayout::INSTANCE_MAP,
+                ProjectLayout::INSTANCE_POOL
             )),
         }
     }
@@ -259,6 +272,18 @@ impl ProjectLayout {
     /// The map-1 shard, reached by an ordinary `LYRACORE_SHARD_MAP` rule.
     pub const KALIMDOR_SHARD: &'static str = "lyracore-kalimdor";
     pub const KALIMDOR_MAP: u32 = 1;
+    /// The INSTANCE POOL (#108): a one-database pool that owns every instance of every dungeon map,
+    /// reached by an ordinary shard-map rule like the continent shard is.
+    ///
+    /// This name is shared with production, and deliberately — so is `lyracore-realm`. What keeps a
+    /// fixture off a production node is the node it is published to (`-s local`, loopback:3000), not
+    /// a name nobody can collide with.
+    pub const INSTANCE_POOL: &'static str = "lyracore-instances";
+    /// Deadmines — the one entry in the server's `DUNGEON_MAPS`, and the only instanced map the
+    /// world import carries. Duplicated here rather than shared: this CLI does not depend on the
+    /// server workspace. A dungeon map the server adds and this list misses routes to the default
+    /// database instead, which is the pre-#108 behaviour and not a collapse.
+    pub const INSTANCE_MAP: u32 = 36;
     /// Realm-core: accounts, sessions, and the character→shard index.
     pub const REALM_CORE: &'static str = "lyracore-realm";
 
@@ -513,7 +538,10 @@ mod tests {
             layout.log_file(Component::Gateway),
             tmp.path().join(".lyracore/logs/gateway.log")
         );
-        assert_eq!(layout.config_file(), tmp.path().join(".lyracore/config.json"));
+        assert_eq!(
+            layout.config_file(),
+            tmp.path().join(".lyracore/config.json")
+        );
     }
 
     // ---- the `--lan` bind contract ----
@@ -597,7 +625,12 @@ mod tests {
         // gateway log it is checked against.
         assert_eq!(
             Topology::Sharded.databases(),
-            vec!["lyracore", "lyracore-kalimdor", "lyracore-realm"]
+            vec![
+                "lyracore",
+                "lyracore-kalimdor",
+                "lyracore-instances",
+                "lyracore-realm"
+            ]
         );
         assert_eq!(Topology::Single.databases(), vec!["lyracore"]);
     }
@@ -624,6 +657,27 @@ mod tests {
         assert_eq!(Topology::Single.realm_core(), None);
     }
 
+    /// Split a `LYRACORE_SHARD_MAP` string the way the gateway's `ShardMap::parse` does: rules
+    /// separated by `,`, each `<map|*>:<bucket|*>=<db>`. Two tests need it, and both of them used to
+    /// be one `split_once('=')` that silently stopped describing anything once the fixture grew its
+    /// second rule (#108) — the whole string parsed as ONE rule targeting a database named
+    /// `lyracore-kalimdor, 36:*=lyracore-instances`.
+    fn parsed_rules(rules: &str) -> Vec<(&str, &str, &str)> {
+        rules
+            .split(',')
+            .map(|rule| {
+                let (selector, db) = rule
+                    .trim()
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("a rule is `<map>:<bucket>=<db>`: {rule:?}"));
+                let (map, bucket) = selector
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("a rule selector is `<map>:<bucket>`: {rule:?}"));
+                (map, bucket, db)
+            })
+            .collect()
+    }
+
     #[test]
     fn map_zero_is_never_named_by_a_shard_map_rule() {
         // Eastern Kingdoms stays whole on the default database. A `0:*=` rule would hand a second
@@ -631,8 +685,31 @@ mod tests {
         // cannot survive — and after the alpha topology reversal there is no second map-0 database
         // for it to name anyway.
         let rules = Topology::Sharded.shard_map().unwrap();
-        assert_eq!(rules, "1:*=lyracore-kalimdor");
-        assert!(!rules.starts_with("0:"), "{rules}");
+        assert_eq!(
+            rules, "1:*=lyracore-kalimdor, 36:*=lyracore-instances",
+            "map 1 to the continent shard, map 36 to the instance pool"
+        );
+        for (map, bucket, _) in parsed_rules(&rules) {
+            assert_ne!(map, "0", "{rules}");
+            // Every rule is map-level. A per-BUCKET rule splits one map's instances across a pool of
+            // several databases; this fixture's pool is one database, so a bucket number here would
+            // be routing that only ever resolves to the same answer with more ways to typo it.
+            assert_eq!(bucket, "*", "{rules}");
+        }
+    }
+
+    #[test]
+    fn the_dungeon_map_is_routed_off_the_default_database() {
+        // The point of the fourth database (#108): instance routing that a fresh clone can actually
+        // exercise. Map 36 must name the instance pool — a fixture where it resolves to the default
+        // shard is the pre-#108 one with an extra database published and unused.
+        let rules = Topology::Sharded.shard_map().unwrap();
+        let dungeon = parsed_rules(&rules)
+            .into_iter()
+            .find(|(map, _, _)| map.parse() == Ok(ProjectLayout::INSTANCE_MAP))
+            .expect("no rule routes the dungeon map");
+        assert_eq!(dungeon.2, ProjectLayout::INSTANCE_POOL);
+        assert_ne!(dungeon.2, ProjectLayout::DATABASE);
     }
 
     #[test]
@@ -662,7 +739,7 @@ mod tests {
         let cmd = Topology::Sharded.apply_env(CommandSpec::new("gateway"));
         assert_eq!(
             cmd.env_value("LYRACORE_SHARD_MAP"),
-            Some("1:*=lyracore-kalimdor")
+            Some("1:*=lyracore-kalimdor, 36:*=lyracore-instances")
         );
         assert_eq!(cmd.env_value("LYRACORE_REALM_CORE"), Some("lyracore-realm"));
         for var in ProjectLayout::TOPOLOGY_VARS {
@@ -693,14 +770,17 @@ mod tests {
             published.contains(&named),
             "LYRACORE_REALM_CORE={named} is unpublished"
         );
-        let rule = cmd.env_value("LYRACORE_SHARD_MAP").unwrap();
-        let (_, target) = rule
-            .split_once('=')
-            .expect("a rule is `<map>:<bucket>=<db>`");
-        assert!(
-            published.contains(&target),
-            "{rule} targets an unpublished db"
-        );
+        let rules = cmd.env_value("LYRACORE_SHARD_MAP").unwrap();
+        // EVERY rule, not the first one: the fixture has had more than one since #108, and the
+        // single `split_once('=')` this used to be would have read the whole string as ONE rule
+        // pointing at a database called "lyracore-kalimdor, 36:*=lyracore-instances" — an assertion
+        // that fails on a correct fixture and can never fail on a broken one.
+        for (_, _, target) in parsed_rules(rules) {
+            assert!(
+                published.contains(&target),
+                "{rules}: {target} is unpublished"
+            );
+        }
     }
 
     #[test]
