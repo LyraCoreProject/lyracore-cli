@@ -584,9 +584,18 @@ impl DevManager {
             // Unlike SpacetimeDB, a foreign gateway must NOT be adopted: we cannot know what build
             // or topology it is running. Starting ours anyway would fail to bind, and the health
             // probe would then pass against *their* listener and record a dead PID as healthy.
+            //
+            // External = no recorded PID at all (see `classify`), so `dev down --forget` — which
+            // only clears a RECORDED PID whose process was reused — is a no-op here and must not
+            // be suggested: it sent an operator in circles (core #540). The stray is typically a
+            // gateway from another checkout (state.json lives per-checkout); the only remedies are
+            // stopping it from ITS checkout or killing it by name.
             return Err(Error::Process(format!(
-                "port {} is already served by a gateway this CLI did not start — stop it first, \
-                 or run `lyracore dev down --forget` if it is stale state from an earlier run",
+                "port {} is already served by a gateway this CLI did not start (typically a \
+                 `dev up` from another checkout — state is per-checkout). Run `lyracore dev down` \
+                 from that checkout, or kill it with `pkill -x lyracore-gatewa` (no trailing 'y': \
+                 the kernel truncates process names to 15 chars, and the full 16-char name \
+                 silently matches nothing), then re-run `lyracore dev up`",
                 ProjectLayout::WORLD_PORT
             )));
         }
@@ -3055,6 +3064,18 @@ mod tests {
                 .to_string()
                 .contains(&ProjectLayout::WORLD_PORT.to_string()),
             "the refusal must name the contended port: {error}"
+        );
+        // core #540: External means NO recorded PID (see `classify`), so `dev down --forget` —
+        // which only clears a recorded-but-reused PID — is a no-op here and sent an operator in
+        // circles. The remedy shown must be one that works: the truncated-comm pkill (the binary
+        // name is 16 chars; the kernel's comm is 15, so the full name matches nothing).
+        assert!(
+            error.to_string().contains("pkill -x lyracore-gatewa"),
+            "the refusal must show the working kill command: {error}"
+        );
+        assert!(
+            !error.to_string().contains("--forget"),
+            "must not suggest --forget for a gateway with no recorded PID: {error}"
         );
         assert!(
             !stack
