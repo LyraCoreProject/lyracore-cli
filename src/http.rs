@@ -170,8 +170,8 @@ pub mod fake {
         }
 
         /// A node that answers everything except the requests whose URL contains `needle`, which it
-        /// refuses with `message`. For a reducer that rejects its ARGUMENT — the seam-menu import
-        /// refusing a malformed row, say — while the rest of the run is healthy.
+        /// refuses with `message`. For one database that rejects a call the rest of the run makes
+        /// happily — `set_gm_level` on a shard that has never heard of the character, say.
         pub fn refusing(needle: &str, message: &str) -> Self {
             Self {
                 failure: Some(message.to_string()),

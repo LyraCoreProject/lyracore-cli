@@ -1,13 +1,13 @@
 //! The local realm lifecycle: `dev up | status | logs | smoke | down`.
 //!
-//! Scope is the seeded loopback fixture, which since #11 is **sharded by default**: four databases
-//! with a live seam across Elwynn (`Topology::Sharded`). `dev up --single` is the pre-#11
-//! one-database fixture, unchanged down to the hard unset of every topology variable.
+//! Scope is the seeded loopback fixture, which since #11 is **sharded by default**: three databases
+//! — the default world shard, the map-1 shard, and realm-core (`Topology::Sharded`). `dev up
+//! --single` is the pre-#11 one-database fixture, unchanged down to the hard unset of every
+//! topology variable.
 //!
 //! This is still not the production recipe in `docs/danger-zones.md` §3 — different databases,
-//! different seam, loopback only — and no path here reads a topology variable out of the
-//! contributor's shell. [`Topology::apply_env`](crate::project::Topology::apply_env) decides all
-//! four, in both modes.
+//! loopback only — and no path here reads a topology variable out of the contributor's shell.
+//! [`Topology::apply_env`](crate::project::Topology::apply_env) decides all four, in both modes.
 //!
 //! # The failure this file is shaped around
 //!
@@ -23,9 +23,7 @@ use crate::cmd::{preflight, publish};
 use crate::harness::{self, Harness};
 use crate::http::HttpClient;
 use crate::proc::{start_signature, CommandSpec, ProcessInspector, ProcessRunner};
-use crate::project::{
-    region_menu_arguments, ClientBind, Component, ProjectLayout, SeamAssignment, Topology,
-};
+use crate::project::{ClientBind, Component, ProjectLayout, Topology};
 use crate::state::{ProcessRecord, RuntimeState};
 use crate::token::Credential;
 use crate::{Error, Result};
@@ -196,11 +194,6 @@ impl DevManager {
             &ProjectLayout::stdb_uri(),
         )?;
         self.claim_operator(runner, http, &credential)?;
-        // The seam, before the gateway rather than after: the gateway reads `game_map_region` once
-        // per world entry from a cache it invalidates on insert, but `region_db_for` short-circuits
-        // on an EMPTY menu — so a gateway started against an unwired realm is a gateway that took
-        // the "no seam menu imported" path for every login until the menu landed.
-        self.wire_seam(http, &credential)?;
         self.ensure_gateway(runner, inspector, &gateway, &credential)?;
 
         // Before the verification, so a realm that came up wrong is still one `dev down` can stop.
@@ -221,8 +214,8 @@ impl DevManager {
     /// environment once, at `Coordinator::connect`.
     ///
     /// Without this, `dev up --single` onto a running sharded stack would report "already up" and
-    /// hand back a four-database realm, and `dev up` onto a running `--single` one would report a
-    /// seam that is not there. Both are the silent collapse wearing a success message.
+    /// hand back a multi-database realm, and `dev up` onto a running `--single` one would report
+    /// shards that are not there. Both are the silent collapse wearing a success message.
     fn check_topology_change(&self, gateway: &ComponentStatus, wanted: Topology) -> Result<()> {
         if !matches!(
             gateway,
@@ -397,97 +390,6 @@ impl DevManager {
             })?;
         }
         Ok(())
-    }
-
-    // ---- the seam ----
-
-    /// Import the seam menu on every world shard, then write the region assignments on realm-core.
-    ///
-    /// Both reducers are `require_operator`-gated, so both go over the SAME bearer-token HTTP path
-    /// `claim_operator` uses — never `spacetime call`, whose identity is the `spacetime` CLI's and
-    /// not necessarily the one `dev up` just claimed with.
-    ///
-    /// The menu itself is never in this CLI. It ships the bytes of the server checkout's
-    /// `content/regions/fixture.regions`; a checkout that predates that file gets a printed skip
-    /// and an unsharded-but-honest realm, because a silently half-wired one is the failure this
-    /// whole feature exists to avoid.
-    fn wire_seam(&self, http: &dyn HttpClient, credential: &Credential) -> Result<()> {
-        if self.topology.region_menu_shards().is_empty() {
-            return Ok(());
-        }
-        let Some(fixture) = self.project.region_fixture() else {
-            println!(
-                "· NO SEAM: this checkout has no {} — it predates the sharded fixture (core \
-                 #327).\n  The databases are published and claimed, and routing collapses to the \
-                 default one.\n  Update the checkout and re-run `lyracore dev up` for a live seam.",
-                ProjectLayout::REGION_FIXTURE
-            );
-            return Ok(());
-        };
-        let packed = std::fs::read_to_string(&fixture)?;
-        let arguments = region_menu_arguments(&packed);
-
-        for shard in self.topology.region_menu_shards() {
-            println!("· importing the seam menu on {shard}...");
-            http.post_json(
-                &reducer_url(shard, "import_map_regions"),
-                Some(credential.token()),
-                &arguments,
-            )
-            .map_err(|e| {
-                // Verbatim. The module rejects the WHOLE menu on any malformed row and says which
-                // row — swallowing that is exactly the "published, claimed, and unused" realm this
-                // is meant to prevent, and the reason is never guessable from the outside.
-                Error::Process(format!(
-                    "{e}\n  `import_map_regions` was refused on {shard}. The message above is the \
-                     module's own; the menu it rejected is {}.",
-                    fixture.display()
-                ))
-            })?;
-        }
-
-        for assignment in self.topology.seam_assignments() {
-            self.assign_region(http, credential, &assignment)?;
-        }
-        Ok(())
-    }
-
-    /// One `set_region_assignment` on realm-core.
-    ///
-    /// A REPEAT `dev up` writes epoch 1 over an existing epoch-1 row, which the module refuses as a
-    /// stale epoch — correctly: an equal epoch is a race, not a flip. That refusal means "already
-    /// assigned, by us, at the epoch we wanted", so it is reported and stepped over rather than
-    /// failing the run. Every other refusal is fatal, because every other refusal means the region
-    /// is NOT where this fixture says it is.
-    fn assign_region(
-        &self,
-        http: &dyn HttpClient,
-        credential: &Credential,
-        assignment: &SeamAssignment,
-    ) -> Result<()> {
-        let SeamAssignment {
-            map_id,
-            region_id,
-            shard,
-            ..
-        } = *assignment;
-        println!("· assigning map {map_id} region {region_id} to {shard}...");
-        match http.post_json(
-            &reducer_url(ProjectLayout::REALM_CORE, "set_region_assignment"),
-            Some(credential.token()),
-            &assignment.call_arguments(),
-        ) {
-            Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("stale epoch") => {
-                println!("  already assigned at this epoch — leaving it alone.");
-                Ok(())
-            }
-            Err(e) => Err(Error::Process(format!(
-                "{e}\n  `set_region_assignment` was refused on {}. Region {region_id} of map \
-                 {map_id} is NOT on {shard}, so the seam is not live.",
-                ProjectLayout::REALM_CORE
-            ))),
-        }
     }
 
     // ---- the realised topology ----
@@ -969,10 +871,10 @@ impl DevManager {
 /// The fixture gateway.
 ///
 /// `LYRACORE_DATABASE` is the DEFAULT world shard in every topology — it must be, because the
-/// gateway reads the seam menu from the first entry of its own shard list and builds that list
-/// starting from this one. The rest of the topology is `Topology::apply_env`'s to decide, in both
-/// modes: `--single` unsets all four variables (so an exported production recipe cannot leak in),
-/// and the sharded default sets the three it means.
+/// gateway builds its own shard list starting from this one and collapses to it for every lookup
+/// no rule answers. The rest of the topology is `Topology::apply_env`'s to decide, in both modes:
+/// `--single` unsets all four variables (so an exported production recipe cannot leak in), and the
+/// sharded default sets the two it means and unsets the other two.
 fn gateway_command(
     project: &ProjectLayout,
     bind: &ClientBind,
@@ -1012,9 +914,9 @@ fn claim_command(database: &str) -> CommandSpec {
 }
 
 /// An operator-gated reducer over the node's HTTP API, which is the only way to call one as an
-/// identity the `spacetime` CLI does not hold — and the only way `dev up` calls the three it needs
-/// (`claim_operator`, `import_map_regions`, `set_region_assignment`), because a claim made by one
-/// identity and a write made by another is the lock-out this path exists to avoid.
+/// identity the `spacetime` CLI does not hold — and the way `dev up` calls `claim_operator`,
+/// because a claim made by one identity and a write made by another is the lock-out this path
+/// exists to avoid. `lyracore character gm` reaches `set_gm_level` the same way.
 pub(crate) fn reducer_url(database: &str, reducer: &str) -> String {
     format!(
         "{}/v1/database/{database}/call/{reducer}",
@@ -1857,10 +1759,9 @@ mod tests {
     }
 
     #[test]
-    fn the_gateway_runs_against_exactly_the_four_databases_the_fixture_published() {
+    fn the_gateway_runs_against_exactly_the_three_databases_the_fixture_published() {
         // The sharded half of the same contract: every database the environment names is one this
-        // CLI publishes and claims, and the default world shard is `LYRACORE_DATABASE` — which is
-        // where the gateway reads the seam menu from.
+        // CLI publishes and claims, and the default world shard is `LYRACORE_DATABASE`.
         let tmp = TempDir::new().unwrap();
         let cmd = gateway_command(
             &project(&tmp),
@@ -1877,34 +1778,15 @@ mod tests {
             Some("1:*=lyracore-kalimdor")
         );
         assert_eq!(cmd.env_value("LYRACORE_REALM_CORE"), Some("lyracore-realm"));
-        assert_eq!(
-            cmd.env_value("LYRACORE_REGION_SHARDS"),
-            Some("lyracore-elwynn")
-        );
-        // ...and the file form is still unset, in this mode too: the env var wins over it, so an
-        // inherited `LYRACORE_SHARD_MAP_FILE` could only mislead whoever read it next.
+        // The two this mode does not set are still unset, in this mode too: the env var wins over
+        // an inherited `LYRACORE_SHARD_MAP_FILE`, and `LYRACORE_REGION_SHARDS` would name a
+        // database from the retired region topology that this fixture never publishes.
         assert!(cmd.removes_env("LYRACORE_SHARD_MAP_FILE"));
+        assert!(cmd.removes_env("LYRACORE_REGION_SHARDS"));
+        assert_eq!(cmd.env_value("LYRACORE_REGION_SHARDS"), None);
     }
 
     // ---- the sharded fixture (#11) ----
-
-    /// The two rows of the server checkout's seam menu, with the prose around them that broke the
-    /// core parser once: a `;` inside a `#` comment (the parser split on `;` before stripping the
-    /// comment, so the whole menu was rejected), and a quote, which a hand-rolled JSON escaper
-    /// would truncate the payload at.
-    const SEAM_MENU: &str = "# The split: Northshire Valley | the rest of Elwynn.\n\
-                             # Region 1 is \"the valley\"; region 2 is everything else.\n\
-                             0:1 = 512..524, 336..350\n\
-                             0:2 = 525..549, 330..369\n";
-
-    /// A checkout that ships the seam menu — i.e. one no older than core #327.
-    fn project_with_seam(tmp: &TempDir) -> ProjectLayout {
-        let layout = project(tmp);
-        let fixture = layout.root.join(ProjectLayout::REGION_FIXTURE);
-        std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
-        std::fs::write(&fixture, SEAM_MENU).unwrap();
-        layout
-    }
 
     fn sharded_up(dev: &mut DevManager, stack: &FakeStack, http: &dyn HttpClient) -> Result<()> {
         dev.up(
@@ -1926,7 +1808,7 @@ mod tests {
     #[test]
     fn up_publishes_and_claims_every_database_in_the_gateways_own_order() {
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new().fail_on("login show", "You are not logged in");
         let http = FakeHttp::new();
         sharded_up(&mut dev, &stack, &http).unwrap();
@@ -1939,12 +1821,7 @@ mod tests {
             .collect();
         assert_eq!(
             published,
-            vec![
-                "lyracore",
-                "lyracore-kalimdor",
-                "lyracore-elwynn",
-                "lyracore-realm"
-            ],
+            vec!["lyracore", "lyracore-kalimdor", "lyracore-realm"],
             "every database, and the default one first"
         );
 
@@ -1965,174 +1842,29 @@ mod tests {
     }
 
     #[test]
-    fn up_ships_the_checkouts_own_seam_menu_to_every_world_shard_and_nothing_else() {
-        let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
-        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
-        let http = FakeHttp::new();
-        sharded_up(&mut dev, &stack, &http).unwrap();
-
-        let imports = calls_to(&http, "import_map_regions");
-        let targets: Vec<String> = imports
-            .iter()
-            .map(|r| r.url.split('/').nth(5).unwrap().to_string())
-            .collect();
-        assert_eq!(
-            targets,
-            vec!["lyracore", "lyracore-elwynn"],
-            "the menu goes to the world shards a region can be assigned to — the gateway reads it \
-             from the first of them"
-        );
-        // The FILE's bytes, verbatim and JSON-escaped — not a menu this CLI knows how to write.
-        // The geometry belongs to the server checkout (core #327) and appears nowhere in here.
-        for import in &imports {
-            assert_eq!(import.body, format!("[{}]", serde_json::json!(SEAM_MENU)));
-            assert!(
-                import.body.contains("0:1 = 512..524, 336..350"),
-                "{import:?}"
-            );
-            assert!(
-                import.body.contains(r#"\"the valley\"; region 2"#),
-                "the semicolon in a prose comment and the quotes around it must survive: {import:?}"
-            );
-        }
-        let source = std::fs::read_to_string(dev.project.region_fixture().unwrap()).unwrap();
-        assert_eq!(source, SEAM_MENU, "the checkout's file is the only source");
-    }
-
-    #[test]
-    fn up_assigns_northshire_to_the_default_database_and_the_rest_of_elwynn_to_the_region_shard() {
-        let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
-        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
-        let http = FakeHttp::new();
-        sharded_up(&mut dev, &stack, &http).unwrap();
-
-        let assignments = calls_to(&http, "set_region_assignment");
-        assert_eq!(assignments.len(), 2, "{assignments:?}");
-        for assignment in &assignments {
-            assert!(
-                assignment
-                    .url
-                    .contains(&format!("/database/{}/call/", ProjectLayout::REALM_CORE)),
-                "assignments are realm-core's, never a world shard's: {assignment:?}"
-            );
-        }
-        assert_eq!(assignments[0].body, r#"[0,1,"lyracore",1]"#);
-        assert_eq!(assignments[1].body, r#"[0,2,"lyracore-elwynn",1]"#);
-    }
-
-    #[test]
-    fn the_operator_gated_reducers_never_go_through_the_spacetime_cli() {
+    fn the_operator_gated_reducer_never_goes_through_the_spacetime_cli() {
         // `spacetime call` runs as the CLI's identity, which for a minted credential is a DIFFERENT
-        // identity from the one that just claimed the operator — so all three would be refused,
-        // and the seam would be missing from a run that reported success.
+        // identity from the one that just claimed the operator — so the claim would be refused, on
+        // a run that reported success.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new().fail_on("login show", "You are not logged in");
         let http = FakeHttp::new();
         sharded_up(&mut dev, &stack, &http).unwrap();
 
-        for reducer in [
-            "claim_operator",
-            "import_map_regions",
-            "set_region_assignment",
-        ] {
-            assert!(
-                !stack.rendered().iter().any(|r| r.contains(reducer)),
-                "{reducer} must not be shelled out: {:?}",
-                stack.rendered()
-            );
-            assert!(
-                !calls_to(&http, reducer).is_empty(),
-                "{reducer} was not called"
-            );
-        }
-        // ...and nothing loggable carries the credential all three were made with.
+        assert!(
+            !stack.rendered().iter().any(|r| r.contains("claim_operator")),
+            "claim_operator must not be shelled out: {:?}",
+            stack.rendered()
+        );
+        assert!(
+            !calls_to(&http, "claim_operator").is_empty(),
+            "claim_operator was not called"
+        );
+        // ...and nothing loggable carries the credential it was made with.
         for rendered in stack.rendered() {
             assert!(!rendered.contains(MINTED_TOKEN), "leaked into: {rendered}");
         }
-    }
-
-    #[test]
-    fn a_checkout_with_no_seam_menu_skips_the_import_rather_than_half_wiring_the_realm() {
-        // Version skew: a core checkout older than this CLI ships no `content/regions/`. The four
-        // databases are still published and claimed; routing simply collapses to the default one,
-        // which is a coherent realm — a menu imported without assignments, or assignments without a
-        // menu, is not.
-        let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project(&tmp)).unwrap();
-        assert_eq!(dev.project.region_fixture(), None);
-        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
-        let http = FakeHttp::new();
-        sharded_up(&mut dev, &stack, &http).unwrap();
-
-        assert!(calls_to(&http, "import_map_regions").is_empty());
-        assert!(
-            calls_to(&http, "set_region_assignment").is_empty(),
-            "an assignment naming a region no shard can resolve routes nobody, silently"
-        );
-        assert_eq!(calls_to(&http, "claim_operator").len(), 4);
-    }
-
-    #[test]
-    fn a_rejected_seam_menu_is_reported_in_the_modules_own_words() {
-        // The module rejects the WHOLE menu on any malformed row and says which. Swallowing that
-        // is exactly the "published, claimed, and unused" realm this feature exists to avoid — and
-        // the reason is never guessable from out here: the core parser once rejected an entire menu
-        // because a `;` appeared inside a `#` comment.
-        let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
-        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
-        let http = FakeHttp::refusing(
-            "import_map_regions",
-            "seam menu rejected 1 row(s): region 2 overlaps region 1 at cell (525, 336)",
-        );
-
-        let error = sharded_up(&mut dev, &stack, &http).unwrap_err();
-        assert!(
-            error.to_string().contains("region 2 overlaps region 1"),
-            "the module's own message must survive verbatim: {error}"
-        );
-        assert!(
-            error.to_string().contains(ProjectLayout::REGION_FIXTURE),
-            "and it must name the file that was rejected: {error}"
-        );
-        assert!(
-            !stack.calls().iter().any(
-                |c| matches!(c, Call::Spawn { spec, .. } if spec.render().contains("gateway"))
-            ),
-            "no gateway may be started against a realm whose seam was refused"
-        );
-    }
-
-    #[test]
-    fn a_second_up_steps_over_an_assignment_that_is_already_at_this_epoch() {
-        // Re-running `dev up` writes epoch 1 over an existing epoch-1 row, which the module refuses
-        // — correctly, an equal epoch is a race and not a flip. That one refusal means "already
-        // where we wanted it", so it must not fail the run; every other refusal still does.
-        let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
-        let stack = FakeStack::new().fail_on("login show", "You are not logged in");
-        let http = FakeHttp::refusing(
-            "set_region_assignment",
-            "stale epoch 1 for map 0 region 2: the current assignment is already at epoch 1",
-        );
-        sharded_up(&mut dev, &stack, &http).unwrap();
-
-        let refusing = FakeHttp::refusing("set_region_assignment", "operator only");
-        let mut fresh = DevManager::new(project_with_seam(&tmp)).unwrap();
-        fresh.state.set(Component::Gateway, None);
-        fresh.state.set(Component::Spacetime, None);
-        let error = sharded_up(&mut fresh, &FakeStack::new(), &refusing).unwrap_err();
-        assert!(
-            error.to_string().contains("operator only"),
-            "any OTHER refusal is still fatal: {error}"
-        );
-        assert!(
-            error.to_string().contains("the seam is not live"),
-            "{error}"
-        );
     }
 
     #[test]
@@ -2141,20 +1873,17 @@ mod tests {
         // such table", so "which ones are current?" is the next question — and this run is the only
         // thing that knows.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
-        // Fail only the THIRD publish: two land, one breaks, one is never attempted.
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        // Fail only the SECOND publish: one lands, one breaks, one is never attempted.
         let stack = FakeStack::new().fail_on(
-            &format!("--yes {}", ProjectLayout::REGION_SHARD),
-            "migration rejected: Removed table game_map_region",
+            &format!("--yes {}", ProjectLayout::KALIMDOR_SHARD),
+            "migration rejected: Removed table game_creature",
         );
 
         let error = sharded_up(&mut dev, &stack, &FakeHttp::new()).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("migration rejected"), "{message}");
-        assert!(
-            message.contains("Published so far: lyracore and lyracore-kalimdor"),
-            "{message}"
-        );
+        assert!(message.contains("Published so far: lyracore."), "{message}");
         assert!(message.contains("Still to do: lyracore-realm"), "{message}");
         assert!(
             !stack
@@ -2169,7 +1898,7 @@ mod tests {
     #[test]
     fn a_first_database_that_fails_reports_that_nothing_was_published() {
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new().fail_on(
             &format!("--yes {}", ProjectLayout::DATABASE),
             "no such server",
@@ -2190,23 +1919,22 @@ mod tests {
         // its health probe and serves ONE database — while the rest sit published, claimed and
         // unused. Every PID and every port is perfect in that state.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         dev.topology = Topology::Sharded;
         dev.verify_timeout = Duration::from_millis(50);
         std::fs::create_dir_all(&dev.project.logs_dir).unwrap();
         std::fs::write(
             dev.project.log_file(Component::Gateway),
             "gateway starting: logon=127.0.0.1:3724 world=127.0.0.1:8085\n\
-             coordinator connected to shard lyracore\n\
-             coordinator connected to shard lyracore-kalimdor\n",
+             coordinator connected to shard lyracore\n",
         )
         .unwrap();
 
         let error = dev.verify_topology().unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("2 of 4 databases"), "{message}");
+        assert!(message.contains("1 of 3 databases"), "{message}");
         assert!(
-            message.contains("lyracore-elwynn and lyracore-realm"),
+            message.contains("lyracore-kalimdor and lyracore-realm"),
             "the refusal must name exactly which ones are missing: {message}"
         );
         assert!(
@@ -2222,7 +1950,7 @@ mod tests {
         // those warns once parsed as 258 connections to a shard named "`". (b) The log appends
         // across runs, so a previous gateway's connect lines must not vouch for this one.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         dev.topology = Topology::Sharded;
         dev.verify_timeout = Duration::from_millis(50);
         std::fs::create_dir_all(&dev.project.logs_dir).unwrap();
@@ -2256,7 +1984,7 @@ mod tests {
         dev.gateway_log_start = stale_len;
         let error = dev.verify_topology().unwrap_err();
         assert!(
-            error.to_string().contains("1 of 4 databases"),
+            error.to_string().contains("1 of 3 databases"),
             "a previous run's connect lines must not pass a collapsed gateway: {error}"
         );
     }
@@ -2265,7 +1993,7 @@ mod tests {
     fn a_complete_realm_verifies_and_a_single_database_one_is_held_to_its_own_count() {
         for topology in [Topology::Single, Topology::Sharded] {
             let tmp = TempDir::new().unwrap();
-            let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+            let mut dev = DevManager::new(project(&tmp)).unwrap();
             dev.topology = topology;
             dev.verify_timeout = Duration::from_millis(50);
             std::fs::create_dir_all(&dev.project.logs_dir).unwrap();
@@ -2313,7 +2041,7 @@ mod tests {
     #[test]
     fn a_single_database_fixture_that_reached_four_names_the_ones_it_should_not_have() {
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         dev.topology = Topology::Single;
         dev.verify_timeout = Duration::from_millis(50);
         std::fs::create_dir_all(&dev.project.logs_dir).unwrap();
@@ -2333,7 +2061,7 @@ mod tests {
         // An older or renamed gateway build. Failing a working stack because this CLI could not
         // read its log would be the worse error, so it says so and carries on.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         dev.topology = Topology::Sharded;
         dev.verify_timeout = Duration::from_millis(50);
         std::fs::create_dir_all(&dev.project.logs_dir).unwrap();
@@ -2352,7 +2080,7 @@ mod tests {
         // as `ShardMap::from_env` does, so this is a real reading of a real (modelled) collapse
         // rather than an assertion that the right strings were exported.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
         sharded_up(&mut dev, &stack, &FakeHttp::new()).unwrap();
         assert_eq!(
@@ -2364,10 +2092,10 @@ mod tests {
 
     #[test]
     fn the_modelled_gateway_drops_the_same_configuration_the_real_one_does() {
-        // Without this the silent-collapse tests would be circular: a fake that always logged four
-        // shards would pass them against a world where the collapse cannot happen. So the fake
-        // derives its log from the ENVIRONMENT, with the real gateway's own three quiet rules —
-        // and here they are, all firing at once.
+        // Without this the silent-collapse tests would be circular: a fake that always logged every
+        // shard would pass them against a world where the collapse cannot happen. So the fake
+        // derives its log from the ENVIRONMENT, with the real gateway's own quiet rules — and here
+        // they are, firing at once.
         let tmp = TempDir::new().unwrap();
         let stack = FakeStack::new();
         let cmd = CommandSpec::new("gateway")
@@ -2379,16 +2107,14 @@ mod tests {
             )
             // Equal to the default database: reads as UNCONFIGURED, not as a second connection.
             .env("LYRACORE_REALM_CORE", "lyracore")
-            // The default is dropped from the region set; the real shard survives.
-            .env("LYRACORE_REGION_SHARDS", "lyracore,lyracore-elwynn")
             .env("LYRACORE_WORLD_BIND", "127.0.0.1:8085");
         let log = tmp.path().join("gateway.log");
         stack.runner().spawn_logged(&cmd, &log).unwrap();
 
         assert_eq!(
             connected_shards(&std::fs::read_to_string(&log).unwrap()),
-            vec!["lyracore", "lyracore-kalimdor", "lyracore-elwynn"],
-            "three of the four databases this config names actually connect — and every one of \
+            vec!["lyracore", "lyracore-kalimdor"],
+            "two of the four databases this config names actually connect — and every one of \
              those drops is silent"
         );
     }
@@ -2398,12 +2124,12 @@ mod tests {
         // The realm came up wrong, but it came UP. State is saved before the verdict, or the one
         // process that needs stopping is the one `dev down` no longer knows about.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         dev.verify_timeout = Duration::from_millis(50);
         let stack = FakeStack::new().with_gateway_log("coordinator connected to shard lyracore\n");
 
         let error = sharded_up(&mut dev, &stack, &FakeHttp::new()).unwrap_err();
-        assert!(error.to_string().contains("1 of 4 databases"), "{error}");
+        assert!(error.to_string().contains("1 of 3 databases"), "{error}");
         assert!(dev.state.record(Component::Gateway).is_some());
         let saved = RuntimeState::load(&dev.project.state_file()).unwrap();
         assert!(saved.record(Component::Gateway).is_some(), "{saved:?}");
@@ -2419,7 +2145,7 @@ mod tests {
         // The highest-value half of #11: a partial publish and a collapsed topology are invisible
         // to a PID-and-port check, and this is the only place either becomes visible.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new();
         sharded_up(&mut dev, &stack, &FakeHttp::new()).unwrap();
 
@@ -2439,14 +2165,14 @@ mod tests {
 
         // A database that is not published gets its own verdict, and the others keep theirs.
         let partial = FakeStack::new().fail_on(
-            &format!("-s local {}", ProjectLayout::REGION_SHARD),
+            &format!("-s local {}", ProjectLayout::KALIMDOR_SHARD),
             "database not found",
         );
         let connected = dev.connected_shards();
         let line = dev.database_health(
             &partial.runner(),
             &ComponentStatus::Healthy,
-            ProjectLayout::REGION_SHARD,
+            ProjectLayout::KALIMDOR_SHARD,
             connected.as_deref(),
         );
         assert!(line.contains("UNREACHABLE"), "{line}");
@@ -2464,13 +2190,13 @@ mod tests {
         // "Published" is not "in use". A database that describes perfectly and that the gateway
         // never connected to is the silent collapse's resting state.
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         dev.topology = Topology::Sharded;
         let stack = FakeStack::new();
         let line = dev.database_health(
             &stack.runner(),
             &ComponentStatus::Healthy,
-            ProjectLayout::REGION_SHARD,
+            ProjectLayout::KALIMDOR_SHARD,
             Some(&["lyracore".to_string()]),
         );
         assert!(line.contains("NEVER CONNECTED"), "{line}");
@@ -2480,9 +2206,9 @@ mod tests {
     // ---- --single stays exactly what it was ----
 
     #[test]
-    fn the_single_fixture_publishes_one_database_claims_one_and_wires_no_seam() {
+    fn the_single_fixture_publishes_one_database_and_claims_exactly_it() {
         let tmp = TempDir::new().unwrap();
-        let mut dev = DevManager::new(project_with_seam(&tmp)).unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
         let stack = FakeStack::new().fail_on("login show", "You are not logged in");
         let http = FakeHttp::new();
         dev.up(
@@ -2501,11 +2227,16 @@ mod tests {
             .collect();
         assert_eq!(publishes.len(), 1, "{publishes:?}");
         assert!(publishes[0].ends_with(ProjectLayout::DATABASE));
-        assert_eq!(calls_to(&http, "claim_operator").len(), 1);
-        // The checkout HAS a seam menu; the one-database fixture still must not import it — there
-        // is nowhere for a second region to live, and a menu with no assignment is inert anyway.
-        assert!(calls_to(&http, "import_map_regions").is_empty());
-        assert!(calls_to(&http, "set_region_assignment").is_empty());
+        // One claim, and it is the default database's — a claim on a database this fixture never
+        // published is a write against a realm nobody is running.
+        let claims = calls_to(&http, "claim_operator");
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert!(
+            claims[0]
+                .url
+                .contains(&format!("/database/{}/call/", ProjectLayout::DATABASE)),
+            "{claims:?}"
+        );
     }
 
     #[test]

@@ -206,19 +206,21 @@ fn endpoint_for(cmd: &CommandSpec) -> Option<String> {
 ///
 /// This is the point of the fake, not decoration. The failure #11 is shaped around is that a wrong
 /// topology variable produces a gateway that starts, binds, answers, and serves ONE database — so a
-/// fake that always logged four shards would make every silent-collapse test pass against a world
+/// fake that always logged every shard would make every silent-collapse test pass against a world
 /// where the collapse cannot happen. Reproduced here, rule for rule:
 ///
 /// - a shard-map rule that is not `<map|*>:<bucket|*>=<db>` is DROPPED (`ShardMap::parse` logs and
 ///   skips it), and so is `<map>=<db>` shorthand's malformed cousin;
 /// - `LYRACORE_REALM_CORE` that is blank, absent, or EQUAL to the default database reads as
 ///   unconfigured (`with_realm_core`);
-/// - `LYRACORE_REGION_SHARDS` drops the default database, realm-core, and anything a rule already
-///   names (`with_region_shards`);
 /// - an empty `LYRACORE_SHARD_MAP` is still SET, and therefore suppresses `LYRACORE_SHARD_MAP_FILE`.
 ///
 /// Every one of those is silent in the real gateway's behaviour and visible only as a database
 /// missing from this list.
+///
+/// `LYRACORE_REGION_SHARDS` is deliberately NOT read: the alpha topology reversal retired region
+/// sharding and the gateway stopped reading it, so a fake that still connected the databases it
+/// names would model a gateway nobody runs.
 fn gateway_log(cmd: &CommandSpec) -> String {
     let default_db = cmd.env_value("LYRACORE_DATABASE").unwrap_or("lyracore");
     let mut dbs = vec![default_db.to_string()];
@@ -254,20 +256,6 @@ fn gateway_log(cmd: &CommandSpec) -> String {
         .map(str::trim)
         .filter(|n| !n.is_empty() && *n != default_db);
 
-    for raw in cmd
-        .env_value("LYRACORE_REGION_SHARDS")
-        .unwrap_or("")
-        .split(['\n', ',', ';'])
-    {
-        let name = raw.split('#').next().unwrap_or("").trim();
-        // The default is already connected; realm-core owns no characters and is refused outright.
-        if name.is_empty() || name == default_db || Some(name) == realm_core {
-            continue;
-        }
-        if !dbs.iter().any(|d| d == name) {
-            dbs.push(name.to_string());
-        }
-    }
     dbs.extend(realm_core.map(str::to_string));
 
     let mut log = format!(

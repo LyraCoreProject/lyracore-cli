@@ -9,7 +9,7 @@
 //! [`Topology::world_shards`](crate::project::Topology::world_shards) — the same list
 //! `account create`'s topology-awareness (`cmd/account.rs`) is built on — trying each in order
 //! until one recognises the name. `set_gm_level` is `require_operator`-gated, so the call goes
-//! over the SAME bearer-token HTTP path `dev up`'s `wire_seam`/`claim_operator` use, never
+//! over the SAME bearer-token HTTP path `dev up`'s `claim_operator` uses, never
 //! `spacetime call`: the credential that claimed the operator may not be the `spacetime` CLI's own
 //! identity.
 
@@ -180,9 +180,8 @@ mod tests {
         set_topology(&project, Topology::Sharded);
 
         // Refuse only the default shard's own URL — `ProjectLayout::DATABASE` ("lyracore") is a
-        // PREFIX of every other shard's name ("lyracore-kalimdor", "lyracore-elwynn",
-        // "lyracore-realm"), so the needle has to be the exact path segment or it refuses all of
-        // them.
+        // PREFIX of every other shard's name ("lyracore-kalimdor", "lyracore-realm"), so the
+        // needle has to be the exact path segment or it refuses all of them.
         let needle = format!("/database/{}/call/", ProjectLayout::DATABASE);
         let http = FakeHttp::refusing(&needle, "no player named 'Ginger' here");
         gm(&project, &FakeStack::new().runner(), &http, "Ginger", true).unwrap();

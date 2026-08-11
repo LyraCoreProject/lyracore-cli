@@ -46,8 +46,8 @@ USAGE:
                                                deliberately not exposed here
   lyracore publish --skip-preflight [DB ...]   publish without running the offline checks
                                                (preflight) first
-  lyracore dev up                              start (or reuse) the local realm: four databases
-                                               with a live shard seam across Elwynn
+  lyracore dev up                              start (or reuse) the local realm: three databases
+                                               — Eastern Kingdoms, Kalimdor, and realm-core
   lyracore dev up --single                     a one-database setup instead, for a quicker
                                                local test — skips the multi-database sharded
                                                configuration
@@ -229,7 +229,7 @@ impl Command {
 ///
 /// The two options are orthogonal — `--single` chooses how many databases, `--lan` chooses who can
 /// reach the two client-facing ports — so refusing to combine them would only mean a contributor
-/// debugging a seam on a LAN client had to go back to hand-rolling the launch.
+/// debugging a sharded realm from a LAN client had to go back to hand-rolling the launch.
 fn parse_dev_up(args: &[&str]) -> Result<Command> {
     let mut bind = ClientBind::Loopback;
     let mut topology = Topology::Sharded;
