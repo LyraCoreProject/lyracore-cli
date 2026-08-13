@@ -169,8 +169,11 @@ fn check_versions(
     };
     let Ok(banner) = runner.run_capturing_stderr(&CommandSpec::new("spacetime").arg("--version"))
     else {
-        // Soft-skip: a sandbox without the CLI still gets every other check.
-        println!("SKIP: no `spacetime` on PATH — CLI version not checked");
+        println!("FAIL: no `spacetime` on PATH — CLI version and schema not checked");
+        failures.bad(format!(
+            "`spacetime` is required for a complete deploy gate. Install the pinned {pinned} CLI:\n    \
+             curl -sSf https://install.spacetimedb.com | sh -s -- --version {pinned}"
+        ));
         return false;
     };
     match parse_version(&banner) {
@@ -560,15 +563,15 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_without_the_spacetime_cli_skips_rather_than_fails() {
-        // A sandbox with no CLI still gets checks 1 and 4; it just cannot validate a schema.
+    fn a_machine_without_the_spacetime_cli_fails_but_keeps_running_other_checks() {
         let tmp = TempDir::new().unwrap();
         let project = fixture(&tmp);
         let stack = FakeStack::new().fail_on("spacetime --version", "command not found");
         let mut failures = Failures::default();
         let have_cli = check_versions(&project, &stack.runner(), &mut failures);
         assert!(!have_cli);
-        assert!(failures.0.is_empty(), "{:?}", failures.0);
+        assert_eq!(failures.0.len(), 1, "{:?}", failures.0);
+        assert!(failures.0[0].contains("required"), "{:?}", failures.0);
     }
 
     #[test]

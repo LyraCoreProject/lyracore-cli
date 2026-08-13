@@ -20,7 +20,10 @@
 //! back out of the gateway's own log ([`DevManager::verify_topology`]), and `status` reports every
 //! database rather than the default one.
 
-use crate::cmd::{preflight, publish};
+use crate::cmd::{
+    gateway_log::{connected_shards, CONNECTED_MARKER},
+    preflight, publish,
+};
 use crate::harness::{self, Harness};
 use crate::http::HttpClient;
 use crate::proc::{start_signature, CommandSpec, ProcessInspector, ProcessRunner};
@@ -45,11 +48,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// world listeners, so by the time the world port answers the lines are already written. This is
 /// slack for the log file's own buffering, not for the connections.
 const TOPOLOGY_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The gateway's per-shard connection line (`gateway/src/stdb/connection.rs`). Matching on the
-/// PHRASE as well as the database name is what lets an older gateway — one that does not log this
-/// at all — be reported as "unverifiable" rather than as a collapsed realm.
-const CONNECTED_MARKER: &str = "coordinator connected to shard";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ComponentStatus {
@@ -961,32 +959,6 @@ fn describe_command(database: &str) -> CommandSpec {
         .arg(database)
 }
 
-/// The databases a gateway log says the coordinator actually connected to, in the order it
-/// connected them.
-fn connected_shards(log: &str) -> Vec<String> {
-    let mut seen = Vec::new();
-    for name in log
-        .lines()
-        .filter_map(|line| line.split_once(CONNECTED_MARKER))
-        .filter_map(|(_, tail)| tail.split_whitespace().next())
-        // The marker phrase also appears QUOTED inside the gateway's own diagnostics (the
-        // motion-relay warn cites "`coordinator connected to shard`" as advice) — there the next
-        // token is a lone backtick, and 43 minutes of a degraded gateway once read as "258 of 4
-        // databases". Only a plausible database name counts as a connection line.
-        .filter(|t| {
-            !t.is_empty()
-                && t.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        })
-    {
-        // Dedup, order-preserving: a reconnecting coordinator logs the line again.
-        if !seen.iter().any(|s| s == name) {
-            seen.push(name.to_string());
-        }
-    }
-    seen
-}
-
 /// A list of database names for a human: `a, b and c`, or `none` for an empty one — which is a real
 /// case here (a publish that failed on the very first database has published nothing).
 fn render_list(names: &[&str]) -> String {
@@ -1885,7 +1857,10 @@ mod tests {
         sharded_up(&mut dev, &stack, &http).unwrap();
 
         assert!(
-            !stack.rendered().iter().any(|r| r.contains("claim_operator")),
+            !stack
+                .rendered()
+                .iter()
+                .any(|r| r.contains("claim_operator")),
             "claim_operator must not be shelled out: {:?}",
             stack.rendered()
         );

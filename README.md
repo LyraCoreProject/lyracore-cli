@@ -20,6 +20,7 @@ lyracore dev logs [spacetime|gateway]
 lyracore dev smoke
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
+lyracore production status --gateway-log PATH --realm-core DB DATABASE ...
 ```
 
 Runtime state lives in the git-ignored `.lyracore/` of the target checkout — `state.json` for the
@@ -47,6 +48,22 @@ Every check runs even after one fails, so a run hands back every problem rather 
 attempt. Check 0 is an EXACT match, unlike `doctor`'s minimum-version floor: newer is not fine when
 a publish is the thing being gated. Where `spacetimedb-standalone` is unavailable,
 `PREFLIGHT_SKIP_SCHEMA=1` skips check 2 — and then nothing validates your `#[default]` encodings.
+The SpacetimeDB CLI itself is mandatory: if it is absent, preflight still runs the independent
+checks but exits nonzero and refuses to call the gate complete.
+
+## `production status` — explicit, read-only topology verification
+
+```bash
+lyracore production status --gateway-log /tmp/gw.log \
+  --realm-core lyracore-realm \
+  lyracore lyracore-world-1 lyracore-instances lyracore-realm
+```
+
+Production status never substitutes the contributor fixture's database names. It checks that each
+named database has a reachable published schema, then reads only the latest gateway-start segment
+and reports the configured set, one coordinator connection per database, realm-core activation,
+listeners, startup errors, realm-address mismatch, and missing writer-occupancy metrics. It is
+strictly observational: no publish, reducer, SQL write, signal, or restart is available through it.
 
 ## `publish` — the one correct deploy
 
