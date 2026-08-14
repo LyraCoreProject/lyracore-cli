@@ -260,15 +260,25 @@ pub fn schema_command(project: &ProjectLayout, out_dir: &Path) -> CommandSpec {
 
 /// The verdict lines out of a chatty extractor log, falling back to the whole thing.
 fn verdict_lines(text: &str) -> String {
-    let verdicts: Vec<&str> = text
-        .lines()
-        .filter(|line| {
-            ["error", "Error", "Failed to", "Caused by"]
-                .iter()
-                .any(|prefix| line.trim_start().starts_with(prefix))
-        })
-        .take(10)
-        .collect();
+    let mut verdicts = Vec::new();
+    let mut in_cause = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let is_verdict = ["error", "Error", "Failed to", "Caused by"]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix));
+        if is_verdict {
+            verdicts.push(line);
+            in_cause = trimmed.starts_with("Caused by");
+        } else if in_cause && trimmed.len() < line.len() && !trimmed.is_empty() {
+            verdicts.push(line);
+        } else if !trimmed.is_empty() {
+            in_cause = false;
+        }
+        if verdicts.len() == 10 {
+            break;
+        }
+    }
     if verdicts.is_empty() {
         text.trim().to_string()
     } else {
@@ -606,6 +616,21 @@ mod tests {
     }
 
     // ---- the commands the checks render ----
+
+    #[test]
+    fn extractor_verdict_keeps_an_indented_cause_without_chatty_build_output() {
+        let output = verdict_lines(
+            "Compiling spacetimedb-sdk v2.7.1\nError: could not extract schema\nCaused by:\n    \
+             spacetimedb-standalone exited before writing the schema\n    executable was not found \
+             on PATH\nFinished release build\n",
+        );
+
+        assert_eq!(
+            output,
+            "Error: could not extract schema\nCaused by:\n    spacetimedb-standalone exited before \
+             writing the schema\n    executable was not found on PATH"
+        );
+    }
 
     #[test]
     fn the_deploy_build_uses_the_feature_publish_bakes_in() {
