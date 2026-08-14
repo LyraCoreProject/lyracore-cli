@@ -172,7 +172,8 @@ fn check_versions(
         println!("FAIL: no `spacetime` on PATH — CLI version and schema not checked");
         failures.bad(format!(
             "`spacetime` is required for a complete deploy gate. Install the pinned {pinned} CLI:\n    \
-             curl -sSf https://install.spacetimedb.com | sh -s -- --version {pinned}"
+             curl -sSf https://install.spacetimedb.com | sh -s -- --version {pinned}\n  \
+             Then ensure `$HOME/.local/bin` is on PATH for non-interactive shells."
         ));
         return false;
     };
@@ -572,6 +573,11 @@ mod tests {
         assert!(!have_cli);
         assert_eq!(failures.0.len(), 1, "{:?}", failures.0);
         assert!(failures.0[0].contains("required"), "{:?}", failures.0);
+        assert!(
+            failures.0[0].contains(".local/bin"),
+            "missing-tool guidance must name the non-interactive SSH PATH location: {:?}",
+            failures.0
+        );
     }
 
     #[test]
@@ -759,6 +765,32 @@ mod tests {
         assert!(
             rendered.iter().any(|r| r.contains("spacetime generate")),
             "check 2 must still have run: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn missing_spacetime_fails_the_whole_gate_after_independent_checks_run() {
+        let tmp = TempDir::new().unwrap();
+        let project = fixture(&tmp);
+        let stack = FakeStack::new().fail_on("spacetime --version", "command not found");
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+        assert!(
+            error.to_string().contains("Nothing was published"),
+            "{error}"
+        );
+        let rendered = stack.rendered();
+        assert!(
+            rendered
+                .iter()
+                .any(|command| command.contains("cargo check")),
+            "the independent deploy build must still run: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|command| command.contains("spacetime generate")),
+            "schema extraction requires the missing CLI: {rendered:?}"
         );
     }
 

@@ -264,6 +264,11 @@ fn parse_production_status(args: &[&str]) -> Result<Command> {
         match *head {
             "--gateway-log" => match tail.split_first() {
                 Some((path, after)) if !path.starts_with('-') => {
+                    if gateway_log.is_some() {
+                        return Err(Error::Usage(
+                            "`production status --gateway-log` may be supplied only once".into(),
+                        ));
+                    }
                     gateway_log = Some((*path).to_string());
                     rest = after;
                 }
@@ -275,6 +280,11 @@ fn parse_production_status(args: &[&str]) -> Result<Command> {
             },
             "--realm-core" => match tail.split_first() {
                 Some((database, after)) if !database.starts_with('-') => {
+                    if realm_core.is_some() {
+                        return Err(Error::Usage(
+                            "`production status --realm-core` may be supplied only once".into(),
+                        ));
+                    }
                     realm_core = Some((*database).to_string());
                     rest = after;
                 }
@@ -781,6 +791,8 @@ mod tests {
             "production status --gateway-log /tmp/gw.log lyracore lyracore-realm",
             "production status --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore",
             "production status --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore-realm lyracore-realm",
+            "production status --gateway-log /tmp/one.log --gateway-log /tmp/two.log --realm-core lyracore-realm lyracore lyracore-realm",
+            "production status --gateway-log /tmp/gw.log --realm-core one --realm-core two lyracore one two",
         ] {
             assert!(parse(line).is_err(), "{line}");
         }

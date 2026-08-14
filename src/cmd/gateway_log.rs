@@ -11,6 +11,7 @@ pub(crate) struct GatewayEvidence {
     pub logon_listener: Option<String>,
     pub world_listener: Option<String>,
     pub startup_errors: usize,
+    pub coordinator_token_warning: bool,
     pub realm_address_warning: bool,
     pub metrics_warning: bool,
 }
@@ -45,9 +46,16 @@ impl GatewayEvidence {
             if let Some((_, tail)) = line.split_once("world listening on ") {
                 evidence.world_listener = tail.split_whitespace().next().map(str::to_string);
             }
-            if line.contains(" ERROR ") || line.contains(" panicked at ") {
+            let trimmed = line.trim_start();
+            if line.contains(" ERROR ")
+                || trimmed.starts_with("ERROR ")
+                || trimmed.starts_with("Error:")
+                || line.contains("panicked at")
+            {
                 evidence.startup_errors += 1;
             }
+            evidence.coordinator_token_warning |=
+                line.contains("LYRACORE_COORDINATOR_TOKEN is unset");
             evidence.realm_address_warning |= line.contains("realm advertises ");
             evidence.metrics_warning |= line.contains("LYRACORE_METRICS_DB_IDS is unset")
                 || line.contains("occupancy=unmeasured");
@@ -61,12 +69,14 @@ pub(crate) fn connected_shards(log: &str) -> Vec<String> {
 }
 
 fn plausible_database(candidate: Option<&str>) -> Option<&str> {
-    candidate.filter(|name| {
-        !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    })
+    candidate.filter(|name| is_database_name(name))
+}
+
+pub(crate) fn is_database_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 fn push_unique(names: &mut Vec<String>, name: &str) {

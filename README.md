@@ -59,11 +59,13 @@ lyracore production status --gateway-log /tmp/gw.log \
   lyracore lyracore-world-1 lyracore-instances lyracore-realm
 ```
 
-Production status never substitutes the contributor fixture's database names. It checks that each
-named database has a reachable published schema, then reads only the latest gateway-start segment
-and reports the configured set, one coordinator connection per database, realm-core activation,
-listeners, startup errors, realm-address mismatch, and missing writer-occupancy metrics. It is
-strictly observational: no publish, reducer, SQL write, signal, or restart is available through it.
+Production status never substitutes the contributor fixture's database names. It distinguishes
+databases missing from `spacetime list -s local` from published schemas that cannot be reached,
+then reads only the latest gateway-start segment and reports the configured set, one coordinator
+connection per database, coordinator credential warnings, realm-core activation, listeners,
+startup errors, realm-address mismatch, and missing writer-occupancy metrics. Warnings leave the
+exit code at zero but the summary says `WARNINGS`, never `HEALTHY`. It is strictly observational:
+no publish, reducer, SQL write, signal, or restart is available through it.
 
 ## `publish` — the one correct deploy
 

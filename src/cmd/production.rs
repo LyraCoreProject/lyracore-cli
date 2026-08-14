@@ -1,6 +1,6 @@
 //! Read-only status for an explicitly named production topology.
 
-use crate::cmd::gateway_log::GatewayEvidence;
+use crate::cmd::gateway_log::{is_database_name, GatewayEvidence};
 use crate::proc::{CommandSpec, ProcessRunner};
 use std::path::PathBuf;
 
@@ -50,9 +50,25 @@ impl StatusReport {
     }
 
     pub fn blocking(&self) -> bool {
-        self.checks
+        self.outcome() == Outcome::Fail
+    }
+
+    pub fn outcome(&self) -> Outcome {
+        if self
+            .checks
             .iter()
             .any(|check| check.outcome == Outcome::Fail)
+        {
+            Outcome::Fail
+        } else if self
+            .checks
+            .iter()
+            .any(|check| check.outcome == Outcome::Warn)
+        {
+            Outcome::Warn
+        } else {
+            Outcome::Pass
+        }
     }
 }
 
@@ -63,6 +79,24 @@ fn describe_command(database: &str) -> CommandSpec {
         .arg("-s")
         .arg("local")
         .arg(database)
+}
+
+fn inventory_command() -> CommandSpec {
+    CommandSpec::new("spacetime")
+        .arg("list")
+        .arg("-s")
+        .arg("local")
+}
+
+fn inventory_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once('|').map(|(names, _)| names))
+        .flat_map(|names| names.split(','))
+        .map(str::trim)
+        .filter(|name| is_database_name(name))
+        .map(str::to_string)
+        .collect()
 }
 
 fn same_set(left: &[String], right: &[String]) -> bool {
@@ -76,10 +110,40 @@ pub fn inspect(options: &StatusOptions, runner: &dyn ProcessRunner) -> StatusRep
         Err(error) => report.check("SpacetimeDB CLI", Outcome::Fail, error.to_string()),
     }
 
+    match runner.run_and_wait(&inventory_command()) {
+        Ok(output) => {
+            let inventory = inventory_names(&output);
+            for database in &options.databases {
+                report.check(
+                    format!("inventory {database}"),
+                    if inventory.contains(database) {
+                        Outcome::Pass
+                    } else {
+                        Outcome::Fail
+                    },
+                    if inventory.contains(database) {
+                        "present in `spacetime list -s local`"
+                    } else {
+                        "missing from `spacetime list -s local`"
+                    },
+                );
+            }
+        }
+        Err(error) => report.check("database inventory", Outcome::Fail, error.to_string()),
+    }
+
     for database in &options.databases {
         match runner.run_and_wait(&describe_command(database)) {
-            Ok(_) => report.check(database, Outcome::Pass, "published schema is reachable"),
-            Err(error) => report.check(database, Outcome::Fail, error.to_string()),
+            Ok(_) => report.check(
+                format!("reachability {database}"),
+                Outcome::Pass,
+                "published schema is reachable",
+            ),
+            Err(error) => report.check(
+                format!("reachability {database}"),
+                Outcome::Fail,
+                error.to_string(),
+            ),
         }
     }
 
@@ -186,6 +250,19 @@ pub fn inspect(options: &StatusOptions, runner: &dyn ProcessRunner) -> StatusRep
         evidence.startup_errors.to_string(),
     );
     report.check(
+        "coordinator credential",
+        if evidence.coordinator_token_warning {
+            Outcome::Fail
+        } else {
+            Outcome::Pass
+        },
+        if evidence.coordinator_token_warning {
+            "LYRACORE_COORDINATOR_TOKEN is unset; private account and session tables are unavailable"
+        } else {
+            "no missing-token warning in the latest start"
+        },
+    );
+    report.check(
         "realm address",
         if evidence.realm_address_warning {
             Outcome::Warn
@@ -193,7 +270,7 @@ pub fn inspect(options: &StatusOptions, runner: &dyn ProcessRunner) -> StatusRep
             Outcome::Pass
         },
         if evidence.realm_address_warning {
-            "gateway reported an advertised-address/listener mismatch"
+            "public listener plus loopback realm address will bounce remote clients to realm select; run `set_realm_address` on every database"
         } else {
             "no mismatch warning in the latest start"
         },
@@ -206,7 +283,7 @@ pub fn inspect(options: &StatusOptions, runner: &dyn ProcessRunner) -> StatusRep
             Outcome::Pass
         },
         if evidence.metrics_warning {
-            "LYRACORE_METRICS_DB_IDS is absent or occupancy is unmeasured"
+            "writer occupancy is unmeasured; configure LYRACORE_METRICS_DB_IDS for every shard"
         } else {
             "no missing-metrics warning in the latest start"
         },
@@ -226,10 +303,10 @@ pub fn report(status: &StatusReport) {
     }
     println!(
         "production status: {}",
-        if status.blocking() {
-            "FAILED"
-        } else {
-            "HEALTHY"
+        match status.outcome() {
+            Outcome::Pass => "HEALTHY",
+            Outcome::Warn => "WARNINGS",
+            Outcome::Fail => "FAILED",
         }
     );
 }
@@ -267,10 +344,25 @@ mod tests {
          world listening on 0.0.0.0:8085\n"
     }
 
+    fn inventory() -> &'static str {
+        "Associated databases for user deadbeef:\n\n\
+         Database Name(s)     | Identity\n\
+         ---------------------+---------\n\
+         lyracore             | 01\n\
+         lyracore-world-1     | 02\n\
+         lyracore-instances   | 03\n\
+         lyracore-realm       | 04\n"
+    }
+
+    fn healthy_stack() -> FakeStack {
+        FakeStack::new().with_stdout("spacetime list -s local", inventory())
+    }
+
     #[test]
     fn a_real_production_topology_passes_without_fixture_names() {
         let tmp = TempDir::new().unwrap();
-        let status = inspect(&options(&tmp, healthy_log()), &FakeStack::new().runner());
+        let stack = healthy_stack();
+        let status = inspect(&options(&tmp, healthy_log()), &stack.runner());
         assert!(!status.blocking(), "{status:?}");
         assert!(status.checks.iter().any(|check| {
             check.label == "connection lyracore-world-1" && check.outcome == Outcome::Pass
@@ -279,13 +371,25 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.label.contains("kalimdor")));
+        assert_eq!(
+            stack.rendered(),
+            vec![
+                "spacetime --version",
+                "spacetime list -s local",
+                "spacetime describe --json -s local lyracore",
+                "spacetime describe --json -s local lyracore-world-1",
+                "spacetime describe --json -s local lyracore-instances",
+                "spacetime describe --json -s local lyracore-realm",
+            ],
+            "production status must remain a read-only inventory probe"
+        );
     }
 
     #[test]
     fn a_configured_but_disconnected_shard_is_a_failure() {
         let tmp = TempDir::new().unwrap();
         let log = healthy_log().replace("coordinator connected to shard lyracore-instances\n", "");
-        let status = inspect(&options(&tmp, &log), &FakeStack::new().runner());
+        let status = inspect(&options(&tmp, &log), &healthy_stack().runner());
         assert!(status.blocking());
         assert!(status.checks.iter().any(|check| {
             check.label == "connection lyracore-instances" && check.outcome == Outcome::Fail
@@ -300,8 +404,9 @@ mod tests {
              WARN LYRACORE_METRICS_DB_IDS is unset\n",
             healthy_log()
         );
-        let status = inspect(&options(&tmp, &log), &FakeStack::new().runner());
+        let status = inspect(&options(&tmp, &log), &healthy_stack().runner());
         assert!(!status.blocking());
+        assert_eq!(status.outcome(), Outcome::Warn);
         assert_eq!(
             status
                 .checks
@@ -310,22 +415,69 @@ mod tests {
                 .count(),
             2
         );
+        let realm_address = status
+            .checks
+            .iter()
+            .find(|check| check.label == "realm address")
+            .unwrap();
+        assert!(realm_address.detail.contains("bounce"), "{realm_address:?}");
+        assert!(
+            realm_address.detail.contains("set_realm_address"),
+            "{realm_address:?}"
+        );
+        assert!(
+            realm_address.detail.contains("every database"),
+            "{realm_address:?}"
+        );
     }
 
     #[test]
     fn an_unreachable_database_is_distinct_from_a_missing_connection() {
         let tmp = TempDir::new().unwrap();
-        let stack = FakeStack::new().fail_on(
+        let stack = healthy_stack().fail_on(
             "spacetime describe --json -s local lyracore-world-1",
             "not found",
         );
         let status = inspect(&options(&tmp, healthy_log()), &stack.runner());
-        assert!(status
-            .checks
-            .iter()
-            .any(|check| { check.label == "lyracore-world-1" && check.outcome == Outcome::Fail }));
+        assert!(status.checks.iter().any(|check| {
+            check.label == "reachability lyracore-world-1" && check.outcome == Outcome::Fail
+        }));
         assert!(status.checks.iter().any(|check| {
             check.label == "connection lyracore-world-1" && check.outcome == Outcome::Pass
+        }));
+    }
+
+    #[test]
+    fn missing_inventory_is_distinct_from_database_reachability() {
+        let tmp = TempDir::new().unwrap();
+        let stack = FakeStack::new().with_stdout(
+            "spacetime list -s local",
+            &inventory().replace("lyracore-world-1     | 02\n", ""),
+        );
+        let status = inspect(&options(&tmp, healthy_log()), &stack.runner());
+        assert!(status.checks.iter().any(|check| {
+            check.label == "inventory lyracore-world-1" && check.outcome == Outcome::Fail
+        }));
+        assert!(status.checks.iter().any(|check| {
+            check.label == "reachability lyracore-world-1" && check.outcome == Outcome::Pass
+        }));
+    }
+
+    #[test]
+    fn missing_coordinator_token_and_fatal_log_lines_are_blocking() {
+        let tmp = TempDir::new().unwrap();
+        let log = format!(
+            "{}WARN LYRACORE_COORDINATOR_TOKEN is unset; private tables are unavailable\n\
+             ERROR coordinator startup failed\n\
+             Error: gateway task exited\n",
+            healthy_log()
+        );
+        let status = inspect(&options(&tmp, &log), &healthy_stack().runner());
+        assert!(status.checks.iter().any(|check| {
+            check.label == "coordinator credential" && check.outcome == Outcome::Fail
+        }));
+        assert!(status.checks.iter().any(|check| {
+            check.label == "startup errors" && check.outcome == Outcome::Fail && check.detail == "2"
         }));
     }
 }
