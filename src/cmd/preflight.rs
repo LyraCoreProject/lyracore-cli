@@ -291,11 +291,20 @@ fn check_schema(
     runner: &dyn ProcessRunner,
     scratch: &Path,
     have_cli: bool,
+    skip_schema: bool,
     failures: &mut Failures,
 ) -> bool {
     step("module schema + #[default] values validate (offline wasm schema extraction)");
-    if !have_cli || std::env::var_os(SKIP_SCHEMA_VAR).is_some() {
-        println!("SKIP: no `spacetime` on PATH (or {SKIP_SCHEMA_VAR} set) — schema not validated");
+    if !have_cli {
+        println!("SKIP: no `spacetime` on PATH — schema not validated");
+        return false;
+    }
+    if skip_schema {
+        println!("SKIP: {SKIP_SCHEMA_VAR} is set — schema not validated");
+        failures.bad(format!(
+            "{SKIP_SCHEMA_VAR} bypassed the deployment-critical schema check; this preflight \
+             cannot approve a publish"
+        ));
         return false;
     }
     match runner.run_and_wait(&schema_command(project, scratch)) {
@@ -308,8 +317,9 @@ fn check_schema(
             failures.bad(format!(
                 "the module schema is invalid — `spacetime publish` would reject this migration \
                  (see above). If the failure above is the EXTRACTOR itself (no \
-                 spacetimedb-standalone), re-run with {SKIP_SCHEMA_VAR}=1 — but then nothing \
-                 validates your #[default] encodings."
+                 spacetimedb-standalone), re-run with {SKIP_SCHEMA_VAR}=1 to collect the remaining \
+                 diagnostics; preflight will still fail because nothing validated your #[default] \
+                 encodings."
             ));
             false
         }
@@ -492,13 +502,28 @@ fn check_db_threading(project: &ProjectLayout, failures: &mut Failures) {
 
 /// Run every check. Returns `Err` if any of them failed.
 pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
+    run_with_schema_skip(project, runner, std::env::var_os(SKIP_SCHEMA_VAR).is_some())
+}
+
+fn run_with_schema_skip(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    skip_schema: bool,
+) -> Result<()> {
     let mut failures = Failures::default();
 
     let have_cli = check_versions(project, runner, &mut failures);
     check_deploy_build(project, runner, &mut failures);
 
     let scratch = ScratchDir::new()?;
-    let generated = check_schema(project, runner, scratch.path(), have_cli, &mut failures);
+    let generated = check_schema(
+        project,
+        runner,
+        scratch.path(),
+        have_cli,
+        skip_schema,
+        &mut failures,
+    );
     check_rls(project, generated.then(|| scratch.path()), &mut failures);
     check_db_threading(project, &mut failures);
 
@@ -816,6 +841,32 @@ mod tests {
                 .iter()
                 .any(|command| command.contains("spacetime generate")),
             "schema extraction requires the missing CLI: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn explicitly_skipped_schema_is_a_blocker_after_independent_checks_run() {
+        let tmp = TempDir::new().unwrap();
+        let project = fixture(&tmp);
+        let stack = FakeStack::new();
+
+        let error = run_with_schema_skip(&project, &stack.runner(), true).unwrap_err();
+        assert!(
+            error.to_string().contains("Nothing was published"),
+            "{error}"
+        );
+        let rendered = stack.rendered();
+        assert!(
+            rendered
+                .iter()
+                .any(|command| command.contains("cargo check")),
+            "the independent deploy build must still run: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|command| command.contains("spacetime generate")),
+            "the explicit skip must bypass extraction: {rendered:?}"
         );
     }
 

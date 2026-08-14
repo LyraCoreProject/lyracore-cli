@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusOptions {
+    pub server: String,
     pub gateway_log: PathBuf,
     pub realm_core: String,
     pub databases: Vec<String>,
@@ -72,20 +73,20 @@ impl StatusReport {
     }
 }
 
-fn describe_command(database: &str) -> CommandSpec {
+fn describe_command(server: &str, database: &str) -> CommandSpec {
     CommandSpec::new("spacetime")
         .arg("describe")
         .arg("--json")
         .arg("-s")
-        .arg("local")
+        .arg(server)
         .arg(database)
 }
 
-fn inventory_command() -> CommandSpec {
+fn inventory_command(server: &str) -> CommandSpec {
     CommandSpec::new("spacetime")
         .arg("list")
         .arg("-s")
-        .arg("local")
+        .arg(server)
 }
 
 fn inventory_names(output: &str) -> Vec<String> {
@@ -110,7 +111,7 @@ pub fn inspect(options: &StatusOptions, runner: &dyn ProcessRunner) -> StatusRep
         Err(error) => report.check("SpacetimeDB CLI", Outcome::Fail, error.to_string()),
     }
 
-    match runner.run_and_wait(&inventory_command()) {
+    match runner.run_and_wait(&inventory_command(&options.server)) {
         Ok(output) => {
             let inventory = inventory_names(&output);
             for database in &options.databases {
@@ -122,9 +123,9 @@ pub fn inspect(options: &StatusOptions, runner: &dyn ProcessRunner) -> StatusRep
                         Outcome::Fail
                     },
                     if inventory.contains(database) {
-                        "present in `spacetime list -s local`"
+                        format!("present in `spacetime list -s {}`", options.server)
                     } else {
-                        "missing from `spacetime list -s local`"
+                        format!("missing from `spacetime list -s {}`", options.server)
                     },
                 );
             }
@@ -133,7 +134,7 @@ pub fn inspect(options: &StatusOptions, runner: &dyn ProcessRunner) -> StatusRep
     }
 
     for database in &options.databases {
-        match runner.run_and_wait(&describe_command(database)) {
+        match runner.run_and_wait(&describe_command(&options.server, database)) {
             Ok(_) => report.check(
                 format!("reachability {database}"),
                 Outcome::Pass,
@@ -321,6 +322,7 @@ mod tests {
         let gateway_log = tmp.path().join("gateway.log");
         std::fs::write(&gateway_log, log).unwrap();
         StatusOptions {
+            server: "http://127.0.0.1:3000".into(),
             gateway_log,
             realm_core: "lyracore-realm".into(),
             databases: vec![
@@ -355,7 +357,7 @@ mod tests {
     }
 
     fn healthy_stack() -> FakeStack {
-        FakeStack::new().with_stdout("spacetime list -s local", inventory())
+        FakeStack::new().with_stdout("spacetime list -s http://127.0.0.1:3000", inventory())
     }
 
     #[test]
@@ -375,11 +377,11 @@ mod tests {
             stack.rendered(),
             vec![
                 "spacetime --version",
-                "spacetime list -s local",
-                "spacetime describe --json -s local lyracore",
-                "spacetime describe --json -s local lyracore-world-1",
-                "spacetime describe --json -s local lyracore-instances",
-                "spacetime describe --json -s local lyracore-realm",
+                "spacetime list -s http://127.0.0.1:3000",
+                "spacetime describe --json -s http://127.0.0.1:3000 lyracore",
+                "spacetime describe --json -s http://127.0.0.1:3000 lyracore-world-1",
+                "spacetime describe --json -s http://127.0.0.1:3000 lyracore-instances",
+                "spacetime describe --json -s http://127.0.0.1:3000 lyracore-realm",
             ],
             "production status must remain a read-only inventory probe"
         );
@@ -435,7 +437,7 @@ mod tests {
     fn an_unreachable_database_is_distinct_from_a_missing_connection() {
         let tmp = TempDir::new().unwrap();
         let stack = healthy_stack().fail_on(
-            "spacetime describe --json -s local lyracore-world-1",
+            "spacetime describe --json -s http://127.0.0.1:3000 lyracore-world-1",
             "not found",
         );
         let status = inspect(&options(&tmp, healthy_log()), &stack.runner());
@@ -451,7 +453,7 @@ mod tests {
     fn missing_inventory_is_distinct_from_database_reachability() {
         let tmp = TempDir::new().unwrap();
         let stack = FakeStack::new().with_stdout(
-            "spacetime list -s local",
+            "spacetime list -s http://127.0.0.1:3000",
             &inventory().replace("lyracore-world-1     | 02\n", ""),
         );
         let status = inspect(&options(&tmp, healthy_log()), &stack.runner());

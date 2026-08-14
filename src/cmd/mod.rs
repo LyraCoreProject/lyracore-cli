@@ -83,7 +83,7 @@ USAGE:
                                                directory, so `import` and `doctor` stop asking
   lyracore character gm NAME true|false        grant (true) or revoke (false) GM level for a
                                                character — tries every world shard in turn
-  lyracore production status --gateway-log PATH --realm-core DB DATABASE ...
+  lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
                                                read-only production topology, schema, connection,
                                                realm-core and listener verdicts
   lyracore update                              pull the latest checkout in place and restart the
@@ -241,7 +241,8 @@ impl Command {
 
             ["production", "status", rest @ ..] => parse_production_status(rest),
             ["production", ..] => Err(Error::Usage(
-                "`production` supports: status --gateway-log PATH --realm-core DB DATABASE ..."
+                "`production` supports: status --server URI --gateway-log PATH --realm-core DB \
+                 DATABASE ..."
                     .to_string(),
             )),
 
@@ -256,12 +257,29 @@ impl Command {
 }
 
 fn parse_production_status(args: &[&str]) -> Result<Command> {
+    let mut server = None;
     let mut gateway_log = None;
     let mut realm_core = None;
     let mut names = Vec::new();
     let mut rest = args;
     while let Some((head, tail)) = rest.split_first() {
         match *head {
+            "--server" => match tail.split_first() {
+                Some((value, after)) if !value.starts_with('-') => {
+                    if server.is_some() {
+                        return Err(Error::Usage(
+                            "`production status --server` may be supplied only once".into(),
+                        ));
+                    }
+                    server = Some((*value).to_string());
+                    rest = after;
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "`production status --server` needs a nickname, host, or URL".into(),
+                    ))
+                }
+            },
             "--gateway-log" => match tail.split_first() {
                 Some((path, after)) if !path.starts_with('-') => {
                     if gateway_log.is_some() {
@@ -306,6 +324,9 @@ fn parse_production_status(args: &[&str]) -> Result<Command> {
         }
     }
 
+    let server = server.ok_or_else(|| {
+        Error::Usage("`production status` needs --server NICKNAME|HOST|URL".to_string())
+    })?;
     let gateway_log = gateway_log
         .ok_or_else(|| Error::Usage("`production status` needs --gateway-log PATH".to_string()))?;
     let realm_core = realm_core.ok_or_else(|| {
@@ -331,6 +352,7 @@ fn parse_production_status(args: &[&str]) -> Result<Command> {
         )));
     }
     Ok(Command::ProductionStatus(production::StatusOptions {
+        server,
         gateway_log: gateway_log.into(),
         realm_core,
         databases,
@@ -767,11 +789,13 @@ mod tests {
     fn production_status_requires_an_explicit_topology_and_log() {
         assert_eq!(
             parse(
-                "production status --gateway-log /tmp/gw.log --realm-core lyracore-realm \
+                "production status --server http://127.0.0.1:3000 --gateway-log /tmp/gw.log \
+                 --realm-core lyracore-realm \
                  lyracore lyracore-world-1 lyracore-instances lyracore-realm"
             )
             .unwrap(),
             Command::ProductionStatus(production::StatusOptions {
+                server: "http://127.0.0.1:3000".into(),
                 gateway_log: "/tmp/gw.log".into(),
                 realm_core: "lyracore-realm".into(),
                 databases: vec![
@@ -787,15 +811,34 @@ mod tests {
     #[test]
     fn production_status_refuses_implicit_or_ambiguous_topology() {
         for line in [
-            "production status --realm-core lyracore-realm lyracore lyracore-realm",
-            "production status --gateway-log /tmp/gw.log lyracore lyracore-realm",
-            "production status --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore",
-            "production status --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore-realm lyracore-realm",
-            "production status --gateway-log /tmp/one.log --gateway-log /tmp/two.log --realm-core lyracore-realm lyracore lyracore-realm",
-            "production status --gateway-log /tmp/gw.log --realm-core one --realm-core two lyracore one two",
+            "production status --server local --realm-core lyracore-realm lyracore lyracore-realm",
+            "production status --server local --gateway-log /tmp/gw.log lyracore lyracore-realm",
+            "production status --server local --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore",
+            "production status --server local --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore-realm lyracore-realm",
+            "production status --server local --gateway-log /tmp/one.log --gateway-log /tmp/two.log --realm-core lyracore-realm lyracore lyracore-realm",
+            "production status --server local --gateway-log /tmp/gw.log --realm-core one --realm-core two lyracore one two",
         ] {
             assert!(parse(line).is_err(), "{line}");
         }
+    }
+
+    #[test]
+    fn production_status_requires_one_explicit_spacetime_server() {
+        assert!(parse(
+            "production status --server http://127.0.0.1:3000 --gateway-log /tmp/gw.log \
+             --realm-core lyracore-realm lyracore lyracore-realm"
+        )
+        .is_ok());
+        assert!(parse(
+            "production status --gateway-log /tmp/gw.log --realm-core lyracore-realm \
+             lyracore lyracore-realm"
+        )
+        .is_err());
+        assert!(parse(
+            "production status --server local --server http://127.0.0.1:3000 \
+             --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore lyracore-realm"
+        )
+        .is_err());
     }
 
     #[test]

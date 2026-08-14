@@ -20,7 +20,7 @@ lyracore dev logs [spacetime|gateway]
 lyracore dev smoke
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
-lyracore production status --gateway-log PATH --realm-core DB DATABASE ...
+lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
 ```
 
 Runtime state lives in the git-ignored `.lyracore/` of the target checkout — `state.json` for the
@@ -47,20 +47,23 @@ call, no sql, no database, so it is safe to run against a live stack. Five check
 Every check runs even after one fails, so a run hands back every problem rather than one per
 attempt. Check 0 is an EXACT match, unlike `doctor`'s minimum-version floor: newer is not fine when
 a publish is the thing being gated. Where `spacetimedb-standalone` is unavailable,
-`PREFLIGHT_SKIP_SCHEMA=1` skips check 2 — and then nothing validates your `#[default]` encodings.
+`PREFLIGHT_SKIP_SCHEMA=1` skips check 2, records a blocking failure, and continues the independent
+checks. The bypass can collect the remaining evidence but cannot approve a publish because nothing
+validated your `#[default]` encodings.
 The SpacetimeDB CLI itself is mandatory: if it is absent, preflight still runs the independent
 checks but exits nonzero and refuses to call the gate complete.
 
 ## `production status` — explicit, read-only topology verification
 
 ```bash
-lyracore production status --gateway-log /tmp/gw.log \
+lyracore production status --server http://127.0.0.1:3000 --gateway-log /tmp/gw.log \
   --realm-core lyracore-realm \
   lyracore lyracore-world-1 lyracore-instances lyracore-realm
 ```
 
-Production status never substitutes the contributor fixture's database names. It distinguishes
-databases missing from `spacetime list -s local` from published schemas that cannot be reached,
+Production status requires the SpacetimeDB server nickname, host, or URL and never substitutes
+`local` or the contributor fixture's database names. It distinguishes databases missing from
+`spacetime list -s <server>` from published schemas that cannot be reached,
 then reads only the latest gateway-start segment and reports the configured set, one coordinator
 connection per database, coordinator credential warnings, realm-core activation, listeners,
 startup errors, realm-address mismatch, and missing writer-occupancy metrics. Warnings leave the
