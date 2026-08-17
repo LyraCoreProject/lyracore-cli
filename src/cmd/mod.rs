@@ -3,8 +3,10 @@ pub mod character;
 pub mod config;
 pub mod dev;
 pub mod doctor;
+mod gateway_log;
 pub mod import;
 pub mod preflight;
+pub mod production;
 pub mod publish;
 pub mod update;
 
@@ -81,6 +83,9 @@ USAGE:
                                                directory, so `import` and `doctor` stop asking
   lyracore character gm NAME true|false        grant (true) or revoke (false) GM level for a
                                                character — tries every world shard in turn
+  lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
+                                               read-only production topology, schema, connection,
+                                               realm-core and listener verdicts
   lyracore update                              pull the latest checkout in place and restart the
                                                local dev stack (refuses over a dirty working tree)
 
@@ -121,6 +126,7 @@ pub enum Command {
         name: String,
         enabled: bool,
     },
+    ProductionStatus(production::StatusOptions),
     Update,
     Help,
     HelpAll,
@@ -233,6 +239,13 @@ impl Command {
                 "`character` supports: gm NAME true|false".to_string(),
             )),
 
+            ["production", "status", rest @ ..] => parse_production_status(rest),
+            ["production", ..] => Err(Error::Usage(
+                "`production` supports: status --server URI --gateway-log PATH --realm-core DB \
+                 DATABASE ..."
+                    .to_string(),
+            )),
+
             ["update"] => Ok(Command::Update),
             ["update", other, ..] => Err(Error::Usage(format!(
                 "`update` takes no arguments (got '{other}')"
@@ -241,6 +254,109 @@ impl Command {
             [other, ..] => Err(Error::Usage(format!("unknown command '{other}'"))),
         }
     }
+}
+
+fn parse_production_status(args: &[&str]) -> Result<Command> {
+    let mut server = None;
+    let mut gateway_log = None;
+    let mut realm_core = None;
+    let mut names = Vec::new();
+    let mut rest = args;
+    while let Some((head, tail)) = rest.split_first() {
+        match *head {
+            "--server" => match tail.split_first() {
+                Some((value, after)) if !value.starts_with('-') => {
+                    if server.is_some() {
+                        return Err(Error::Usage(
+                            "`production status --server` may be supplied only once".into(),
+                        ));
+                    }
+                    server = Some((*value).to_string());
+                    rest = after;
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "`production status --server` needs a nickname, host, or URL".into(),
+                    ))
+                }
+            },
+            "--gateway-log" => match tail.split_first() {
+                Some((path, after)) if !path.starts_with('-') => {
+                    if gateway_log.is_some() {
+                        return Err(Error::Usage(
+                            "`production status --gateway-log` may be supplied only once".into(),
+                        ));
+                    }
+                    gateway_log = Some((*path).to_string());
+                    rest = after;
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "`production status --gateway-log` needs a path".into(),
+                    ))
+                }
+            },
+            "--realm-core" => match tail.split_first() {
+                Some((database, after)) if !database.starts_with('-') => {
+                    if realm_core.is_some() {
+                        return Err(Error::Usage(
+                            "`production status --realm-core` may be supplied only once".into(),
+                        ));
+                    }
+                    realm_core = Some((*database).to_string());
+                    rest = after;
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "`production status --realm-core` needs a database name".into(),
+                    ))
+                }
+            },
+            option if option.starts_with('-') => {
+                return Err(Error::Usage(format!(
+                    "unknown `production status` option '{option}'"
+                )))
+            }
+            database => {
+                names.push(database.to_string());
+                rest = tail;
+            }
+        }
+    }
+
+    let server = server.ok_or_else(|| {
+        Error::Usage("`production status` needs --server NICKNAME|HOST|URL".to_string())
+    })?;
+    let gateway_log = gateway_log
+        .ok_or_else(|| Error::Usage("`production status` needs --gateway-log PATH".to_string()))?;
+    let realm_core = realm_core.ok_or_else(|| {
+        Error::Usage("`production status` needs --realm-core DATABASE".to_string())
+    })?;
+    if names.is_empty() {
+        return Err(Error::Usage(
+            "`production status` needs the complete production database list".to_string(),
+        ));
+    }
+    let databases = publish::databases(&names)?;
+    if databases
+        .iter()
+        .any(|name| databases.iter().filter(|other| *other == name).count() > 1)
+    {
+        return Err(Error::Usage(
+            "`production status` database names must be unique".to_string(),
+        ));
+    }
+    if !databases.contains(&realm_core) {
+        return Err(Error::Usage(format!(
+            "realm-core '{realm_core}' is not in the production database list"
+        )));
+    }
+    Ok(Command::ProductionStatus(production::StatusOptions {
+        server,
+        gateway_log: gateway_log.into(),
+        realm_core,
+        databases,
+    }))
 }
 
 /// `dev up [--single] [--lan <IP>]`, in either order.
@@ -667,6 +783,62 @@ mod tests {
                 "`{line}` should be a usage error"
             );
         }
+    }
+
+    #[test]
+    fn production_status_requires_an_explicit_topology_and_log() {
+        assert_eq!(
+            parse(
+                "production status --server http://127.0.0.1:3000 --gateway-log /tmp/gw.log \
+                 --realm-core lyracore-realm \
+                 lyracore lyracore-world-1 lyracore-instances lyracore-realm"
+            )
+            .unwrap(),
+            Command::ProductionStatus(production::StatusOptions {
+                server: "http://127.0.0.1:3000".into(),
+                gateway_log: "/tmp/gw.log".into(),
+                realm_core: "lyracore-realm".into(),
+                databases: vec![
+                    "lyracore".into(),
+                    "lyracore-world-1".into(),
+                    "lyracore-instances".into(),
+                    "lyracore-realm".into(),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn production_status_refuses_implicit_or_ambiguous_topology() {
+        for line in [
+            "production status --server local --realm-core lyracore-realm lyracore lyracore-realm",
+            "production status --server local --gateway-log /tmp/gw.log lyracore lyracore-realm",
+            "production status --server local --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore",
+            "production status --server local --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore-realm lyracore-realm",
+            "production status --server local --gateway-log /tmp/one.log --gateway-log /tmp/two.log --realm-core lyracore-realm lyracore lyracore-realm",
+            "production status --server local --gateway-log /tmp/gw.log --realm-core one --realm-core two lyracore one two",
+        ] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn production_status_requires_one_explicit_spacetime_server() {
+        assert!(parse(
+            "production status --server http://127.0.0.1:3000 --gateway-log /tmp/gw.log \
+             --realm-core lyracore-realm lyracore lyracore-realm"
+        )
+        .is_ok());
+        assert!(parse(
+            "production status --gateway-log /tmp/gw.log --realm-core lyracore-realm \
+             lyracore lyracore-realm"
+        )
+        .is_err());
+        assert!(parse(
+            "production status --server local --server http://127.0.0.1:3000 \
+             --gateway-log /tmp/gw.log --realm-core lyracore-realm lyracore lyracore-realm"
+        )
+        .is_err());
     }
 
     #[test]

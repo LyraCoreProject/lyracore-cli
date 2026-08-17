@@ -169,8 +169,12 @@ fn check_versions(
     };
     let Ok(banner) = runner.run_capturing_stderr(&CommandSpec::new("spacetime").arg("--version"))
     else {
-        // Soft-skip: a sandbox without the CLI still gets every other check.
-        println!("SKIP: no `spacetime` on PATH — CLI version not checked");
+        println!("FAIL: no `spacetime` on PATH — CLI version and schema not checked");
+        failures.bad(format!(
+            "`spacetime` is required for a complete deploy gate. Install the pinned {pinned} CLI:\n    \
+             curl -sSf https://install.spacetimedb.com | sh -s -- --version {pinned}\n  \
+             Then ensure `$HOME/.local/bin` is on PATH for non-interactive shells."
+        ));
         return false;
     };
     match parse_version(&banner) {
@@ -256,15 +260,25 @@ pub fn schema_command(project: &ProjectLayout, out_dir: &Path) -> CommandSpec {
 
 /// The verdict lines out of a chatty extractor log, falling back to the whole thing.
 fn verdict_lines(text: &str) -> String {
-    let verdicts: Vec<&str> = text
-        .lines()
-        .filter(|line| {
-            ["error", "Error", "Failed to", "Caused by"]
-                .iter()
-                .any(|prefix| line.trim_start().starts_with(prefix))
-        })
-        .take(10)
-        .collect();
+    let mut verdicts = Vec::new();
+    let mut in_cause = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let is_verdict = ["error", "Error", "Failed to", "Caused by"]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix));
+        if is_verdict {
+            verdicts.push(line);
+            in_cause = trimmed.starts_with("Caused by");
+        } else if in_cause && trimmed.len() < line.len() && !trimmed.is_empty() {
+            verdicts.push(line);
+        } else if !trimmed.is_empty() {
+            in_cause = false;
+        }
+        if verdicts.len() == 10 {
+            break;
+        }
+    }
     if verdicts.is_empty() {
         text.trim().to_string()
     } else {
@@ -277,11 +291,20 @@ fn check_schema(
     runner: &dyn ProcessRunner,
     scratch: &Path,
     have_cli: bool,
+    skip_schema: bool,
     failures: &mut Failures,
 ) -> bool {
     step("module schema + #[default] values validate (offline wasm schema extraction)");
-    if !have_cli || std::env::var_os(SKIP_SCHEMA_VAR).is_some() {
-        println!("SKIP: no `spacetime` on PATH (or {SKIP_SCHEMA_VAR} set) — schema not validated");
+    if !have_cli {
+        println!("SKIP: no `spacetime` on PATH — schema not validated");
+        return false;
+    }
+    if skip_schema {
+        println!("SKIP: {SKIP_SCHEMA_VAR} is set — schema not validated");
+        failures.bad(format!(
+            "{SKIP_SCHEMA_VAR} bypassed the deployment-critical schema check; this preflight \
+             cannot approve a publish"
+        ));
         return false;
     }
     match runner.run_and_wait(&schema_command(project, scratch)) {
@@ -294,8 +317,9 @@ fn check_schema(
             failures.bad(format!(
                 "the module schema is invalid — `spacetime publish` would reject this migration \
                  (see above). If the failure above is the EXTRACTOR itself (no \
-                 spacetimedb-standalone), re-run with {SKIP_SCHEMA_VAR}=1 — but then nothing \
-                 validates your #[default] encodings."
+                 spacetimedb-standalone), re-run with {SKIP_SCHEMA_VAR}=1 to collect the remaining \
+                 diagnostics; preflight will still fail because nothing validated your #[default] \
+                 encodings."
             ));
             false
         }
@@ -478,13 +502,28 @@ fn check_db_threading(project: &ProjectLayout, failures: &mut Failures) {
 
 /// Run every check. Returns `Err` if any of them failed.
 pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
+    run_with_schema_skip(project, runner, std::env::var_os(SKIP_SCHEMA_VAR).is_some())
+}
+
+fn run_with_schema_skip(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    skip_schema: bool,
+) -> Result<()> {
     let mut failures = Failures::default();
 
     let have_cli = check_versions(project, runner, &mut failures);
     check_deploy_build(project, runner, &mut failures);
 
     let scratch = ScratchDir::new()?;
-    let generated = check_schema(project, runner, scratch.path(), have_cli, &mut failures);
+    let generated = check_schema(
+        project,
+        runner,
+        scratch.path(),
+        have_cli,
+        skip_schema,
+        &mut failures,
+    );
     check_rls(project, generated.then(|| scratch.path()), &mut failures);
     check_db_threading(project, &mut failures);
 
@@ -560,15 +599,20 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_without_the_spacetime_cli_skips_rather_than_fails() {
-        // A sandbox with no CLI still gets checks 1 and 4; it just cannot validate a schema.
+    fn a_machine_without_the_spacetime_cli_fails_but_keeps_running_other_checks() {
         let tmp = TempDir::new().unwrap();
         let project = fixture(&tmp);
         let stack = FakeStack::new().fail_on("spacetime --version", "command not found");
         let mut failures = Failures::default();
         let have_cli = check_versions(&project, &stack.runner(), &mut failures);
         assert!(!have_cli);
-        assert!(failures.0.is_empty(), "{:?}", failures.0);
+        assert_eq!(failures.0.len(), 1, "{:?}", failures.0);
+        assert!(failures.0[0].contains("required"), "{:?}", failures.0);
+        assert!(
+            failures.0[0].contains(".local/bin"),
+            "missing-tool guidance must name the non-interactive SSH PATH location: {:?}",
+            failures.0
+        );
     }
 
     #[test]
@@ -597,6 +641,21 @@ mod tests {
     }
 
     // ---- the commands the checks render ----
+
+    #[test]
+    fn extractor_verdict_keeps_an_indented_cause_without_chatty_build_output() {
+        let output = verdict_lines(
+            "Compiling spacetimedb-sdk v2.7.1\nError: could not extract schema\nCaused by:\n    \
+             spacetimedb-standalone exited before writing the schema\n    executable was not found \
+             on PATH\nFinished release build\n",
+        );
+
+        assert_eq!(
+            output,
+            "Error: could not extract schema\nCaused by:\n    spacetimedb-standalone exited before \
+             writing the schema\n    executable was not found on PATH"
+        );
+    }
 
     #[test]
     fn the_deploy_build_uses_the_feature_publish_bakes_in() {
@@ -756,6 +815,58 @@ mod tests {
         assert!(
             rendered.iter().any(|r| r.contains("spacetime generate")),
             "check 2 must still have run: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn missing_spacetime_fails_the_whole_gate_after_independent_checks_run() {
+        let tmp = TempDir::new().unwrap();
+        let project = fixture(&tmp);
+        let stack = FakeStack::new().fail_on("spacetime --version", "command not found");
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+        assert!(
+            error.to_string().contains("Nothing was published"),
+            "{error}"
+        );
+        let rendered = stack.rendered();
+        assert!(
+            rendered
+                .iter()
+                .any(|command| command.contains("cargo check")),
+            "the independent deploy build must still run: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|command| command.contains("spacetime generate")),
+            "schema extraction requires the missing CLI: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn explicitly_skipped_schema_is_a_blocker_after_independent_checks_run() {
+        let tmp = TempDir::new().unwrap();
+        let project = fixture(&tmp);
+        let stack = FakeStack::new();
+
+        let error = run_with_schema_skip(&project, &stack.runner(), true).unwrap_err();
+        assert!(
+            error.to_string().contains("Nothing was published"),
+            "{error}"
+        );
+        let rendered = stack.rendered();
+        assert!(
+            rendered
+                .iter()
+                .any(|command| command.contains("cargo check")),
+            "the independent deploy build must still run: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|command| command.contains("spacetime generate")),
+            "the explicit skip must bypass extraction: {rendered:?}"
         );
     }
 

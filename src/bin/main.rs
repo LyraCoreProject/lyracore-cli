@@ -109,6 +109,15 @@ fn run(args: &[String]) -> Result<i32> {
             let project = ProjectLayout::discover()?;
             cmd::character::gm(&project, &runner, &http, &name, enabled).map(|_| EXIT_OK)
         }
+        Command::ProductionStatus(options) => {
+            let status = cmd::production::inspect(&options, &runner);
+            cmd::production::report(&status);
+            Ok(if status.blocking() {
+                EXIT_FAILURE
+            } else {
+                EXIT_OK
+            })
+        }
         Command::Update => cmd::update::run(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK),
     }
 }
