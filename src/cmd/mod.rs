@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod import;
 pub mod preflight;
 pub mod publish;
+pub mod systemd;
 pub mod update;
 
 use crate::project::{ClientBind, Component, Topology};
@@ -83,6 +84,16 @@ USAGE:
                                                character — tries every world shard in turn
   lyracore update                              pull the latest checkout in place and restart the
                                                local dev stack (refuses over a dirty working tree)
+  lyracore update --install-service            also install/refresh the tracked
+                                               spacetimedb-standalone systemd unit and restart it.
+                                               For a production host: copies the checkout's
+                                               deploy/systemd unit to /etc/systemd/system, reloads
+                                               systemd, enables and restarts the standalone node,
+                                               then verifies its ActiveState, LimitNOFILE and
+                                               stderr destination. Must run as root, never touches
+                                               the node's data directory, and refuses when another
+                                               active service already owns that data directory or
+                                               listen address
 
 The password is read from stdin with --password-stdin, otherwise from a hidden terminal
 prompt. It is never passed as a command-line argument.";
@@ -121,7 +132,11 @@ pub enum Command {
         name: String,
         enabled: bool,
     },
-    Update,
+    Update {
+        /// Also reconcile the tracked standalone systemd unit (`--install-service`). Off by
+        /// default: plain `update` is a contributor's git-pull replacement and owns no service.
+        install_service: bool,
+    },
     Help,
     HelpAll,
 }
@@ -233,9 +248,14 @@ impl Command {
                 "`character` supports: gm NAME true|false".to_string(),
             )),
 
-            ["update"] => Ok(Command::Update),
+            ["update"] => Ok(Command::Update {
+                install_service: false,
+            }),
+            ["update", "--install-service"] => Ok(Command::Update {
+                install_service: true,
+            }),
             ["update", other, ..] => Err(Error::Usage(format!(
-                "`update` takes no arguments (got '{other}')"
+                "`update` takes only --install-service (got '{other}')"
             ))),
 
             [other, ..] => Err(Error::Usage(format!("unknown command '{other}'"))),
@@ -758,14 +778,41 @@ mod tests {
     // ---- update ----
 
     #[test]
-    fn update_takes_no_arguments() {
-        assert_eq!(parse("update").unwrap(), Command::Update);
+    fn update_takes_only_the_install_service_flag() {
+        assert_eq!(
+            parse("update").unwrap(),
+            Command::Update {
+                install_service: false
+            }
+        );
+        assert_eq!(
+            parse("update --install-service").unwrap(),
+            Command::Update {
+                install_service: true
+            }
+        );
         assert!(parse("update origin").is_err());
+        assert!(parse("update --install-services").is_err());
     }
 
     #[test]
     fn the_help_text_documents_update() {
         assert!(USAGE_ALL.contains("lyracore update"), "{USAGE_ALL}");
+    }
+
+    /// The flag mutates a production host, so the help has to say what it does to one — which
+    /// unit, that systemd is reloaded and restarted, and that it needs root.
+    #[test]
+    fn the_help_text_documents_what_install_service_changes() {
+        for phrase in [
+            "--install-service",
+            "spacetimedb-standalone systemd unit",
+            "/etc/systemd/system",
+            "LimitNOFILE",
+            "root",
+        ] {
+            assert!(USAGE_ALL.contains(phrase), "{phrase}: {USAGE_ALL}");
+        }
     }
 
     // ---- help ----

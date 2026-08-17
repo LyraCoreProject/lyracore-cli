@@ -5,8 +5,10 @@
 Source-first developer CLI for LyraCore. It drives the local developer fixture: start SpacetimeDB,
 publish the module, claim the operator identity, run the gateway, and provision accounts.
 
-It deliberately does **not** manage production realms, backups, system services, or the installation
-of Rust and SpacetimeDB.
+It deliberately does **not** manage production realms, backups, or the installation of Rust and
+SpacetimeDB. The one system service it can touch is the standalone supervisor unit tracked in the
+checkout, and only when [`update --install-service`](#update--the-checkout-and-optionally-the-standalone-supervisor)
+asks it to.
 
 ## Commands
 
@@ -20,6 +22,7 @@ lyracore dev logs [spacetime|gateway]
 lyracore dev smoke
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
+lyracore update [--install-service]
 ```
 
 Runtime state lives in the git-ignored `.lyracore/` of the target checkout — `state.json` for the
@@ -288,6 +291,47 @@ running rather than the one today's default would build.
 `dev down` compares that identity before signalling anything. If the PID now belongs to something
 else it **refuses and kills nothing**, directing you to `dev down --forget`, which drops the record
 without signalling.
+
+## `update` — the checkout, and optionally the standalone supervisor
+
+```bash
+lyracore update                          # the checkout only
+sudo lyracore update --install-service   # the checkout, then the systemd unit
+```
+
+`update` fetches `origin`, refuses over tracked local edits, and moves the checkout to `origin/main`
+with `git reset --hard` — the publish mirror force-pushes an unrelated history, so a merge cannot
+work. It restarts nothing.
+
+`--install-service` adds one thing, for a **production host**: the host's `spacetimedb-standalone`
+supervisor is made to match the unit tracked in the checkout at
+`deploy/systemd/spacetimedb-standalone.service`. In order:
+
+1. **Root, up front.** `id -u` runs before the fetch. Everything after step 2 writes to
+   `/etc/systemd/system` or drives `systemctl`, and a plan that stops halfway for a password is
+   worse than one that never started.
+2. **The git steps above, unchanged.** Tracked local edits still refuse *everything*, the service
+   change included.
+3. **Host prerequisites.** The unit's `User=` account, its `ExecStart` binary, its `--data-dir`, and
+   the directory holding its `StandardError=append:` log. Each missing one is a refusal naming the
+   command that fixes it. None of them is created for you.
+4. **A conflicting service.** Every active unit whose `ExecStart` or `WorkingDirectory` claims the
+   same data directory or listen address. A hand-rolled legacy `spacetimedb.service` is named and
+   refused — never migrated, never stopped on your behalf, so two nodes cannot race for one port
+   and one data directory.
+5. **The install.** `install -o root -g root -m 0644` into `/etc/systemd/system/`, then
+   `systemctl daemon-reload`, `enable`, `restart`.
+6. **The verification.** `systemctl show` must report `ActiveState=active` plus the `LimitNOFILE`
+   and `StandardError` the tracked unit declares. A node that came back with the inherited
+   1024-descriptor ceiling fails here instead of passing as reconciled.
+
+Every expected value is read out of the tracked unit rather than duplicated in this CLI, so it
+cannot certify a host against a contract the checkout no longer ships. The node's persistent data
+directory is only ever checked for existence: never created, moved or deleted. Reconciliation is
+idempotent and runs even when the checkout is already at `origin/main`, because deployment drift is
+independent of git drift — and it restarts the node every time, which is a short outage.
+
+No gateway, module publish or schema migration is touched. Those stay operator decisions.
 
 ## Passwords
 

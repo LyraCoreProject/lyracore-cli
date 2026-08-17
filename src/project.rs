@@ -341,6 +341,12 @@ impl ProjectLayout {
     /// in the core repo; this CLI only orders its modes.
     pub const IMPORTER_BIN: &'static str = "target/debug/lyracore-importer";
 
+    /// The standalone supervisor artifact tracked in the checkout, installed by
+    /// `update --install-service`. The service contract a host must end up with — descriptor
+    /// limit, stderr destination, data directory, listen address — is read out of THIS file, so
+    /// the CLI never carries a second copy of it that can drift.
+    pub const STANDALONE_UNIT: &'static str = "deploy/systemd/spacetimedb-standalone.service";
+
     /// The pinned wire-harness release this checkout consumes (#246).
     pub const WIRE_HARNESS_PIN: &'static str = ".wire-harness-rev";
     /// Paths INSIDE a harness checkout. `dev smoke` drives the generic login smoke through the
@@ -457,6 +463,10 @@ impl ProjectLayout {
 
     pub fn module_sources(&self) -> PathBuf {
         self.module_dir().join("src")
+    }
+
+    pub fn standalone_unit(&self) -> PathBuf {
+        self.root.join(Self::STANDALONE_UNIT)
     }
 
     pub fn rust_toolchain_file(&self) -> PathBuf {
