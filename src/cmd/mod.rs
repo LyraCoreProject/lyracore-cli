@@ -29,8 +29,8 @@ USAGE:
   lyracore dev status      show whether the server is running
   lyracore dev down        stop the server
   lyracore import          replace the placeholder starter data with the real game
-                           world — quests, creatures, items — pulled from public game
-                           data and your own 1.12.1 client
+                           world — every Alliance early-game corridor — from public
+                           game data and your own 1.12.1 client
 
 Run `lyracore help --all` to see every command, including the ones for working on
 LyraCore itself.";
@@ -64,20 +64,20 @@ USAGE:
   lyracore account create USER [--password-stdin]
                                                provision an account's SRP6 credentials
   lyracore import [--client-data PATH]         build the REAL world in place of the seed
-                                               fixture: pull cmangos' classic-db, read your
-                                               own 1.12.1 client's Data/ archives, drive the
-                                               importer's modes in order and assert the
-                                               FLOOR_* import floors — on every database the
-                                               fixture populates, which includes the
-                                               instance pool. Asks for consent first,
-                                               every time
+                                               fixture: every Alliance early-game corridor
+                                               in Eastern Kingdoms and Kalimdor, plus the
+                                               instance maps. Pulls cmangos' classic-db,
+                                               reads your own 1.12.1 client's Data/ archives,
+                                               drives the importer and asserts the FLOOR_*
+                                               import floors on every destination. Asks for
+                                               consent first, every time
   lyracore import world --accept               the same command by its full name (`import`
                                                is its alias), with the consent answered in
                                                advance (scripted runs)
   lyracore import vmaps [--client-data PATH]   exact model/WMO collision triangles for each
-                                               world shard, read from your own client's
-                                               archives — nothing is fetched, so there is
-                                               no consent gate
+                                               populated World Shard, including Kalimdor,
+                                               read from your own client's archives — nothing
+                                               is fetched, so there is no consent gate
   lyracore config                              show the persisted client-data path (or \"(unset)\")
   lyracore config set client-data PATH         validate and remember your 1.12.1 client's Data/
                                                directory, so `import` and `doctor` stop asking
@@ -765,6 +765,9 @@ mod tests {
         assert!(USAGE_ALL.contains("lyracore import vmaps"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--client-data"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--accept"), "{USAGE_ALL}");
+        assert!(USAGE.contains("every Alliance early-game corridor"), "{USAGE}");
+        assert!(USAGE_ALL.contains("Eastern Kingdoms and Kalimdor"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("populated World Shard"), "{USAGE_ALL}");
     }
 
     #[test]
