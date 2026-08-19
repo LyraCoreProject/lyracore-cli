@@ -90,11 +90,11 @@ fn run(args: &[String]) -> Result<i32> {
             &options,
         )
         .map(|_| EXIT_OK),
-        Command::ImportVmaps { client_data } => cmd::import::run_vmaps(
+        Command::ImportVmaps { options } => cmd::import::run_vmaps(
             &ProjectLayout::discover()?,
             &runner,
             &cmd::import::TtyPrompt,
-            client_data.as_deref(),
+            &options,
         )
         .map(|_| EXIT_OK),
         Command::AccountCreate { user, source } => {

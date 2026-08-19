@@ -53,6 +53,16 @@ pub struct ImportOptions {
     pub accept: bool,
     /// `--client-data PATH`: where the 1.12.1 client's `Data/` directory is.
     pub client_data: Option<String>,
+    /// Explicit World Import Profile destinations. Supplying one requires the full production
+    /// plan, so fixture and production shard names cannot be mixed in one import.
+    pub profile_shards: Vec<String>,
+}
+
+/// What `import vmaps` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmapOptions {
+    pub client_data: Option<String>,
+    pub profile_shards: Vec<String>,
 }
 
 /// Asking the operator something on their terminal.
@@ -141,7 +151,7 @@ const POST_VANILLA_ARCHIVES: [&str; 2] = ["common.MPQ", "expansion.MPQ"];
 /// Where `pull-classic-db.sh` assembles the dump — its documented output, and `--dump`'s input.
 /// Relative on purpose: every child runs from the checkout root, exactly like the bash flow.
 const DUMP_PATH: &str = ".import/classic-db-full.sql";
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WorldProfile {
     AllianceEastern,
     AllianceKalimdor,
@@ -150,12 +160,27 @@ enum WorldProfile {
 }
 
 impl WorldProfile {
+    const SHARDED: [Self; 3] = [
+        Self::AllianceEastern,
+        Self::AllianceKalimdor,
+        Self::Instances,
+    ];
+
     fn name(self) -> &'static str {
         match self {
             Self::AllianceEastern => "alliance-eastern",
             Self::AllianceKalimdor => "alliance-kalimdor",
             Self::AllianceSingle => "alliance-single",
             Self::Instances => "instances",
+        }
+    }
+
+    fn parse_sharded(name: &str) -> Option<Self> {
+        match name {
+            "alliance-eastern" => Some(Self::AllianceEastern),
+            "alliance-kalimdor" => Some(Self::AllianceKalimdor),
+            "instances" => Some(Self::Instances),
+            _ => None,
         }
     }
 
@@ -185,9 +210,9 @@ impl WorldProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ImportDestination {
-    shard: &'static str,
+    shard: String,
     profile: WorldProfile,
 }
 
@@ -208,6 +233,10 @@ pub fn run_world(
     if let Some(raw) = &options.client_data {
         validate_client_data(Path::new(raw))?;
     }
+    let destinations = import_destinations(
+        RuntimeState::load(&project.state_file())?.topology(),
+        &options.profile_shards,
+    )?;
 
     // ---- consent, first and always ------------------------------------------------------------
     consent(prompt, options.accept)?;
@@ -238,7 +267,6 @@ pub fn run_world(
         ProjectLayout::IMPORT_MANIFEST_SCRIPT
     );
 
-    let destinations = import_destinations(RuntimeState::load(&project.state_file())?.topology());
     // Three fixed stages, then the modes + the re-arm + the floors per destination.
     let total = 3 + 3 * destinations.len() as u8;
 
@@ -299,7 +327,7 @@ pub fn run_world(
     // flow was run in, per database, against real dumps.
     for (i, destination) in destinations.iter().enumerate() {
         let n = 4 + 3 * i as u8;
-        let database = destination.shard;
+        let database = destination.shard.as_str();
         let profile = destination.profile.name();
         let contents = if destination.profile.has_bounded_slices() {
             "creatures, quests, loot, vendors, terrain, navigation, spells"
@@ -320,7 +348,7 @@ pub fn run_world(
         } else if destination.profile == WorldProfile::Instances {
             println!("   instance-only profile: open-world terrain and navigation are skipped.");
         }
-        for (what, advice, command) in world_etl_commands(project, &client_data, *destination) {
+        for (what, advice, command) in world_etl_commands(project, &client_data, destination) {
             println!();
             println!("   -> {what}");
             runner.run_streaming(&command).map_err(|e| {
@@ -376,27 +404,82 @@ pub fn run_world(
 
 /// Content destinations, in import order. The importer owns every profile's spatial facts; the CLI
 /// owns only the Realm topology assignment.
-fn import_destinations(topology: Topology) -> Vec<ImportDestination> {
-    match topology {
-        Topology::Single => vec![ImportDestination {
-            shard: ProjectLayout::DATABASE,
-            profile: WorldProfile::AllianceSingle,
-        }],
-        Topology::Sharded => vec![
-            ImportDestination {
-                shard: ProjectLayout::DATABASE,
-                profile: WorldProfile::AllianceEastern,
-            },
-            ImportDestination {
-                shard: ProjectLayout::KALIMDOR_SHARD,
-                profile: WorldProfile::AllianceKalimdor,
-            },
-            ImportDestination {
-                shard: ProjectLayout::INSTANCE_POOL,
-                profile: WorldProfile::Instances,
-            },
-        ],
+fn import_destinations(
+    topology: Topology,
+    profile_shards: &[String],
+) -> Result<Vec<ImportDestination>> {
+    if profile_shards.is_empty() {
+        return Ok(match topology {
+            Topology::Single => vec![ImportDestination {
+                shard: ProjectLayout::DATABASE.to_string(),
+                profile: WorldProfile::AllianceSingle,
+            }],
+            Topology::Sharded => vec![
+                ImportDestination {
+                    shard: ProjectLayout::DATABASE.to_string(),
+                    profile: WorldProfile::AllianceEastern,
+                },
+                ImportDestination {
+                    shard: ProjectLayout::KALIMDOR_SHARD.to_string(),
+                    profile: WorldProfile::AllianceKalimdor,
+                },
+                ImportDestination {
+                    shard: ProjectLayout::INSTANCE_POOL.to_string(),
+                    profile: WorldProfile::Instances,
+                },
+            ],
+        });
     }
+
+    let mut configured = BTreeMap::new();
+    for assignment in profile_shards {
+        let (profile, shard) = assignment.split_once('=').ok_or_else(|| {
+            Error::Usage(format!(
+                "`--profile-shard` needs PROFILE=SHARD, got {assignment:?}"
+            ))
+        })?;
+        let profile = WorldProfile::parse_sharded(profile).ok_or_else(|| {
+            Error::Usage(format!(
+                "`--profile-shard` accepts alliance-eastern, alliance-kalimdor, or instances; got {profile:?}"
+            ))
+        })?;
+        if shard.is_empty()
+            || !shard
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(Error::Usage(format!(
+                "`--profile-shard` has an invalid shard name {shard:?}; use letters, digits, `-`, or `_`"
+            )));
+        }
+        if configured.insert(profile, shard.to_string()).is_some() {
+            return Err(Error::Usage(format!(
+                "`--profile-shard` names {} more than once",
+                profile.name()
+            )));
+        }
+    }
+
+    let missing: Vec<&str> = WorldProfile::SHARDED
+        .iter()
+        .filter(|profile| !configured.contains_key(profile))
+        .map(|profile| profile.name())
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::Usage(format!(
+            "production profile destinations must name alliance-eastern, alliance-kalimdor, and instances exactly once; missing {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(WorldProfile::SHARDED
+        .iter()
+        .map(|profile| ImportDestination {
+            shard: configured
+                .remove(profile)
+                .expect("every required profile was checked"),
+            profile: *profile,
+        })
+        .collect())
 }
 
 /// Print the notice and require an affirmative answer. `--accept` answers it in advance; nothing
@@ -436,10 +519,10 @@ pub fn run_vmaps(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     prompt: &dyn Prompt,
-    client_data: Option<&str>,
+    options: &VmapOptions,
 ) -> Result<()> {
     // Same early check as `import world`: a typo in the flag is a usage mistake, refused first.
-    if let Some(raw) = client_data {
+    if let Some(raw) = &options.client_data {
         validate_client_data(Path::new(raw))?;
     }
 
@@ -453,7 +536,7 @@ pub fn run_vmaps(
     println!("from the network, and nothing read here leaves your machine.");
     println!();
 
-    let data = resolve_client_data(project, prompt, client_data)?;
+    let data = resolve_client_data(project, prompt, options.client_data.as_deref())?;
     println!("   client data: {}", data.display());
 
     runner
@@ -467,18 +550,21 @@ pub fn run_vmaps(
             )
         })?;
 
-    let destinations = import_destinations(RuntimeState::load(&project.state_file())?.topology());
+    let destinations = import_destinations(
+        RuntimeState::load(&project.state_file())?.topology(),
+        &options.profile_shards,
+    )?;
     let world_shards: Vec<ImportDestination> = destinations
         .into_iter()
         .filter(|destination| destination.profile.has_bounded_slices())
         .collect();
     for destination in &world_shards {
-        let shard = destination.shard;
+        let shard = destination.shard.as_str();
         let profile = destination.profile.name();
         println!();
         println!("==> {shard}: vmap extract + import ({profile})");
         runner
-            .run_streaming(&vmap_command(project, *destination, &data))
+            .run_streaming(&vmap_command(project, destination, &data))
             .map_err(|e| {
                 stage_failure(
                     &format!("importing vmaps for {shard} ({profile})"),
@@ -707,10 +793,10 @@ fn importer_command(project: &ProjectLayout, database: &str) -> CommandSpec {
 fn world_etl_commands(
     project: &ProjectLayout,
     client_data: &Path,
-    destination: ImportDestination,
+    destination: &ImportDestination,
 ) -> Vec<(&'static str, &'static str, CommandSpec)> {
     let data = client_data.to_string_lossy().to_string();
-    let database = destination.shard;
+    let database = destination.shard.as_str();
     let profile = destination.profile;
     let dump = importer_command(project, database)
         .arg("--dump")
@@ -836,10 +922,10 @@ fn sql_command(project: &ProjectLayout, database: &str, query: &str) -> CommandS
 
 fn vmap_command(
     project: &ProjectLayout,
-    destination: ImportDestination,
+    destination: &ImportDestination,
     client_data: &Path,
 ) -> CommandSpec {
-    importer_command(project, destination.shard)
+    importer_command(project, &destination.shard)
         .arg("--vmap")
         .arg(client_data.to_string_lossy().to_string())
         .arg("--world-profile")
@@ -1953,6 +2039,14 @@ mod tests {
         ImportOptions {
             accept: true,
             client_data: Some(path.to_string_lossy().to_string()),
+            profile_shards: vec![],
+        }
+    }
+
+    fn vmap_options(path: &Path) -> VmapOptions {
+        VmapOptions {
+            client_data: Some(path.to_string_lossy().to_string()),
+            profile_shards: vec![],
         }
     }
 
@@ -2002,6 +2096,7 @@ mod tests {
             let options = ImportOptions {
                 accept: false,
                 client_data: Some(data.to_string_lossy().to_string()),
+                profile_shards: vec![],
             };
             let error = run_world(&project, &stack.runner(), &prompt, &options).unwrap_err();
             assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{answer:?}");
@@ -2024,6 +2119,7 @@ mod tests {
             let options = ImportOptions {
                 accept: false,
                 client_data: Some(data.to_string_lossy().to_string()),
+                profile_shards: vec![],
             };
             run_world(&project, &stack.runner(), &prompt, &options).unwrap();
             assert!(
@@ -2144,6 +2240,55 @@ mod tests {
     }
 
     #[test]
+    fn explicit_profile_shards_reach_every_world_import_destination() {
+        let profiles = vec![
+            "alliance-eastern=lyracore".to_string(),
+            "alliance-kalimdor=lyracore-world-1".to_string(),
+            "instances=lyracore-instances".to_string(),
+        ];
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        set_topology(&project, Topology::Sharded);
+        let stack = healthy();
+        let options = ImportOptions {
+            profile_shards: profiles,
+            ..accepted(&data)
+        };
+        run_world(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &options,
+        )
+        .unwrap();
+        let assigned: Vec<(String, String)> = dump_destinations(&stack);
+        assert_eq!(
+            assigned,
+            vec![
+                ("lyracore".to_string(), "alliance-eastern".to_string()),
+                (
+                    "lyracore-world-1".to_string(),
+                    "alliance-kalimdor".to_string()
+                ),
+                ("lyracore-instances".to_string(), "instances".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_profile_shards_are_refused_before_the_import_starts() {
+        let error = import_destinations(
+            Topology::Sharded,
+            &["alliance-kalimdor=lyracore-world-1".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("alliance-eastern"), "{error}");
+        assert!(error.contains("instances"), "{error}");
+    }
+
+    #[test]
     fn sharded_verification_follows_each_destinations_profile() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
@@ -2188,8 +2333,8 @@ mod tests {
         let pool = world_etl_commands(
             &project,
             &data,
-            ImportDestination {
-                shard: ProjectLayout::INSTANCE_POOL,
+            &ImportDestination {
+                shard: ProjectLayout::INSTANCE_POOL.to_string(),
                 profile: WorldProfile::Instances,
             },
         );
@@ -2238,6 +2383,7 @@ mod tests {
         let options = ImportOptions {
             accept: false,
             client_data: Some(data.to_string_lossy().to_string()),
+            profile_shards: vec![],
         };
         let error = run_world(&project, &stack.runner(), &prompt, &options)
             .unwrap_err()
@@ -2255,6 +2401,7 @@ mod tests {
         let options = ImportOptions {
             accept: false,
             client_data: Some(data.to_string_lossy().to_string()),
+            profile_shards: vec![],
         };
         assert!(run_world(&project, &stack.runner(), &prompt, &options).is_err());
         assert!(stack.calls().is_empty());
@@ -2684,6 +2831,7 @@ mod tests {
         let options = ImportOptions {
             accept: true,
             client_data: Some(tmp.path().join("nope").to_string_lossy().to_string()),
+            profile_shards: vec![],
         };
         let error = run_world(
             &project,
@@ -3146,7 +3294,7 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&data.to_string_lossy()),
+            &vmap_options(&data),
         )
         .unwrap();
 
@@ -3195,7 +3343,7 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&data.to_string_lossy()),
+            &vmap_options(&data),
         )
         .unwrap();
 
@@ -3226,7 +3374,7 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&data.to_string_lossy()),
+            &vmap_options(&data),
         )
         .unwrap();
 
@@ -3245,13 +3393,7 @@ mod tests {
         let stack = FakeStack::new();
         let prompt = ScriptedPrompt::new(&[]); // any question at all would error
 
-        run_vmaps(
-            &project,
-            &stack.runner(),
-            &prompt,
-            Some(&data.to_string_lossy()),
-        )
-        .unwrap();
+        run_vmaps(&project, &stack.runner(), &prompt, &vmap_options(&data)).unwrap();
         assert!(prompt.asked().is_empty());
     }
 
@@ -3268,7 +3410,7 @@ mod tests {
         let stack = FakeStack::new();
         let prompt = ScriptedPrompt::new(&[]);
 
-        run_vmaps(&project, &stack.runner(), &prompt, None).unwrap();
+        run_vmaps(&project, &stack.runner(), &prompt, &VmapOptions::default()).unwrap();
         assert!(
             prompt.asked().is_empty(),
             "a configured path must not prompt"
@@ -3286,7 +3428,10 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&tmp.path().join("nope").to_string_lossy()),
+            &VmapOptions {
+                client_data: Some(tmp.path().join("nope").to_string_lossy().to_string()),
+                profile_shards: vec![],
+            },
         )
         .unwrap_err();
         assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
@@ -3304,7 +3449,7 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&data.to_string_lossy()),
+            &vmap_options(&data),
         )
         .unwrap_err()
         .to_string();
