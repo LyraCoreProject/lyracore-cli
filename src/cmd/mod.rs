@@ -1,4 +1,5 @@
 pub mod account;
+pub mod alpha_test_tools;
 pub mod character;
 pub mod config;
 pub mod dev;
@@ -63,6 +64,10 @@ USAGE:
   lyracore dev down [--forget]                 stop the processes this CLI started
   lyracore account create USER [--password-stdin]
                                                provision an account's SRP6 credentials
+  lyracore account alpha-test-tools enrollment REALM_CORE [true|false]
+                                               read or set automatic enrollment for new Accounts
+  lyracore account alpha-test-tools grant|revoke REALM_CORE ACCOUNT
+                                               grant or revoke one Account's Alpha Test Tools
   lyracore import [--client-data PATH]         build the REAL world in place of the seed
                                                fixture: every Alliance early-game corridor
                                                in Eastern Kingdoms and Kalimdor, plus the
@@ -117,6 +122,10 @@ pub enum Command {
     AccountCreate {
         user: String,
         source: PasswordSource,
+    },
+    AccountAlphaTestTools {
+        realm_core: String,
+        action: alpha_test_tools::Action,
     },
     ImportWorld(ImportOptions),
     ImportVmaps {
@@ -199,8 +208,50 @@ impl Command {
             ["account", "create"] => Err(Error::Usage(
                 "`account create` needs a username".to_string(),
             )),
+            ["account", "alpha-test-tools", "enrollment", realm_core] => {
+                alpha_test_tools::validate_realm_core(realm_core)?;
+                Ok(Command::AccountAlphaTestTools {
+                    realm_core: (*realm_core).to_string(),
+                    action: alpha_test_tools::Action::ReadEnrollment,
+                })
+            }
+            ["account", "alpha-test-tools", "enrollment", realm_core, "true"] => {
+                alpha_test_tools::validate_realm_core(realm_core)?;
+                Ok(Command::AccountAlphaTestTools {
+                    realm_core: (*realm_core).to_string(),
+                    action: alpha_test_tools::Action::SetEnrollment(true),
+                })
+            }
+            ["account", "alpha-test-tools", "enrollment", realm_core, "false"] => {
+                alpha_test_tools::validate_realm_core(realm_core)?;
+                Ok(Command::AccountAlphaTestTools {
+                    realm_core: (*realm_core).to_string(),
+                    action: alpha_test_tools::Action::SetEnrollment(false),
+                })
+            }
+            ["account", "alpha-test-tools", "enrollment", _realm_core, other] => {
+                Err(Error::Usage(format!(
+                    "`account alpha-test-tools enrollment` takes true or false (got '{other}')"
+                )))
+            }
+            ["account", "alpha-test-tools", action @ ("grant" | "revoke"), realm_core, account] => {
+                alpha_test_tools::validate_realm_core(realm_core)?;
+                Ok(Command::AccountAlphaTestTools {
+                    realm_core: (*realm_core).to_string(),
+                    action: if *action == "grant" {
+                        alpha_test_tools::Action::Grant((*account).to_string())
+                    } else {
+                        alpha_test_tools::Action::Revoke((*account).to_string())
+                    },
+                })
+            }
+            ["account", "alpha-test-tools", ..] => Err(Error::Usage(
+                "`account alpha-test-tools` supports: enrollment REALM_CORE [true|false], or grant|revoke REALM_CORE ACCOUNT"
+                    .to_string(),
+            )),
             ["account", ..] => Err(Error::Usage(
-                "`account` supports: create USER [--password-stdin]".to_string(),
+                "`account` supports: create USER [--password-stdin], or alpha-test-tools"
+                    .to_string(),
             )),
 
             // Two verbs since #104: `world` (the full import) and `vmaps` (collision only). Bare
@@ -548,6 +599,72 @@ mod tests {
                 user: "TEST".to_string(),
                 source: PasswordSource::Tty,
             }
+        );
+    }
+
+    #[test]
+    fn account_alpha_test_tools_parses_every_action() {
+        use alpha_test_tools::Action;
+
+        for (line, action) in [
+            (
+                "account alpha-test-tools enrollment lyracore-realm",
+                Action::ReadEnrollment,
+            ),
+            (
+                "account alpha-test-tools enrollment lyracore-realm true",
+                Action::SetEnrollment(true),
+            ),
+            (
+                "account alpha-test-tools enrollment lyracore-realm false",
+                Action::SetEnrollment(false),
+            ),
+            (
+                "account alpha-test-tools grant lyracore-realm TEST",
+                Action::Grant("TEST".to_string()),
+            ),
+            (
+                "account alpha-test-tools revoke lyracore-realm TEST",
+                Action::Revoke("TEST".to_string()),
+            ),
+        ] {
+            assert_eq!(
+                parse(line).unwrap(),
+                Command::AccountAlphaTestTools {
+                    realm_core: "lyracore-realm".to_string(),
+                    action,
+                },
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_alpha_test_tools_refuses_missing_or_invalid_arguments() {
+        for line in [
+            "account alpha-test-tools",
+            "account alpha-test-tools enrollment",
+            "account alpha-test-tools enrollment lyracore-realm yes",
+            "account alpha-test-tools enrollment --realm true",
+            "account alpha-test-tools grant",
+            "account alpha-test-tools grant lyracore-realm",
+            "account alpha-test-tools revoke lyracore-realm",
+            "account alpha-test-tools change lyracore-realm TEST",
+        ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+        }
+    }
+
+    #[test]
+    fn full_help_documents_account_alpha_test_tools() {
+        assert!(
+            USAGE_ALL.contains("alpha-test-tools enrollment"),
+            "{USAGE_ALL}"
+        );
+        assert!(
+            USAGE_ALL.contains("grant|revoke REALM_CORE ACCOUNT"),
+            "{USAGE_ALL}"
         );
     }
 

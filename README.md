@@ -20,12 +20,29 @@ lyracore dev logs [spacetime|gateway]
 lyracore dev smoke
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
+lyracore account alpha-test-tools enrollment REALM_CORE [true|false]
+lyracore account alpha-test-tools grant|revoke REALM_CORE ACCOUNT
 lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
 ```
 
 Runtime state lives in the git-ignored `.lyracore/` of the target checkout — `state.json` for the
 processes the CLI started, `logs/{spacetime,gateway}.log`, and `coordinator-token` (mode `0600`) if
 this host had no SpacetimeDB login and the CLI minted a local identity.
+
+## Account Alpha Test Tools controls
+
+```bash
+lyracore account alpha-test-tools enrollment lyracore-realm
+lyracore account alpha-test-tools enrollment lyracore-realm false
+lyracore account alpha-test-tools grant lyracore-realm TEST
+lyracore account alpha-test-tools revoke lyracore-realm TEST
+```
+
+The first command reads whether new Accounts automatically receive Alpha Test Tools. Adding `true`
+or `false` changes that setting. `grant` and `revoke` change one existing Account. Every command
+requires the Realm-core database name and the coordinator credential resolved by `dev up`. Account
+names use the same uppercase normalization as provisioning. The credential is sent as bearer auth
+and never appears in the command line or rendered output.
 
 ## `preflight` — the offline deploy gate
 

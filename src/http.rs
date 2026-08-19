@@ -1,19 +1,18 @@
-//! The two loopback HTTP requests this CLI makes to the SpacetimeDB node itself.
+//! The loopback HTTP requests this CLI makes to the SpacetimeDB node itself.
 //!
-//! Everything else the CLI does goes through the `spacetime` binary — deliberately, because the
-//! CLI's config layout is its own business. Two things cannot: minting a **server-issued**
-//! identity (`POST /v1/identity`) and calling `claim_operator` **as that identity**. Neither has a
-//! `spacetime` sub-command that does not first write a token into the contributor's global
-//! `cli.toml`, and rewriting a global credential is not something `lyracore dev up` may do.
+//! Most operations go through the `spacetime` binary. Requests that must use the coordinator
+//! credential do not, because a server-issued identity may differ from the identity in the
+//! contributor's global `cli.toml`. This client mints that identity, makes Operator calls, and reads
+//! private Realm-core state with bearer authentication.
 //!
-//! Scope is exactly that: loopback, plaintext, two small JSON requests. There is no HTTPS, no
+//! Scope is exactly that: loopback, plaintext, and small JSON or SQL requests. There is no HTTPS, no
 //! redirect following, no keep-alive and no dependency — `http://127.0.0.1:3000` is the only
 //! address this ever talks to (`--lan` never moves the database), so a TLS stack would be
 //! unreachable code and a new dependency in a crate that is `cargo install`ed from git on a
 //! contributor's first run.
 //!
 //! ponytail: a hand-written HTTP/1.1 request rather than reqwest/ureq. Ceiling — it speaks only
-//! what these two endpoints answer with (`Connection: close`, and a body it does not have to
+//! what these endpoints answer with (`Connection: close`, and a body it does not have to
 //! frame-decode; see [`json_field`]). Upgrade path: if this ever needs a third endpoint with a
 //! streaming or chunk-critical response, take the dependency.
 
@@ -34,12 +33,33 @@ pub trait HttpClient {
     /// it can then be kept out of every error this returns, because no error is ever built from
     /// the whole request.
     fn post_json(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<String>;
+
+    /// `POST url` with a SQL body. The default keeps small Fakes simple.
+    fn post_sql(&self, url: &str, bearer: Option<&str>, sql: &str) -> Result<String> {
+        self.post_json(url, bearer, sql)
+    }
 }
 
 pub struct LoopbackHttpClient;
 
 impl HttpClient for LoopbackHttpClient {
     fn post_json(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<String> {
+        self.post(url, bearer, body, Some("application/json"))
+    }
+
+    fn post_sql(&self, url: &str, bearer: Option<&str>, sql: &str) -> Result<String> {
+        self.post(url, bearer, sql, None)
+    }
+}
+
+impl LoopbackHttpClient {
+    fn post(
+        &self,
+        url: &str,
+        bearer: Option<&str>,
+        body: &str,
+        content_type: Option<&str>,
+    ) -> Result<String> {
         let (authority, path) = split_url(url)?;
         let address = authority
             .to_socket_addrs()
@@ -56,9 +76,12 @@ impl HttpClient for LoopbackHttpClient {
         // which is never rendered, logged, or put in an error.
         let mut request = format!(
             "POST {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+             Content-Length: {}\r\nConnection: close\r\n",
             body.len()
         );
+        if let Some(content_type) = content_type {
+            request.push_str(&format!("Content-Type: {content_type}\r\n"));
+        }
         if let Some(bearer) = bearer {
             request.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
         }
@@ -153,6 +176,7 @@ pub mod fake {
         failure: Option<String>,
         /// Refuse only the requests whose URL contains this — one reducer, not the whole node.
         refused: Option<String>,
+        response: Option<(String, String)>,
     }
 
     impl FakeHttp {
@@ -176,6 +200,13 @@ pub mod fake {
             Self {
                 failure: Some(message.to_string()),
                 refused: Some(needle.to_string()),
+                ..Self::default()
+            }
+        }
+
+        pub fn responding(needle: &str, body: &str) -> Self {
+            Self {
+                response: Some((needle.to_string(), body.to_string())),
                 ..Self::default()
             }
         }
@@ -209,7 +240,13 @@ pub mod fake {
                     return Err(Error::Http(format!("{url} answered HTTP 400: {message}")));
                 }
             }
-            Ok(if url.ends_with("/v1/identity") {
+            Ok(if let Some((needle, body)) = &self.response {
+                if url.contains(needle) {
+                    body.clone()
+                } else {
+                    String::new()
+                }
+            } else if url.ends_with("/v1/identity") {
                 format!(r#"{{"identity":"{MINTED_IDENTITY}","token":"{MINTED_TOKEN}"}}"#)
             } else {
                 String::new()
@@ -381,6 +418,21 @@ mod tests {
         let request_line = request.lines().next().unwrap();
         assert!(!request_line.contains(TOKEN), "{request_line}");
         assert!(!url.contains(TOKEN), "{url}");
+    }
+
+    #[test]
+    fn a_sql_read_matches_the_pinned_cli_request_shape() {
+        let node = FakeNode::answering_once("200 OK", r#"[{"schema":{},"rows":[[true]]}]"#);
+        LoopbackHttpClient
+            .post_sql(
+                &format!("{}/v1/database/realm/sql", node.url),
+                Some("eyJ.SECRET.SIG"),
+                "SELECT enabled FROM game_alpha_test_tools_enrollment",
+            )
+            .unwrap();
+
+        let request = node.request();
+        assert!(!request.contains("Content-Type:"), "{request}");
     }
 
     #[test]

@@ -101,6 +101,11 @@ fn run(args: &[String]) -> Result<i32> {
             let project = ProjectLayout::discover()?;
             cmd::account::create(&project, &user, source, &runner).map(|_| EXIT_OK)
         }
+        Command::AccountAlphaTestTools { realm_core, action } => {
+            let project = ProjectLayout::discover()?;
+            cmd::alpha_test_tools::run(&project, &runner, &inspector, &http, &realm_core, action)
+                .map(|_| EXIT_OK)
+        }
         Command::ConfigShow => cmd::config::show(&ProjectLayout::discover()?).map(|_| EXIT_OK),
         Command::ConfigSetClientData { path } => {
             cmd::config::set_client_data(&ProjectLayout::discover()?, &path).map(|_| EXIT_OK)
