@@ -1,10 +1,10 @@
 //! `lyracore import [world|vmaps]` — build the real world.
 //!
 //! A fresh checkout publishes a FIXTURE: a handful of demo creatures, one quest, enough to prove
-//! the stack is wired up. The real Elwynn/Westfall corridor — ~950 creature templates, ~640 quests,
-//! the loot/vendor/trainer tables, the terrain heightmap and the navigation grid — is not in this
-//! repository and never will be. It is RECONSTRUCTED on your machine, from two sources that are
-//! yours to obtain and not ours to redistribute:
+//! the stack is wired up. The Alliance early-game corridors, their loot/vendor/trainer tables,
+//! terrain heightmaps and navigation grids are not in this repository and never will be. They are
+//! RECONSTRUCTED on your machine, from two sources that are yours to obtain and not ours to
+//! redistribute:
 //!
 //!   1. cmangos' `classic-db` world database (GPL-3.0), pulled from cmangos' own public repository
 //!      at a commit this repo pins.
@@ -22,9 +22,8 @@
 //!   mode ordering, and the FLOOR_* manifest assertions. Every mode still SHELLS OUT to the pinned
 //!   `lyracore-importer` binary — this CLI gains no MPQ/DBC parsing and no module-schema crate
 //!   coupling; the queries below are the same textual `spacetime sql` probes the bash ran.
-//!   `import-world.sh` itself is NOT retired: it remains the by-hand advanced path (several
-//!   shards, a non-default box, a second continent) until this flow has proven parity on a fresh
-//!   provision, and this command deliberately does not run it.
+//!   `import-world.sh` itself is not retired: it remains the by-hand path for a custom legacy scope
+//!   or one canonical profile, while the CLI owns the complete Realm topology plan.
 //! - `import vmaps` drives the importer's `--vmap` mode (exact model/WMO collision triangles →
 //!   `game_vmap_chunk`) per world shard. It reads only YOUR client's archives — nothing is fetched
 //!   from the network — so it carries no consent gate.
@@ -36,9 +35,8 @@
 //! retuned floor never needs a CLI release.
 //!
 //! HOW MANY STAGES: the pull, the client, the importer build, then the modes + the re-arm + the
-//! floors PER POPULATED DATABASE — six on `dev up --single`, nine on the sharded fixture, which
-//! since #108 routes dungeons to `lyracore-instances` and therefore has to populate it. See
-//! [`populated_databases`].
+//! floors per content destination: six on `dev up --single`, twelve on the sharded fixture. See
+//! [`import_destinations`].
 
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::{ProjectLayout, Topology};
@@ -55,6 +53,16 @@ pub struct ImportOptions {
     pub accept: bool,
     /// `--client-data PATH`: where the 1.12.1 client's `Data/` directory is.
     pub client_data: Option<String>,
+    /// Explicit World Import Profile destinations. Supplying one requires the full production
+    /// plan, so fixture and production shard names cannot be mixed in one import.
+    pub profile_shards: Vec<String>,
+}
+
+/// What `import vmaps` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmapOptions {
+    pub client_data: Option<String>,
+    pub profile_shards: Vec<String>,
 }
 
 /// Asking the operator something on their terminal.
@@ -140,36 +148,73 @@ const OPTIONAL_ARCHIVES: [&str; 2] = ["model.MPQ", "wmo.MPQ"];
 /// inside the first stage.
 const POST_VANILLA_ARCHIVES: [&str; 2] = ["common.MPQ", "expansion.MPQ"];
 
-// ---- the canonical map-0 run, mirrored from import-world.sh ---------------------------------
-//
-// These literals are the bash flow's map-0 defaults, copied value for value — the numbers were
-// measured/derived against real dumps there, and that file's header comments remain their
-// documentation of record. The CLI runs ONLY this canonical corridor; every knob the bash exposes
-// (MAP, BOX, CENTER, a second continent, a region-shard slice) is the by-hand advanced path and
-// stays in `importer/scripts/import-world.sh`, which is why none of them appears here.
-
 /// Where `pull-classic-db.sh` assembles the dump — its documented output, and `--dump`'s input.
 /// Relative on purpose: every child runs from the checkout root, exactly like the bash flow.
 const DUMP_PATH: &str = ".import/classic-db-full.sql";
-/// Map 0 — Eastern Kingdoms; the canonical corridor is the only continent this command imports.
-const CANONICAL_MAP: &str = "0";
-/// `X0,X1,Y0,Y1` — full Elwynn + full Westfall + Redridge + the north-Duskwood spillover. The
-/// Goldshire class trainers sit at x=-9461.85, so X0 must stay well west of them (the regression
-/// import-world.sh's header documents).
-const CANONICAL_BOX: &str = "-11400,-8000,-3100,2000";
-/// The Deadmines interior rides the same clear+reload run as a whole extra map keyed by id.
-const DEADMINES_MAP: &str = "36";
-/// Out-of-box quest givers force-imported by entry — 10 NPCs whose spawns sit outside the box but
-/// whose quest chains complete inside it.
-const INCLUDE_CREATURES: &str = "344,11406,266,415,1343,6966,5165,6166,6569,5149";
-/// The caster-mob `--only` allowlist: spell ids the in-box Elwynn/Westfall casters reference,
-/// imported additively so the curated class kit survives. Extending it (the Defias casters) is
-/// dump-verification work that lives with the bash flow's EXTEND-HERE block.
-const CASTER_SPELL_IDS: &str = "53,133,143,1776,145,744,745,3149,3150,3238,3248,5416,5708,6016,\
-                                6268,6524,6660,6730,7159,7357,8014,8260,8646,8873,9080,10101,\
-                                10277,12023,12024,12170,12544,13322,13342,13375,13443,14030,\
-                                15572,15652,15657,15661,16144,16244,20712,20714,20720,20746,\
-                                20793,20808,23114,23260,23504,28265";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WorldProfile {
+    AllianceEastern,
+    AllianceKalimdor,
+    AllianceSingle,
+    Instances,
+}
+
+impl WorldProfile {
+    const SHARDED: [Self; 3] = [
+        Self::AllianceEastern,
+        Self::AllianceKalimdor,
+        Self::Instances,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::AllianceEastern => "alliance-eastern",
+            Self::AllianceKalimdor => "alliance-kalimdor",
+            Self::AllianceSingle => "alliance-single",
+            Self::Instances => "instances",
+        }
+    }
+
+    fn parse_sharded(name: &str) -> Option<Self> {
+        match name {
+            "alliance-eastern" => Some(Self::AllianceEastern),
+            "alliance-kalimdor" => Some(Self::AllianceKalimdor),
+            "instances" => Some(Self::Instances),
+            _ => None,
+        }
+    }
+
+    fn has_bounded_slices(self) -> bool {
+        !matches!(self, Self::Instances)
+    }
+
+    fn includes_eastern_corridors(self) -> bool {
+        matches!(self, Self::AllianceEastern | Self::AllianceSingle)
+    }
+
+    fn includes_kalimdor_corridors(self) -> bool {
+        matches!(self, Self::AllianceKalimdor | Self::AllianceSingle)
+    }
+
+    fn includes_instances(self) -> bool {
+        matches!(self, Self::AllianceSingle | Self::Instances)
+    }
+
+    fn open_world_maps(self) -> &'static [i64] {
+        match self {
+            Self::AllianceEastern => &[0],
+            Self::AllianceKalimdor => &[1],
+            Self::AllianceSingle => &[0, 1],
+            Self::Instances => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportDestination {
+    shard: String,
+    profile: WorldProfile,
+}
 
 // =============================================================================================
 //  `import world`
@@ -188,6 +233,10 @@ pub fn run_world(
     if let Some(raw) = &options.client_data {
         validate_client_data(Path::new(raw))?;
     }
+    let destinations = import_destinations(
+        RuntimeState::load(&project.state_file())?.topology(),
+        &options.profile_shards,
+    )?;
 
     // ---- consent, first and always ------------------------------------------------------------
     consent(prompt, options.accept)?;
@@ -218,13 +267,8 @@ pub fn run_world(
         ProjectLayout::IMPORT_MANIFEST_SCRIPT
     );
 
-    // Which databases this import POPULATES, and therefore how many stages there are. Not
-    // `world_shards()`: `lyracore-kalimdor` is in that list and is deliberately not here, because
-    // map 1 has no content in the dump slice this ETL imports — importing it would be a long run
-    // that lands nothing.
-    let databases = populated_databases(RuntimeState::load(&project.state_file())?.topology());
-    // Three fixed stages, then the modes + the re-arm + the floors per database.
-    let total = 3 + 3 * databases.len() as u8;
+    // Three fixed stages, then the modes + the re-arm + the floors per destination.
+    let total = 3 + 3 * destinations.len() as u8;
 
     // ---- stage 1: the world database dump -----------------------------------------------------
     stage(
@@ -261,7 +305,11 @@ pub fn run_world(
     println!("   client data: {}", client_data.display());
 
     // ---- stage 3: the importer binary ---------------------------------------------------------
-    stage(3, total, "building the importer (cargo build --bin lyracore-importer)");
+    stage(
+        3,
+        total,
+        "building the importer (cargo build --bin lyracore-importer)",
+    );
     runner
         .run_and_wait(&build_importer_command(project))
         .map_err(|e| {
@@ -273,48 +321,39 @@ pub fn run_world(
             )
         })?;
 
-    // ---- the modes, the re-arm and the floors, PER POPULATED DATABASE, INTERLEAVED ------------
+    // ---- the modes, the re-arm and the floors, per destination, interleaved -------------------
     // Interleaved rather than all-modes-then-all-floors so a failure part way leaves one COMPLETE
     // database rather than two half ones — and because modes-then-floors is the order the bash
     // flow was run in, per database, against real dumps.
-    for (i, database) in databases.iter().enumerate() {
+    for (i, destination) in destinations.iter().enumerate() {
         let n = 4 + 3 * i as u8;
+        let database = destination.shard.as_str();
+        let profile = destination.profile.name();
+        let contents = if destination.profile.has_bounded_slices() {
+            "creatures, quests, loot, vendors, terrain, navigation, spells"
+        } else {
+            "instance creatures, loot, gameobjects, spells"
+        };
 
-        // ---- the importer's modes, in the bash flow's order ------------------------------------
+        // ---- the importer's modes, in the bash flow's order ----------------------------------
         stage(
             n,
             total,
-            &format!(
-                "importing the world into {database} (creatures, quests, loot, vendors, terrain, \
-                 navigation, spells)"
-            ),
+            &format!("importing {profile} into {database} ({contents})"),
         );
         if i == 0 {
             println!(
                 "   this is the long one — tens of minutes; each mode prints its own progress."
             );
-        } else {
-            // Why a second full run and not a map-36 slice: the mode list has no map-36-only
-            // shape, and narrowing one means teaching the terrain/nav assertion floors AND
-            // `db_never_imported`'s fresh-shard signal to stand down — ways to pass an import
-            // that imported nothing, to save wall time on a command that already asks for
-            // consent. The duplicated map-0 rows are inert: routing never reads them, and the
-            // creature tick's movement/AI passes are seeded from PLAYERS
-            // (`module/src/creatures/tick/mod.rs`, `active_cell_creatures`), so a playerless
-            // second copy of Elwynn costs one table scan per tick, not a second simulation.
-            println!(
-                "   the instance pool needs its OWN map-36 spawn rows — it is the database that \
-                 spawns\n   a Deadmines run's population, and nothing reports an empty instance at \
-                 runtime.\n   As long again as the pass above; the duplicated map-0 rows are never \
-                 routed to."
-            );
+        } else if destination.profile == WorldProfile::Instances {
+            println!("   instance-only profile: open-world terrain and navigation are skipped.");
         }
-        for (what, advice, command) in world_etl_commands(project, &client_data, database) {
+        for (what, advice, command) in world_etl_commands(project, &client_data, destination) {
             println!();
             println!("   -> {what}");
-            runner
-                .run_streaming(&command)
-                .map_err(|e| stage_failure(what, advice, e))?;
+            runner.run_streaming(&command).map_err(|e| {
+                stage_failure(&format!("{what} for {database} ({profile})"), advice, e)
+            })?;
         }
 
         // ---- re-arm this database --------------------------------------------------------------
@@ -332,7 +371,7 @@ pub fn run_world(
                 .run_and_wait(&call_command(project, database, reducer))
                 .map_err(|e| {
                     stage_failure(
-                        reducer,
+                        &format!("{reducer} for {database} ({profile})"),
                         "Both reducers are operator-gated — `lyracore dev up` publishes the \
                          module and claims the operator; is the stack up (`lyracore dev status`)?",
                         e,
@@ -346,7 +385,13 @@ pub fn run_world(
             total,
             &format!("asserting the import floors on {database} (the FLOOR_* manifest)"),
         );
-        assert_floors(project, runner, database, &floors)?;
+        assert_floors(project, runner, database, destination.profile, &floors).map_err(
+            |error| {
+                Error::Process(format!(
+                    "asserting import floors for {database} ({profile}) failed: {error}"
+                ))
+            },
+        )?;
     }
 
     println!();
@@ -357,17 +402,84 @@ pub fn run_world(
     Ok(())
 }
 
-/// The databases `import` populates, in the order it populates them.
-///
-/// The default world shard always, and the instance pool whenever the fixture routes dungeons there
-/// (#108) — because that database is the one that spawns a dungeon run's population, and a realm
-/// where it was skipped reports NOTHING: the entry is routed correctly and the instance comes up
-/// empty. `lyracore-kalimdor` is deliberately absent: map 1 has no content in this dump slice.
-fn populated_databases(topology: Topology) -> Vec<&'static str> {
-    match topology {
-        Topology::Single => vec![ProjectLayout::DATABASE],
-        Topology::Sharded => vec![ProjectLayout::DATABASE, ProjectLayout::INSTANCE_POOL],
+/// Content destinations, in import order. The importer owns every profile's spatial facts; the CLI
+/// owns only the Realm topology assignment.
+fn import_destinations(
+    topology: Topology,
+    profile_shards: &[String],
+) -> Result<Vec<ImportDestination>> {
+    if profile_shards.is_empty() {
+        return Ok(match topology {
+            Topology::Single => vec![ImportDestination {
+                shard: ProjectLayout::DATABASE.to_string(),
+                profile: WorldProfile::AllianceSingle,
+            }],
+            Topology::Sharded => vec![
+                ImportDestination {
+                    shard: ProjectLayout::DATABASE.to_string(),
+                    profile: WorldProfile::AllianceEastern,
+                },
+                ImportDestination {
+                    shard: ProjectLayout::KALIMDOR_SHARD.to_string(),
+                    profile: WorldProfile::AllianceKalimdor,
+                },
+                ImportDestination {
+                    shard: ProjectLayout::INSTANCE_POOL.to_string(),
+                    profile: WorldProfile::Instances,
+                },
+            ],
+        });
     }
+
+    let mut configured = BTreeMap::new();
+    for assignment in profile_shards {
+        let (profile, shard) = assignment.split_once('=').ok_or_else(|| {
+            Error::Usage(format!(
+                "`--profile-shard` needs PROFILE=SHARD, got {assignment:?}"
+            ))
+        })?;
+        let profile = WorldProfile::parse_sharded(profile).ok_or_else(|| {
+            Error::Usage(format!(
+                "`--profile-shard` accepts alliance-eastern, alliance-kalimdor, or instances; got {profile:?}"
+            ))
+        })?;
+        if shard.is_empty()
+            || !shard
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(Error::Usage(format!(
+                "`--profile-shard` has an invalid shard name {shard:?}; use letters, digits, `-`, or `_`"
+            )));
+        }
+        if configured.insert(profile, shard.to_string()).is_some() {
+            return Err(Error::Usage(format!(
+                "`--profile-shard` names {} more than once",
+                profile.name()
+            )));
+        }
+    }
+
+    let missing: Vec<&str> = WorldProfile::SHARDED
+        .iter()
+        .filter(|profile| !configured.contains_key(profile))
+        .map(|profile| profile.name())
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::Usage(format!(
+            "production profile destinations must name alliance-eastern, alliance-kalimdor, and instances exactly once; missing {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(WorldProfile::SHARDED
+        .iter()
+        .map(|profile| ImportDestination {
+            shard: configured
+                .remove(profile)
+                .expect("every required profile was checked"),
+            profile: *profile,
+        })
+        .collect())
 }
 
 /// Print the notice and require an affirmative answer. `--accept` answers it in advance; nothing
@@ -394,26 +506,23 @@ fn consent(prompt: &dyn Prompt, accept: bool) -> Result<()> {
 // =============================================================================================
 
 /// Drive the importer's `--vmap` mode — exact per-cell model/WMO collision triangles →
-/// `game_vmap_chunk` — for each world shard of the running topology.
+/// `game_vmap_chunk` — for each bounded World Shard profile in the running topology.
 ///
 /// No consent gate, on purpose: unlike `import world` this fetches nothing from anyone — the only
 /// input is the operator's own client archives, named by the same `--client-data`/config/prompt
 /// chain, and the only output is the local database. The notice below still says so before
 /// anything is read.
 ///
-/// Per shard means per world shard with a KNOWN slice. The default shard gets map 0 under the
-/// canonical corridor box — the same rectangle the world import covered, so collision coverage
-/// matches nav coverage. Any other shard is skipped loudly rather than guessed at: vmaps follow
-/// content, this fixture imports no Kalimdor content, and a guessed box is the expensive kind of
-/// wrong (the derive-not-guess rule import-world.sh's MAP!=0 branch enforces for the same reason).
+/// The canonical profile is shared with the dump, terrain and navigation modes, so collision
+/// coverage follows the same bounded slices without this caller reproducing their coordinates.
 pub fn run_vmaps(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     prompt: &dyn Prompt,
-    client_data: Option<&str>,
+    options: &VmapOptions,
 ) -> Result<()> {
     // Same early check as `import world`: a typo in the flag is a usage mistake, refused first.
-    if let Some(raw) = client_data {
+    if let Some(raw) = &options.client_data {
         validate_client_data(Path::new(raw))?;
     }
 
@@ -427,7 +536,7 @@ pub fn run_vmaps(
     println!("from the network, and nothing read here leaves your machine.");
     println!();
 
-    let data = resolve_client_data(project, prompt, client_data)?;
+    let data = resolve_client_data(project, prompt, options.client_data.as_deref())?;
     println!("   client data: {}", data.display());
 
     runner
@@ -441,43 +550,45 @@ pub fn run_vmaps(
             )
         })?;
 
-    let shards = RuntimeState::load(&project.state_file())?
-        .topology()
-        .world_shards();
-    for shard in shards {
+    let destinations = import_destinations(
+        RuntimeState::load(&project.state_file())?.topology(),
+        &options.profile_shards,
+    )?;
+    let world_shards: Vec<ImportDestination> = destinations
+        .into_iter()
+        .filter(|destination| destination.profile.has_bounded_slices())
+        .collect();
+    for destination in &world_shards {
+        let shard = destination.shard.as_str();
+        let profile = destination.profile.name();
         println!();
-        if shard == ProjectLayout::DATABASE {
-            println!("==> {shard}: vmap extract + import (map {CANONICAL_MAP}, the canonical corridor box)");
-            runner
-                .run_streaming(&vmap_command(project, shard, &data))
-                .map_err(|e| {
-                    stage_failure(
-                        "importing vmaps",
-                        "The extract reads model.MPQ/wmo.MPQ out of the client archives; \
-                         `no MCNK cells intersected the slice` means the box/map pair matched no \
-                         tiles. The --apply half needs the node up and the shard published \
-                         (`lyracore dev up`).",
-                        e,
-                    )
-                })?;
-        } else {
-            println!(
-                "==> {shard}: skipped — no canonical --box for map {}. vmaps follow content, and \
-                 this fixture imports none there; after a by-hand map-{} world import \
-                 (importer/scripts/import-world.sh), run its box through:\n      \
-                 ./{} --db {shard} --vmap <Data> --map {} --box <your box> --apply",
-                ProjectLayout::KALIMDOR_MAP,
-                ProjectLayout::KALIMDOR_MAP,
-                ProjectLayout::IMPORTER_BIN,
-                ProjectLayout::KALIMDOR_MAP,
-            );
-        }
+        println!("==> {shard}: vmap extract + import ({profile})");
+        runner
+            .run_streaming(&vmap_command(project, destination, &data))
+            .map_err(|e| {
+                stage_failure(
+                    &format!("importing vmaps for {shard} ({profile})"),
+                    "The extract reads model.MPQ/wmo.MPQ out of the client archives; \
+                     `no MCNK cells intersected the profile` means its bounded slices matched no \
+                     tiles. The --apply half needs the node up and the World Shard published \
+                     (`lyracore dev up`).",
+                    e,
+                )
+            })?;
     }
 
     println!();
     println!("vmaps imported. The exact rays stay gated until you flip the module config:");
-    println!("  spacetime call --server {} {} debug_set_vmap_enabled true", ProjectLayout::stdb_uri(), ProjectLayout::DATABASE);
-    println!("— flipping it is a runtime decision, not part of this import, so it is not done here.");
+    for destination in world_shards {
+        println!(
+            "  spacetime call --server {} {} debug_set_vmap_enabled true",
+            ProjectLayout::stdb_uri(),
+            destination.shard
+        );
+    }
+    println!(
+        "— flipping it is a runtime decision, not part of this import, so it is not done here."
+    );
     Ok(())
 }
 
@@ -660,13 +771,14 @@ fn build_importer_command(project: &ProjectLayout) -> CommandSpec {
         .cwd(project.root.clone())
 }
 
-/// A base importer invocation: the pinned binary, the target database named EXPLICITLY. The
-/// importer's own `--db` default is the fixture database too, but a silent default is how a shard
-/// once had rows written to a different database entirely — so nothing here is left to one.
+/// A base importer invocation: the pinned binary, destination Shard and loopback endpoint named
+/// explicitly. Neither may fall through to ambient CLI state.
 fn importer_command(project: &ProjectLayout, database: &str) -> CommandSpec {
     CommandSpec::new(project.importer_bin().to_string_lossy().to_string())
         .arg("--db")
         .arg(database)
+        .arg("--server")
+        .arg(ProjectLayout::stdb_uri())
         .cwd(project.root.clone())
 }
 
@@ -681,57 +793,56 @@ fn importer_command(project: &ProjectLayout, database: &str) -> CommandSpec {
 fn world_etl_commands(
     project: &ProjectLayout,
     client_data: &Path,
-    database: &str,
+    destination: &ImportDestination,
 ) -> Vec<(&'static str, &'static str, CommandSpec)> {
     let data = client_data.to_string_lossy().to_string();
-    vec![
-        (
-            "world slice (creatures, quests, loot, vendors, gameobjects)",
-            "The dump families are clear+reload — a failed run leaves the target partially \
-             loaded; re-run after fixing the cause. `no spawns matched the filter` means the \
-             canonical box does not fit your dump: derive yours with --print-extents and use the \
-             by-hand path, importer/scripts/import-world.sh.",
-            importer_command(project, database)
-                .arg("--dump")
-                .arg(DUMP_PATH)
-                .arg("--dbc")
-                .arg(&data)
-                .arg("--map")
-                .arg(CANONICAL_MAP)
-                .arg("--box")
-                .arg(CANONICAL_BOX)
-                .arg("--include-map")
-                .arg(DEADMINES_MAP)
-                .arg("--include-creatures")
-                .arg(INCLUDE_CREATURES)
-                .arg("--apply"),
-        ),
-        (
+    let database = destination.shard.as_str();
+    let profile = destination.profile;
+    let dump = importer_command(project, database)
+        .arg("--dump")
+        .arg(DUMP_PATH)
+        .arg("--dbc")
+        .arg(&data)
+        .arg("--world-profile")
+        .arg(profile.name())
+        .arg("--apply");
+
+    let mut commands = vec![(
+        "world content (creatures, quests, loot, vendors, gameobjects)",
+        "The dump families are clear+reload — a failed run leaves the target partially loaded; \
+         re-run after fixing the cause. `no spawns matched the profile` means the canonical \
+         profile does not fit the pinned dump; verify its dump-derived scope in the importer.",
+        dump,
+    )];
+
+    if profile.has_bounded_slices() {
+        commands.extend([
+            (
             "terrain heightmap (ground-z)",
             "Reads terrain.MPQ. A self-check failure is an axis/interpolation regression, not a \
              missing file — do not re-run past it.",
             importer_command(project, database)
                 .arg("--terrain")
                 .arg(&data)
-                .arg("--map")
-                .arg(CANONICAL_MAP)
-                .arg("--box")
-                .arg(CANONICAL_BOX)
+                .arg("--world-profile")
+                .arg(profile.name())
                 .arg("--apply"),
-        ),
-        (
+            ),
+            (
             "nav grid (walkability / line of sight)",
             "Reads model.MPQ/wmo.MPQ. A handful of M2 parse warnings is expected (decorative \
              props); a calibration failure means transform drift and must not be re-run past.",
             importer_command(project, database)
                 .arg("--nav")
                 .arg(&data)
-                .arg("--map")
-                .arg(CANONICAL_MAP)
-                .arg("--box")
-                .arg(CANONICAL_BOX)
+                .arg("--world-profile")
+                .arg(profile.name())
                 .arg("--apply"),
-        ),
+            ),
+        ]);
+    }
+
+    commands.extend([
         (
             "character-creation + faction DBC tables",
             "Reads dbc.MPQ. Without this pass non-Warrior classes inherit the Warrior loadout — \
@@ -767,24 +878,13 @@ fn world_etl_commands(
              \"requested N ids but matched M\" warning names ids your client build does not have.",
             class_spells_command(project, client_data, database),
         ),
-        (
-            "caster-mob spells (the Elwynn/Westfall --only allowlist)",
-            "Additive --only import. A \"requested N ids but matched M\" warning is a wrong or \
-             typo'd id in the allowlist — correct the id rather than shipping a mute caster.",
-            importer_command(project, database)
-                .arg("--dbc")
-                .arg(&data)
-                .arg("--spells")
-                .arg("--apply")
-                .arg("--only")
-                .arg(CASTER_SPELL_IDS),
-        ),
-    ]
+    ]);
+    commands
 }
 
-/// The class-spell import takes the client path as its one argument and the database from `DB` —
-/// pass BOTH explicitly, because its `DB` default is the fixture database and a silent default is
-/// how a shard once had its spells written to a different database entirely.
+/// The class-spell import takes the client path as its argument, the destination from `DB`, and the
+/// node from `SPACETIME_SERVER`. Pass all three explicitly so no Shard or node comes from ambient
+/// shell state.
 fn class_spells_command(
     project: &ProjectLayout,
     client_data: &Path,
@@ -793,6 +893,7 @@ fn class_spells_command(
     from_root(project, project.import_class_spells_script())
         .arg(client_data.to_string_lossy().to_string())
         .env("DB", database)
+        .env("SPACETIME_SERVER", ProjectLayout::stdb_uri())
 }
 
 /// `spacetime call`, pinned to the loopback node — bare `spacetime call` inherits the CLI's
@@ -819,18 +920,17 @@ fn sql_command(project: &ProjectLayout, database: &str, query: &str) -> CommandS
         .cwd(project.root.clone())
 }
 
-fn vmap_command(project: &ProjectLayout, shard: &str, client_data: &Path) -> CommandSpec {
-    CommandSpec::new(project.importer_bin().to_string_lossy().to_string())
-        .arg("--db")
-        .arg(shard)
+fn vmap_command(
+    project: &ProjectLayout,
+    destination: &ImportDestination,
+    client_data: &Path,
+) -> CommandSpec {
+    importer_command(project, &destination.shard)
         .arg("--vmap")
         .arg(client_data.to_string_lossy().to_string())
-        .arg("--map")
-        .arg(CANONICAL_MAP)
-        .arg("--box")
-        .arg(CANONICAL_BOX)
+        .arg("--world-profile")
+        .arg(destination.profile.name())
         .arg("--apply")
-        .cwd(project.root.clone())
 }
 
 fn stage(number: u8, total: u8, what: &str) {
@@ -852,7 +952,7 @@ fn stage_failure(what: &str, advice: &str, cause: Error) -> Error {
 /// import-manifest-smoke.sh pins for the bash consumer): `run_world` demands every one of these
 /// from the sourced manifest BEFORE the first stage runs, so a floor that goes missing fails the
 /// import up front instead of downgrading its check to a silent pass.
-const CONSUMED_FLOORS: [&str; 47] = [
+const CONSUMED_FLOORS: [&str; 63] = [
     "FLOOR_CLASS_TRAINERS",
     "FLOOR_TRAINER_OFFERINGS_CLASS",
     "FLOOR_TRAINER_OFFERINGS_PROFESSION",
@@ -872,6 +972,19 @@ const CONSUMED_FLOORS: [&str; 47] = [
     "FLOOR_QUESTGIVER_COVERAGE",
     "FLOOR_SENTINEL_HILL_VENDOR",
     "FLOOR_START_ITEMS_CLASSES",
+    "FLOOR_HUMAN_START_POSITIONS",
+    "FLOOR_DWARF_START_POSITIONS",
+    "FLOOR_GNOME_START_POSITIONS",
+    "FLOOR_NIGHT_ELF_START_POSITIONS",
+    "FLOOR_DWARF_START_ITEMS_CLASSES",
+    "FLOOR_GNOME_START_ITEMS_CLASSES",
+    "FLOOR_NIGHT_ELF_START_ITEMS_CLASSES",
+    "FLOOR_DUN_MOROGH_START",
+    "FLOOR_LOCH_MODAN_CONTENT",
+    "FLOOR_TELDRASSIL_START",
+    "FLOOR_DARKSHORE_CONTENT",
+    "FLOOR_CORRIDOR_QUEST_LEVEL_BAND",
+    "FLOOR_CORRIDOR_GAMEOBJECTS",
     "FLOOR_CASTER_CAST_ROWS",
     "FLOOR_SPELL_TOTAL",
     "FLOOR_SPELL_CHAIN",
@@ -887,6 +1000,9 @@ const CONSUMED_FLOORS: [&str; 47] = [
     "FLOOR_AREAS",
     "FLOOR_AREA_TRIGGERS",
     "FLOOR_GRAVEYARDS",
+    "FLOOR_TAXI_NODES",
+    "FLOOR_TAXI_PATHS",
+    "FLOOR_TAXI_PATH_NODES",
     "FLOOR_GRAVEYARD_ZONE_RESOLVE",
     "FLOOR_AREATRIGGER_TELEPORTS",
     "FLOOR_DEADMINES_PORTAL_ROUNDTRIP",
@@ -945,12 +1061,16 @@ fn floors_command(project: &ProjectLayout) -> CommandSpec {
         .arg("-c")
         .arg(FLOOR_DUMP_SNIPPET)
         .arg("bash")
-        .arg(project.import_manifest_script().to_string_lossy().to_string())
-        // The CLI runs ONLY the canonical map-0 corridor, so the manifest's SLICE/MAP override
-        // block must never fire — pinned here rather than inherited, because a contributor's
-        // exported MAP=1 would otherwise silently swap every floor for a presence value.
+        .arg(
+            project
+                .import_manifest_script()
+                .to_string_lossy()
+                .to_string(),
+        )
+        // Canonical profiles are bounded slices, so use the manifest's conservative slice floors.
+        // Named corridor checks below provide the stronger profile-specific evidence.
         .env("MAP", "0")
-        .env("SLICE", "0")
+        .env("SLICE", "1")
         .cwd(project.root.clone())
 }
 
@@ -1193,20 +1313,225 @@ fn audit_service(
     providing.len() as i64
 }
 
-/// The FLOOR_* assertion pass — `import-world.sh`'s `chk` block, ported check for check, label
-/// for label, in the bash order. Everything here runs on the canonical map-0 corridor run, so the
-/// bash's `chk0`/`chk36` map fences collapse to always-on (the CLI cannot express another
-/// continent — that is the by-hand path).
-///
-/// Left in the bash on purpose: the one-continent-per-database preflight and post-run re-assert
-/// (this flow only ever runs map 0+36 at the fixture database, so the map switch they guard
-/// against cannot be expressed here) and every MAP/BOX/CENTER knob. The service-coverage audit is
-/// PORTED, natively — the bash needed python3 for it and skipped it when absent; this pass has no
-/// skip path.
+fn verify_alliance_creation_data(a: &mut Assertions<'_>) -> Result<()> {
+    for (key, label, query) in [
+        (
+            "FLOOR_HUMAN_START_POSITIONS",
+            "Human start positions (all 6 classes, map 0)",
+            "SELECT race_class FROM game_start_position WHERE race=1 AND map_id=0",
+        ),
+        (
+            "FLOOR_DWARF_START_POSITIONS",
+            "Dwarf start positions (all 5 classes, map 0)",
+            "SELECT race_class FROM game_start_position WHERE race=3 AND map_id=0",
+        ),
+        (
+            "FLOOR_GNOME_START_POSITIONS",
+            "Gnome start positions (all 4 classes, map 0)",
+            "SELECT race_class FROM game_start_position WHERE race=7 AND map_id=0",
+        ),
+        (
+            "FLOOR_NIGHT_ELF_START_POSITIONS",
+            "Night Elf start positions (all 5 classes, map 1)",
+            "SELECT race_class FROM game_start_position WHERE race=4 AND map_id=1",
+        ),
+    ] {
+        a.chk_count(key, label, query, RowMatch::Numeric)?;
+    }
+
+    for (key, label, query) in [
+        (
+            "FLOOR_DWARF_START_ITEMS_CLASSES",
+            "Dwarf start-item families (no Human fallback)",
+            "SELECT race_class FROM game_start_item WHERE race_class=769 OR race_class=770 OR race_class=771 OR race_class=772 OR race_class=773",
+        ),
+        (
+            "FLOOR_GNOME_START_ITEMS_CLASSES",
+            "Gnome start-item families (no Human fallback)",
+            "SELECT race_class FROM game_start_item WHERE race_class=1793 OR race_class=1796 OR race_class=1800 OR race_class=1801",
+        ),
+        (
+            "FLOOR_NIGHT_ELF_START_ITEMS_CLASSES",
+            "Night Elf start-item families (no Human fallback)",
+            "SELECT race_class FROM game_start_item WHERE race_class=1025 OR race_class=1027 OR race_class=1028 OR race_class=1029 OR race_class=1035",
+        ),
+    ] {
+        let families: BTreeSet<i64> = a.values(query)?.into_iter().collect();
+        a.chk(key, label, families.len() as i64)?;
+    }
+    Ok(())
+}
+
+fn verify_named_corridor(
+    a: &mut Assertions<'_>,
+    label: &str,
+    map: i64,
+    giver: u32,
+    floor: &'static str,
+) -> Result<()> {
+    a.chk_count(
+        floor,
+        &format!("{label} correct-map quest-giver spawn ({giver}, map {map})"),
+        &format!("SELECT guid FROM game_creature_spawn WHERE entry={giver} AND map_id={map}"),
+        RowMatch::AnyDigit,
+    )?;
+    a.chk_count(
+        floor,
+        &format!("{label} quest-giver relation ({giver})"),
+        &format!("SELECT quest_entry FROM game_creature_quest WHERE creature_entry={giver}"),
+        RowMatch::Numeric,
+    )?;
+    let mut levels_in_band = 0;
+    for quest in a.values(&format!(
+        "SELECT quest_entry FROM game_creature_quest WHERE creature_entry={giver}"
+    ))? {
+        levels_in_band += a
+            .values(&format!(
+                "SELECT quest_level FROM game_quest_template WHERE entry={quest}"
+            ))?
+            .into_iter()
+            .filter(|level| (1..=20).contains(level))
+            .count() as i64;
+    }
+    a.chk(
+        "FLOOR_CORRIDOR_QUEST_LEVEL_BAND",
+        &format!("{label} quest level band (1-20)"),
+        levels_in_band,
+    )
+}
+
+fn verify_graveyard_zone(a: &mut Assertions<'_>, label: &str, zone: i64) -> Result<()> {
+    let mut resolved = 0;
+    for id in a.values(&format!(
+        "SELECT safe_loc_id FROM game_graveyard_zone WHERE zone_id = {zone}"
+    ))? {
+        if a.count(
+            &format!("SELECT id FROM game_graveyard WHERE id = {id}"),
+            RowMatch::Exactly(id),
+        )? > 0
+        {
+            resolved += 1;
+        }
+    }
+    a.chk(
+        "FLOOR_GRAVEYARD_ZONE_RESOLVE",
+        &format!("{label} graveyard-zone links resolve (zone {zone})"),
+        resolved,
+    )
+}
+
+fn verify_profile_corridors(a: &mut Assertions<'_>, profile: WorldProfile) -> Result<()> {
+    if profile.includes_eastern_corridors() {
+        verify_named_corridor(a, "Dun Morogh start", 0, 658, "FLOOR_DUN_MOROGH_START")?;
+        a.chk_count(
+            "FLOOR_DUN_MOROGH_START",
+            "Dun Morogh Paladin trainer (Bromos Grummner 926)",
+            "SELECT spell_id FROM game_trainer_spell WHERE trainer_entry=926",
+            RowMatch::Numeric,
+        )?;
+        a.chk_count(
+            "FLOOR_DUN_MOROGH_START",
+            "Dun Morogh vendor (Durnan Furcutter 836)",
+            "SELECT item_entry FROM game_npc_vendor WHERE creature_entry=836",
+            RowMatch::Numeric,
+        )?;
+        verify_named_corridor(
+            a,
+            "Loch Modan follow-on",
+            0,
+            1340,
+            "FLOOR_LOCH_MODAN_CONTENT",
+        )?;
+        a.chk_count(
+            "FLOOR_LOCH_MODAN_CONTENT",
+            "Loch Modan Mining trainer (Brock Stoneseeker 1681)",
+            "SELECT spell_id FROM game_trainer_spell WHERE trainer_entry=1681",
+            RowMatch::Numeric,
+        )?;
+        a.chk_count(
+            "FLOOR_CORRIDOR_GAMEOBJECTS",
+            "Eastern profile GameObjects (map 0)",
+            "SELECT guid FROM game_gameobject WHERE map_id=0",
+            RowMatch::AnyDigit,
+        )?;
+        verify_graveyard_zone(a, "Dun Morogh", 1)?;
+        verify_graveyard_zone(a, "Loch Modan", 38)?;
+    }
+    if profile.includes_kalimdor_corridors() {
+        verify_named_corridor(a, "Teldrassil start", 1, 2079, "FLOOR_TELDRASSIL_START")?;
+        a.chk_count(
+            "FLOOR_TELDRASSIL_START",
+            "Teldrassil Warrior trainer (Alyissia 3593)",
+            "SELECT spell_id FROM game_trainer_spell WHERE trainer_entry=3593",
+            RowMatch::Numeric,
+        )?;
+        verify_named_corridor(
+            a,
+            "Darkshore follow-on",
+            1,
+            10219,
+            "FLOOR_DARKSHORE_CONTENT",
+        )?;
+        a.chk_count(
+            "FLOOR_DARKSHORE_CONTENT",
+            "Darkshore vendor (Laird 4200)",
+            "SELECT item_entry FROM game_npc_vendor WHERE creature_entry=4200",
+            RowMatch::Numeric,
+        )?;
+        a.chk_count(
+            "FLOOR_CORRIDOR_GAMEOBJECTS",
+            "Kalimdor profile GameObjects (map 1)",
+            "SELECT guid FROM game_gameobject WHERE map_id=1",
+            RowMatch::AnyDigit,
+        )?;
+        verify_graveyard_zone(a, "Teldrassil", 141)?;
+        verify_graveyard_zone(a, "Darkshore", 148)?;
+    }
+    Ok(())
+}
+
+fn verify_caster_spell_catalogue(a: &mut Assertions<'_>) -> Result<()> {
+    let mut missing = 0;
+    for table in ["game_creature_cast", "game_creature_spell"] {
+        let spells: BTreeSet<i64> = a
+            .values(&format!("SELECT spell_id FROM {table}"))?
+            .into_iter()
+            .collect();
+        for spell in spells {
+            if a.count(
+                &format!("SELECT spell_id FROM game_spell WHERE spell_id = {spell}"),
+                RowMatch::Numeric,
+            )? > 0
+            {
+                continue;
+            }
+            let entries: BTreeSet<i64> = a
+                .values(&format!(
+                    "SELECT creature_entry FROM {table} WHERE spell_id = {spell}"
+                ))?
+                .into_iter()
+                .collect();
+            println!(
+                "  FAIL  caster spell catalogue: {table} creature entry/entries {entries:?} reference missing spell {spell}"
+            );
+            missing += 1;
+        }
+    }
+    if missing == 0 {
+        println!("  ok    caster spell catalogue: every imported caster spell resolves");
+    } else {
+        a.failed += missing;
+    }
+    Ok(())
+}
+
+/// Profile-aware post-import Verification. Global catalogue checks run on every destination,
+/// corridor checks follow the bounded slices, and instance checks run only where map 36 is owned.
 fn assert_floors(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     database: &str,
+    profile: WorldProfile,
     floors: &Floors,
 ) -> Result<()> {
     let mut a = Assertions {
@@ -1216,180 +1541,208 @@ fn assert_floors(
         floors,
         failed: 0,
     };
-    println!("   assertions (map {CANONICAL_MAP} → {database}):");
+    println!("   assertions ({} → {database}):", profile.name());
 
-    a.chk_count(
-        "FLOOR_CLASS_TRAINERS",
-        "Goldshire anchor trainers spawned {328,377,906,913,917,927} (NOT total coverage — see the service-coverage audit below)",
-        "SELECT guid FROM game_world_entity WHERE owner_guid=0 AND (entry=328 OR entry=377 OR entry=906 OR entry=913 OR entry=917 OR entry=927)",
-        RowMatch::Guid,
-    )?;
-    a.chk_count(
-        "FLOOR_TRAINER_OFFERINGS_CLASS",
-        "class trainer offerings (learn_skill_line=0)",
-        "SELECT spell_id FROM game_trainer_spell WHERE learn_skill_line = 0",
-        RowMatch::Numeric,
-    )?;
-    a.chk_count(
-        "FLOOR_TRAINER_OFFERINGS_PROFESSION",
-        "profession learn offerings (learn_skill_line>0)",
-        "SELECT spell_id FROM game_trainer_spell WHERE learn_skill_line > 0",
-        RowMatch::Numeric,
-    )?;
-    a.chk_count(
-        "FLOOR_GATHER_NODE_GO",
-        "gather-node GO spawns",
-        "SELECT guid FROM game_gameobject",
-        RowMatch::AnyDigit,
-    )?;
-    a.chk_count(
-        "FLOOR_TERRAIN_CHUNKS",
-        "terrain chunks (ground-z heightmap)",
-        "SELECT key FROM game_terrain_chunk",
-        RowMatch::AnyDigit,
-    )?;
-    a.chk_count(
-        "FLOOR_NAV_CHUNKS",
-        "nav chunks (walkability/LoS grid)",
-        "SELECT key FROM game_nav_chunk",
-        RowMatch::AnyDigit,
-    )?;
-    a.chk_count(
-        "FLOOR_INNKEEPER_FARLEY",
-        "innkeeper Farley(295) spawned",
-        "SELECT guid FROM game_world_entity WHERE entry=295 AND owner_guid=0",
-        RowMatch::Guid,
-    )?;
-    a.chk_count(
-        "FLOOR_CONTINENT_SPAWNS",
-        "spawn rows on this run's map (0)",
-        "SELECT guid FROM game_creature_spawn WHERE map_id = 0",
-        RowMatch::AnyDigit,
-    )?;
-    a.chk_count(
-        "FLOOR_QUEST_GIVER_RELATIONS",
-        "quest-giver relations",
-        "SELECT quest_entry FROM game_creature_quest",
-        RowMatch::Numeric,
-    )?;
+    verify_alliance_creation_data(&mut a)?;
+    verify_profile_corridors(&mut a, profile)?;
 
-    // The quest-level bands filter raw values shell-side in the bash (a single-column inequality
-    // filter in SQL is itself the can-return-0-rows-wrongly trap its comment cites) — same here.
-    let quest_levels = a.values("SELECT quest_level FROM game_quest_template")?;
-    let l6_10 = quest_levels.iter().filter(|l| (6..=10).contains(*l)).count() as i64;
-    a.chk("FLOOR_QUESTS_L6_10", "L6-10 quests (quest_level band)", l6_10)?;
-    let l10_20 = quest_levels.iter().filter(|l| (10..=20).contains(*l)).count() as i64;
-    a.chk(
-        "FLOOR_QUESTS_L10_20",
-        "L10-20 quests (Westfall quest_level band)",
-        l10_20,
-    )?;
-    let chained = a
-        .values("SELECT next_quest_id FROM game_quest_template")?
-        .iter()
-        .filter(|v| **v > 0)
-        .count() as i64;
-    a.chk(
-        "FLOOR_QUESTS_CHAINED",
-        "chained quests (next_quest_id>0) [V]",
-        chained,
-    )?;
-    // Timed quests are coverage-printed only, no floor — plausibly zero in this slice, per the
-    // manifest's own note.
-    let timed = a
-        .values("SELECT limit_time FROM game_quest_template")?
-        .iter()
-        .filter(|v| **v > 0)
-        .count();
-    println!("  ..    timed quests (limit_time>0) [V]: {timed}");
-
-    a.chk_count(
-        "FLOOR_LIVE_CREATURES",
-        "live creature entities",
-        "SELECT guid FROM game_world_entity WHERE entry>0 AND owner_guid=0",
-        RowMatch::Guid,
-    )?;
-    a.chk_count(
-        "FLOOR_VENDORS",
-        "vendors (npc_vendor)",
-        "SELECT item_entry FROM game_npc_vendor",
-        RowMatch::Numeric,
-    )?;
-
-    // --- Service coverage: an NPC that ADVERTISES a service via npc_flags must actually PROVIDE
-    // it. This audit exists because the row-count assertions above once certified an import "OK"
-    // while every spawned Northshire class trainer taught NOTHING — it joins spawned+flagged
-    // templates against the provider tables HERE (spacetime sql has no JOIN) and names the dead
-    // NPCs. Floors guard non-regression on the COVERED counts; the dead lists are the honest gap
-    // ledger (fix = give them rows, not silence).
-    println!("   service coverage (flagged NPCs that actually provide their service):");
-    let mut templates: BTreeMap<u32, (u32, String)> = BTreeMap::new();
-    for row in table_cells(&a.sql("SELECT entry, npc_flags, name FROM game_creature_template")?) {
-        let (Some(entry), Some(flags)) = (
-            row.first().and_then(|c| c.parse().ok()),
-            row.get(1).and_then(|c| c.parse().ok()),
-        ) else {
-            continue;
-        };
-        let name = row
-            .get(2)
-            .map(|c| c.trim_matches('"').to_string())
-            .unwrap_or_default();
-        templates.insert(entry, (flags, name));
+    if profile.includes_eastern_corridors() {
+        a.chk_count(
+            "FLOOR_CLASS_TRAINERS",
+            "Goldshire anchor trainers spawned {328,377,906,913,917,927} (NOT total coverage; see the service-coverage audit below)",
+            "SELECT guid FROM game_world_entity WHERE owner_guid=0 AND (entry=328 OR entry=377 OR entry=906 OR entry=913 OR entry=917 OR entry=927)",
+            RowMatch::Guid,
+        )?;
     }
-    let entry_set = |a: &Assertions, query: &str| -> Result<BTreeSet<u32>> {
-        Ok(table_cells(&a.sql(query)?)
+    if profile.has_bounded_slices() {
+        a.chk_count(
+            "FLOOR_TRAINER_OFFERINGS_CLASS",
+            "class trainer offerings (learn_skill_line=0)",
+            "SELECT spell_id FROM game_trainer_spell WHERE learn_skill_line = 0",
+            RowMatch::Numeric,
+        )?;
+        a.chk_count(
+            "FLOOR_TRAINER_OFFERINGS_PROFESSION",
+            "profession learn offerings (learn_skill_line>0)",
+            "SELECT spell_id FROM game_trainer_spell WHERE learn_skill_line > 0",
+            RowMatch::Numeric,
+        )?;
+
+        a.chk_count(
+            "FLOOR_GATHER_NODE_GO",
+            "gather-node GO spawns",
+            "SELECT guid FROM game_gameobject",
+            RowMatch::AnyDigit,
+        )?;
+        a.chk_count(
+            "FLOOR_TERRAIN_CHUNKS",
+            "terrain chunks (ground-z heightmap)",
+            "SELECT key FROM game_terrain_chunk",
+            RowMatch::AnyDigit,
+        )?;
+        a.chk_count(
+            "FLOOR_NAV_CHUNKS",
+            "nav chunks (walkability/LoS grid)",
+            "SELECT key FROM game_nav_chunk",
+            RowMatch::AnyDigit,
+        )?;
+        if profile.includes_eastern_corridors() {
+            a.chk_count(
+                "FLOOR_INNKEEPER_FARLEY",
+                "innkeeper Farley(295) spawned",
+                "SELECT guid FROM game_world_entity WHERE entry=295 AND owner_guid=0",
+                RowMatch::Guid,
+            )?;
+        }
+        for map in profile.open_world_maps() {
+            a.chk_count(
+                "FLOOR_CONTINENT_SPAWNS",
+                &format!("spawn rows on this profile's map ({map})"),
+                &format!("SELECT guid FROM game_creature_spawn WHERE map_id = {map}"),
+                RowMatch::AnyDigit,
+            )?;
+        }
+        a.chk_count(
+            "FLOOR_QUEST_GIVER_RELATIONS",
+            "quest-giver relations",
+            "SELECT quest_entry FROM game_creature_quest",
+            RowMatch::Numeric,
+        )?;
+
+        // The quest-level bands filter raw values shell-side in the bash (a single-column inequality
+        // filter in SQL is itself the can-return-0-rows-wrongly trap its comment cites) — same here.
+        let quest_levels = a.values("SELECT quest_level FROM game_quest_template")?;
+        let l6_10 = quest_levels
             .iter()
-            .filter_map(|row| row.first().and_then(|c| c.parse().ok()))
-            .collect())
-    };
-    let spawned = entry_set(&a, "SELECT entry FROM game_world_entity WHERE owner_guid = 0")?;
-    let teach = entry_set(&a, "SELECT trainer_entry FROM game_trainer_spell")?;
-    let sell = entry_set(&a, "SELECT creature_entry FROM game_npc_vendor")?;
-    let give = entry_set(&a, "SELECT creature_entry FROM game_creature_quest")?;
-    let trainers = audit_service(
-        "trainers (npc_flags&0x10 vs game_trainer_spell)",
-        0x10,
-        &spawned,
-        &templates,
-        &teach,
-    );
-    let vendors = audit_service(
-        "vendors (npc_flags&0x4 vs game_npc_vendor)",
-        0x4,
-        &spawned,
-        &templates,
-        &sell,
-    );
-    let questgivers = audit_service(
+            .filter(|l| (6..=10).contains(*l))
+            .count() as i64;
+        a.chk(
+            "FLOOR_QUESTS_L6_10",
+            "L6-10 quests (quest_level band)",
+            l6_10,
+        )?;
+        let l10_20 = quest_levels
+            .iter()
+            .filter(|l| (10..=20).contains(*l))
+            .count() as i64;
+        a.chk(
+            "FLOOR_QUESTS_L10_20",
+            "L10-20 quests (Westfall quest_level band)",
+            l10_20,
+        )?;
+        let chained = a
+            .values("SELECT next_quest_id FROM game_quest_template")?
+            .iter()
+            .filter(|v| **v > 0)
+            .count() as i64;
+        a.chk(
+            "FLOOR_QUESTS_CHAINED",
+            "chained quests (next_quest_id>0) [V]",
+            chained,
+        )?;
+        // Timed quests are coverage-printed only, no floor — plausibly zero in this slice, per the
+        // manifest's own note.
+        let timed = a
+            .values("SELECT limit_time FROM game_quest_template")?
+            .iter()
+            .filter(|v| **v > 0)
+            .count();
+        println!("  ..    timed quests (limit_time>0) [V]: {timed}");
+
+        a.chk_count(
+            "FLOOR_LIVE_CREATURES",
+            "live creature entities",
+            "SELECT guid FROM game_world_entity WHERE entry>0 AND owner_guid=0",
+            RowMatch::Guid,
+        )?;
+        a.chk_count(
+            "FLOOR_VENDORS",
+            "vendors (npc_vendor)",
+            "SELECT item_entry FROM game_npc_vendor",
+            RowMatch::Numeric,
+        )?;
+
+        // --- Service coverage: an NPC that ADVERTISES a service via npc_flags must actually PROVIDE
+        // it. This audit exists because the row-count assertions above once certified an import "OK"
+        // while every spawned Northshire class trainer taught NOTHING — it joins spawned+flagged
+        // templates against the provider tables HERE (spacetime sql has no JOIN) and names the dead
+        // NPCs. Floors guard non-regression on the COVERED counts; the dead lists are the honest gap
+        // ledger (fix = give them rows, not silence).
+        println!("   service coverage (flagged NPCs that actually provide their service):");
+        let mut templates: BTreeMap<u32, (u32, String)> = BTreeMap::new();
+        for row in table_cells(&a.sql("SELECT entry, npc_flags, name FROM game_creature_template")?)
+        {
+            let (Some(entry), Some(flags)) = (
+                row.first().and_then(|c| c.parse().ok()),
+                row.get(1).and_then(|c| c.parse().ok()),
+            ) else {
+                continue;
+            };
+            let name = row
+                .get(2)
+                .map(|c| c.trim_matches('"').to_string())
+                .unwrap_or_default();
+            templates.insert(entry, (flags, name));
+        }
+        let entry_set = |a: &Assertions, query: &str| -> Result<BTreeSet<u32>> {
+            Ok(table_cells(&a.sql(query)?)
+                .iter()
+                .filter_map(|row| row.first().and_then(|c| c.parse().ok()))
+                .collect())
+        };
+        let spawned = entry_set(
+            &a,
+            "SELECT entry FROM game_world_entity WHERE owner_guid = 0",
+        )?;
+        let teach = entry_set(&a, "SELECT trainer_entry FROM game_trainer_spell")?;
+        let sell = entry_set(&a, "SELECT creature_entry FROM game_npc_vendor")?;
+        let give = entry_set(&a, "SELECT creature_entry FROM game_creature_quest")?;
+        let trainers = audit_service(
+            "trainers (npc_flags&0x10 vs game_trainer_spell)",
+            0x10,
+            &spawned,
+            &templates,
+            &teach,
+        );
+        let vendors = audit_service(
+            "vendors (npc_flags&0x4 vs game_npc_vendor)",
+            0x4,
+            &spawned,
+            &templates,
+            &sell,
+        );
+        let questgivers = audit_service(
         "questgivers (npc_flags&0x2 vs game_creature_quest; quiet ones may be off-level content)",
         0x2,
         &spawned,
         &templates,
         &give,
     );
-    a.chk(
-        "FLOOR_TRAINER_COVERAGE",
-        "trainer coverage (spawned trainers that teach)",
-        trainers,
-    )?;
-    a.chk(
-        "FLOOR_VENDOR_COVERAGE",
-        "vendor coverage (spawned vendors that sell)",
-        vendors,
-    )?;
-    a.chk(
-        "FLOOR_QUESTGIVER_COVERAGE",
-        "questgiver coverage (spawned givers with quests)",
-        questgivers,
-    )?;
+        a.chk(
+            "FLOOR_TRAINER_COVERAGE",
+            "trainer coverage (spawned trainers that teach)",
+            trainers,
+        )?;
+        a.chk(
+            "FLOOR_VENDOR_COVERAGE",
+            "vendor coverage (spawned vendors that sell)",
+            vendors,
+        )?;
+        a.chk(
+            "FLOOR_QUESTGIVER_COVERAGE",
+            "questgiver coverage (spawned givers with quests)",
+            questgivers,
+        )?;
 
-    a.chk_count(
-        "FLOOR_SENTINEL_HILL_VENDOR",
-        "Sentinel Hill vendor spawned (Quartermaster Lewis 491)",
-        "SELECT guid FROM game_world_entity WHERE owner_guid=0 AND entry=491",
-        RowMatch::Guid,
-    )?;
+        if profile.includes_eastern_corridors() {
+            a.chk_count(
+                "FLOOR_SENTINEL_HILL_VENDOR",
+                "Sentinel Hill vendor spawned (Quartermaster Lewis 491)",
+                "SELECT guid FROM game_world_entity WHERE owner_guid=0 AND entry=491",
+                RowMatch::Guid,
+            )?;
+        }
+    }
     // All 6 Human classes have a creation loadout (race_class = (race<<8)|class). DISTINCT
     // present values — the WHERE caps it at 6, so distinct-count 6 means all six landed.
     let start_items: BTreeSet<i64> = a
@@ -1403,12 +1756,14 @@ fn assert_floors(
         "Human start-items (all 6 classes)",
         start_items.len() as i64,
     )?;
-    a.chk_count(
-        "FLOOR_CASTER_CAST_ROWS",
-        "caster-mob cast rows",
-        "SELECT creature_entry FROM game_creature_cast",
-        RowMatch::Numeric,
-    )?;
+    if profile.has_bounded_slices() {
+        a.chk_count(
+            "FLOOR_CASTER_CAST_ROWS",
+            "caster-mob cast rows",
+            "SELECT creature_entry FROM game_creature_cast",
+            RowMatch::Numeric,
+        )?;
+    }
     a.chk_count(
         "FLOOR_SPELL_TOTAL",
         "total game_spell rows (full Spell.dbc import)",
@@ -1440,41 +1795,44 @@ fn assert_floors(
         RowMatch::Numeric,
     )?;
     a.chk_count(
-        "FLOOR_IMP_FIREBOLT_CAST_ROW",
-        "Imp(416) Firebolt cast row",
-        "SELECT spell_id FROM game_creature_cast WHERE creature_entry=416",
-        RowMatch::Numeric,
-    )?;
-    a.chk_count(
         "FLOOR_IMP_FIREBOLT_SPELL",
         "Imp Firebolt(3110) in game_spell",
         "SELECT spell_id FROM game_spell WHERE spell_id=3110",
         RowMatch::Numeric,
     )?;
-    a.chk_count(
-        "FLOOR_DEFIAS_CASTER_CAST_ROW",
-        "Defias caster cast row (Pillager 589?/Conjurer 449? [V])",
-        "SELECT creature_entry FROM game_creature_cast WHERE creature_entry=589 OR creature_entry=449",
-        RowMatch::Numeric,
-    )?;
-    a.chk_count(
-        "FLOOR_ROTATION_ROWS",
-        "rotation rows (game_creature_spell)",
-        "SELECT id FROM game_creature_spell",
-        RowMatch::Numeric,
-    )?;
-    a.chk_count(
-        "FLOOR_GEOMANCER_ROTATION_NUKE",
-        "476 Geomancer rotation nuke row",
-        "SELECT id FROM game_creature_spell WHERE creature_entry=476 AND condition=0",
-        RowMatch::Numeric,
-    )?;
-    a.chk_count(
-        "FLOOR_FROST_ARMOR_ROTATION",
-        "474/476 Frost Armor rotation row",
-        "SELECT id FROM game_creature_spell WHERE spell_id=12544",
-        RowMatch::Numeric,
-    )?;
+    if profile.includes_eastern_corridors() {
+        a.chk_count(
+            "FLOOR_IMP_FIREBOLT_CAST_ROW",
+            "Imp(416) Firebolt cast row",
+            "SELECT spell_id FROM game_creature_cast WHERE creature_entry=416",
+            RowMatch::Numeric,
+        )?;
+        a.chk_count(
+            "FLOOR_DEFIAS_CASTER_CAST_ROW",
+            "Defias caster cast row (Pillager 589?/Conjurer 449? [V])",
+            "SELECT creature_entry FROM game_creature_cast WHERE creature_entry=589 OR creature_entry=449",
+            RowMatch::Numeric,
+        )?;
+        a.chk_count(
+            "FLOOR_ROTATION_ROWS",
+            "rotation rows (game_creature_spell)",
+            "SELECT id FROM game_creature_spell",
+            RowMatch::Numeric,
+        )?;
+        a.chk_count(
+            "FLOOR_GEOMANCER_ROTATION_NUKE",
+            "476 Geomancer rotation nuke row",
+            "SELECT id FROM game_creature_spell WHERE creature_entry=476 AND condition=0",
+            RowMatch::Numeric,
+        )?;
+        a.chk_count(
+            "FLOOR_FROST_ARMOR_ROTATION",
+            "474/476 Frost Armor rotation row",
+            "SELECT id FROM game_creature_spell WHERE spell_id=12544",
+            RowMatch::Numeric,
+        )?;
+    }
+    verify_caster_spell_catalogue(&mut a)?;
     a.chk_count(
         "FLOOR_AREAS",
         "areas imported (game_area) [V]",
@@ -1493,24 +1851,23 @@ fn assert_floors(
         "SELECT id FROM game_graveyard",
         RowMatch::Numeric,
     )?;
-
-    // Zone-12 (Elwynn) graveyard links must resolve to a real game_graveyard row — spacetime sql
-    // has no JOIN, so this is done here, link by link, like the bash.
-    println!("   zone-12 graveyard_zone→game_graveyard resolve check (client-side, no SQL JOIN):");
-    let mut resolved = 0;
-    for id in a.values("SELECT safe_loc_id FROM game_graveyard_zone WHERE zone_id = 12")? {
-        if a.count(
-            &format!("SELECT id FROM game_graveyard WHERE id = {id}"),
-            RowMatch::Exactly(id),
-        )? > 0
-        {
-            resolved += 1;
-        }
-    }
-    a.chk(
-        "FLOOR_GRAVEYARD_ZONE_RESOLVE",
-        "zone-12 graveyard_zone links resolve to a real game_graveyard row",
-        resolved,
+    a.chk_count(
+        "FLOOR_TAXI_NODES",
+        "taxi nodes imported from TaxiNodes.dbc",
+        "SELECT id FROM game_taxi_node WHERE id < 5090000",
+        RowMatch::Numeric,
+    )?;
+    a.chk_count(
+        "FLOOR_TAXI_PATHS",
+        "directed taxi paths imported from TaxiPath.dbc",
+        "SELECT id FROM game_taxi_path WHERE id < 5090000",
+        RowMatch::Numeric,
+    )?;
+    a.chk_count(
+        "FLOOR_TAXI_PATH_NODES",
+        "ordered taxi path points imported from TaxiPathNode.dbc",
+        "SELECT id FROM game_taxi_path_node WHERE id < 5090000",
+        RowMatch::Numeric,
     )?;
 
     a.chk_count(
@@ -1525,41 +1882,42 @@ fn assert_floors(
         "SELECT trigger_id FROM game_areatrigger_teleport WHERE trigger_id=78 OR trigger_id=119",
         RowMatch::Numeric,
     )?;
-    a.chk_count(
-        "FLOOR_DEADMINES_CREATURE_SPAWNS",
-        "Deadmines creature spawns (map 36) [V]",
-        "SELECT guid FROM game_creature_spawn WHERE map_id = 36",
-        RowMatch::AnyDigit,
-    )?;
-    a.chk_count(
-        "FLOOR_DEADMINES_GAMEOBJECTS",
-        "Deadmines gameobjects (doors/cannon/chests, map 36) [V]",
-        "SELECT guid FROM game_gameobject WHERE map_id = 36",
-        RowMatch::AnyDigit,
-    )?;
-    // Placed bosses, DISTINCT entries. Sneed 643 stays in the query but not the floor — he is
-    // script-summoned in cmangos-era dumps, so a correct import usually has no placed row.
-    let bosses: BTreeSet<i64> = a
-        .values(
-            "SELECT entry FROM game_creature_spawn WHERE map_id = 36 AND (entry=644 OR entry=643 OR entry=642 OR entry=1763 OR entry=646 OR entry=647 OR entry=639)",
-        )?
-        .into_iter()
-        .collect();
-    a.chk(
-        "FLOOR_DEADMINES_BOSSES",
-        "Deadmines bosses spawned (>=6 distinct placed entries) [V]",
-        bosses.len() as i64,
-    )?;
-    // BOTH named drops, DISTINCT item ids — two rows of one item must not pass vacuously.
-    let named_loot: BTreeSet<i64> = a
-        .values("SELECT item_entry FROM game_creature_loot WHERE item_entry=5191 OR item_entry=5196")?
-        .into_iter()
-        .collect();
-    a.chk(
-        "FLOOR_DEADMINES_NAMED_LOOT",
-        "Deadmines named drops (Cruel Barb ~5191 + Smite's Mighty Hammer ~5196) [V]",
-        named_loot.len() as i64,
-    )?;
+    if profile.includes_instances() {
+        a.chk_count(
+            "FLOOR_DEADMINES_CREATURE_SPAWNS",
+            "Deadmines creature spawns (map 36) [V]",
+            "SELECT guid FROM game_creature_spawn WHERE map_id = 36",
+            RowMatch::AnyDigit,
+        )?;
+        a.chk_count(
+            "FLOOR_DEADMINES_GAMEOBJECTS",
+            "Deadmines gameobjects (doors/cannon/chests, map 36) [V]",
+            "SELECT guid FROM game_gameobject WHERE map_id = 36",
+            RowMatch::AnyDigit,
+        )?;
+        let bosses: BTreeSet<i64> = a
+            .values(
+                "SELECT entry FROM game_creature_spawn WHERE map_id = 36 AND (entry=644 OR entry=643 OR entry=642 OR entry=1763 OR entry=646 OR entry=647 OR entry=639)",
+            )?
+            .into_iter()
+            .collect();
+        a.chk(
+            "FLOOR_DEADMINES_BOSSES",
+            "Deadmines bosses spawned (>=6 distinct placed entries) [V]",
+            bosses.len() as i64,
+        )?;
+        let named_loot: BTreeSet<i64> = a
+            .values(
+                "SELECT item_entry FROM game_creature_loot WHERE item_entry=5191 OR item_entry=5196",
+            )?
+            .into_iter()
+            .collect();
+        a.chk(
+            "FLOOR_DEADMINES_NAMED_LOOT",
+            "Deadmines named drops (Cruel Barb ~5191 + Smite's Mighty Hammer ~5196) [V]",
+            named_loot.len() as i64,
+        )?;
+    }
     a.chk_count(
         "FLOOR_PICKPOCKET_LOOT",
         "pickpocket loot rows (game_pickpocket_loot) [V]",
@@ -1606,7 +1964,7 @@ fn assert_floors(
             ProjectLayout::IMPORT_MANIFEST_SCRIPT
         )));
     }
-    println!("   OK — all 1-20 blockers present");
+    println!("   OK — all profile blockers present");
     Ok(())
 }
 
@@ -1681,6 +2039,14 @@ mod tests {
         ImportOptions {
             accept: true,
             client_data: Some(path.to_string_lossy().to_string()),
+            profile_shards: vec![],
+        }
+    }
+
+    fn vmap_options(path: &Path) -> VmapOptions {
+        VmapOptions {
+            client_data: Some(path.to_string_lossy().to_string()),
+            profile_shards: vec![],
         }
     }
 
@@ -1730,6 +2096,7 @@ mod tests {
             let options = ImportOptions {
                 accept: false,
                 client_data: Some(data.to_string_lossy().to_string()),
+                profile_shards: vec![],
             };
             let error = run_world(&project, &stack.runner(), &prompt, &options).unwrap_err();
             assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{answer:?}");
@@ -1752,6 +2119,7 @@ mod tests {
             let options = ImportOptions {
                 accept: false,
                 client_data: Some(data.to_string_lossy().to_string()),
+                profile_shards: vec![],
             };
             run_world(&project, &stack.runner(), &prompt, &options).unwrap();
             assert!(
@@ -1783,15 +2151,22 @@ mod tests {
         .unwrap();
     }
 
-    /// The `--db` value of every world-slice (`--dump`) importer invocation, in order.
-    fn dump_databases(stack: &FakeStack) -> Vec<String> {
+    /// The destination/profile pair of every dump importer invocation, in order.
+    fn dump_destinations(stack: &FakeStack) -> Vec<(String, String)> {
         stack
             .calls()
             .into_iter()
             .filter_map(|call| match call {
                 Call::Stream(spec) | Call::Wait(spec) => {
                     let args = spec.args();
-                    args.iter().any(|a| a == "--dump").then(|| args[1].clone())
+                    args.iter().any(|a| a == "--dump").then(|| {
+                        let profile = args
+                            .windows(2)
+                            .find(|pair| pair[0] == "--world-profile")
+                            .map(|pair| pair[1].clone())
+                            .expect("dump command has no profile");
+                        (args[1].clone(), profile)
+                    })
                 }
                 _ => None,
             })
@@ -1814,19 +2189,25 @@ mod tests {
     }
 
     #[test]
-    fn a_sharded_fixture_imports_the_instance_pool_too_and_single_does_not() {
-        // THE reason this loop exists. The sharded fixture routes map 36 to `lyracore-instances`,
-        // and that database — not the world shard — is what spawns a dungeon run's population. Skip
-        // it and a Deadmines entry is routed perfectly and comes up EMPTY, with no error on either
-        // side and nothing at runtime that reports it. There is no loud failure to fall back on, so
-        // the import has to be the thing that covers it.
+    fn topology_assigns_each_content_destination_its_canonical_profile_once() {
         for (topology, want) in [
-            (Topology::Single, vec![ProjectLayout::DATABASE]),
+            (
+                Topology::Single,
+                vec![(ProjectLayout::DATABASE, "alliance-single")],
+            ),
             (
                 Topology::Sharded,
-                vec![ProjectLayout::DATABASE, ProjectLayout::INSTANCE_POOL],
+                vec![
+                    (ProjectLayout::DATABASE, "alliance-eastern"),
+                    (ProjectLayout::KALIMDOR_SHARD, "alliance-kalimdor"),
+                    (ProjectLayout::INSTANCE_POOL, "instances"),
+                ],
             ),
         ] {
+            let want: Vec<(String, String)> = want
+                .into_iter()
+                .map(|(shard, profile)| (shard.to_string(), profile.to_string()))
+                .collect();
             let tmp = TempDir::new().unwrap();
             let project = checkout(&tmp);
             let data = client_data(&tmp);
@@ -1841,40 +2222,134 @@ mod tests {
             )
             .unwrap();
 
-            let world = dump_databases(&stack);
+            let world = dump_destinations(&stack);
             assert_eq!(world, want, "{topology:?}");
-            // ...and the class-spell pass follows each ETL onto the SAME database. Its `DB` default
-            // is the fixture database, so an unset one writes a shard's spells into `lyracore`
-            // silently — the failure that made passing it explicitly a rule in the first place.
+            assert!(rendered(&stack)
+                .iter()
+                .filter(|command| command.contains(" --dump "))
+                .all(|command| !command.contains("--include-creatures")));
+            let expected_shards: Vec<String> =
+                want.iter().map(|(shard, _)| shard.clone()).collect();
             let spells: Vec<String> = imported_databases(&stack)
                 .into_iter()
                 .filter(|(script, _)| script == "import-class-spells.sh")
                 .map(|(_, db)| db)
                 .collect();
-            assert_eq!(spells, want, "{topology:?}");
+            assert_eq!(spells, expected_shards, "{topology:?}");
         }
     }
 
     #[test]
-    fn the_instance_pool_modes_are_the_default_ones_with_only_the_database_changed() {
-        // The pool rides the same canonical mode list — crucially `--include-map 36`, which is
-        // what puts the Deadmines interior on the pool. A narrowed box or map set here would be
-        // this CLI second-guessing modes whose assertion floors are tuned to those defaults.
+    fn explicit_profile_shards_reach_every_world_import_destination() {
+        let profiles = vec![
+            "alliance-eastern=lyracore".to_string(),
+            "alliance-kalimdor=lyracore-world-1".to_string(),
+            "instances=lyracore-instances".to_string(),
+        ];
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let data = client_data(&tmp);
-        let default = world_etl_commands(&project, &data, ProjectLayout::DATABASE);
-        let pool = world_etl_commands(&project, &data, ProjectLayout::INSTANCE_POOL);
-        assert_eq!(default.len(), pool.len());
-        for ((_, _, d), (_, _, p)) in default.iter().zip(pool.iter()) {
-            assert_eq!(
-                p.render()
-                    .replace(ProjectLayout::INSTANCE_POOL, ProjectLayout::DATABASE),
-                d.render(),
-                "the two passes must differ in the database and nothing else"
-            );
+        set_topology(&project, Topology::Sharded);
+        let stack = healthy();
+        let options = ImportOptions {
+            profile_shards: profiles,
+            ..accepted(&data)
+        };
+        run_world(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &options,
+        )
+        .unwrap();
+        let assigned: Vec<(String, String)> = dump_destinations(&stack);
+        assert_eq!(
+            assigned,
+            vec![
+                ("lyracore".to_string(), "alliance-eastern".to_string()),
+                (
+                    "lyracore-world-1".to_string(),
+                    "alliance-kalimdor".to_string()
+                ),
+                ("lyracore-instances".to_string(), "instances".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_profile_shards_are_refused_before_the_import_starts() {
+        let error = import_destinations(
+            Topology::Sharded,
+            &["alliance-kalimdor=lyracore-world-1".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("alliance-eastern"), "{error}");
+        assert!(error.contains("instances"), "{error}");
+    }
+
+    #[test]
+    fn sharded_verification_follows_each_destinations_profile() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        set_topology(&project, Topology::Sharded);
+        let stack = healthy();
+
+        run_world(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap();
+
+        let calls = rendered(&stack);
+        let eastern = ProjectLayout::DATABASE;
+        let kalimdor = ProjectLayout::KALIMDOR_SHARD;
+        let instances = ProjectLayout::INSTANCE_POOL;
+        let queried = |database: &str, needle: &str| {
+            calls.iter().any(|command| {
+                command.starts_with("spacetime sql")
+                    && command.contains(&format!(" {database} "))
+                    && command.contains(needle)
+            })
+        };
+
+        assert!(queried(eastern, "creature_entry=658"));
+        assert!(!queried(eastern, "creature_entry=2079"));
+        assert!(queried(kalimdor, "creature_entry=2079"));
+        assert!(!queried(kalimdor, "entry=295"));
+        assert!(queried(instances, "map_id = 36"));
+        assert!(!queried(instances, "game_terrain_chunk"));
+        assert!(!queried(instances, "creature_entry=658"));
+    }
+
+    #[test]
+    fn the_instance_pool_skips_open_world_geometry_but_keeps_global_modes() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let pool = world_etl_commands(
+            &project,
+            &data,
+            &ImportDestination {
+                shard: ProjectLayout::INSTANCE_POOL.to_string(),
+                profile: WorldProfile::Instances,
+            },
+        );
+        let rendered: Vec<String> = pool
+            .iter()
+            .map(|(_, _, command)| command.render())
+            .collect();
+        assert!(rendered.iter().any(|command| {
+            command.contains("--dump") && command.contains("--world-profile instances")
+        }));
+        assert!(!rendered.iter().any(|command| command.contains("--terrain")));
+        assert!(!rendered.iter().any(|command| command.contains("--nav")));
+        for mode in ["--talents", "--spells"] {
+            assert!(rendered.iter().any(|command| command.contains(mode)));
         }
-        // The class-spell overlay's database rides env, not argv — assert it separately.
         let spells = pool
             .iter()
             .find(|(what, _, _)| what.contains("class spells"))
@@ -1908,6 +2383,7 @@ mod tests {
         let options = ImportOptions {
             accept: false,
             client_data: Some(data.to_string_lossy().to_string()),
+            profile_shards: vec![],
         };
         let error = run_world(&project, &stack.runner(), &prompt, &options)
             .unwrap_err()
@@ -1925,6 +2401,7 @@ mod tests {
         let options = ImportOptions {
             accept: false,
             client_data: Some(data.to_string_lossy().to_string()),
+            profile_shards: vec![],
         };
         assert!(run_world(&project, &stack.runner(), &prompt, &options).is_err());
         assert!(stack.calls().is_empty());
@@ -1937,8 +2414,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let data = client_data(&tmp);
-        // One database, so the expected list below stays exact — the sharded default would run
-        // the same modes a second time against the instance pool.
+        // One destination, so the expected list below stays exact.
         set_topology(&project, Topology::Single);
         let stack = healthy();
 
@@ -1954,16 +2430,16 @@ mod tests {
         let data = std::fs::canonicalize(&data).unwrap();
         let data = data.to_string_lossy();
         let db = ProjectLayout::DATABASE;
+        let server = ProjectLayout::stdb_uri();
         let expected = vec![
             format!(
-                "{importer} --db {db} --dump {DUMP_PATH} --dbc {data} --map 0 --box {CANONICAL_BOX} --include-map 36 --include-creatures {INCLUDE_CREATURES} --apply"
+                "{importer} --db {db} --server {server} --dump {DUMP_PATH} --dbc {data} --world-profile alliance-single --apply"
             ),
-            format!("{importer} --db {db} --terrain {data} --map 0 --box {CANONICAL_BOX} --apply"),
-            format!("{importer} --db {db} --nav {data} --map 0 --box {CANONICAL_BOX} --apply"),
-            format!("{importer} --db {db} --dbc {data} --apply"),
-            format!("{importer} --db {db} --dbc {data} --talents --apply"),
-            format!("{importer} --db {db} --dbc {data} --spells --apply"),
-            format!("{importer} --db {db} --dbc {data} --spells --apply --only {CASTER_SPELL_IDS}"),
+            format!("{importer} --db {db} --server {server} --terrain {data} --world-profile alliance-single --apply"),
+            format!("{importer} --db {db} --server {server} --nav {data} --world-profile alliance-single --apply"),
+            format!("{importer} --db {db} --server {server} --dbc {data} --apply"),
+            format!("{importer} --db {db} --server {server} --dbc {data} --talents --apply"),
+            format!("{importer} --db {db} --server {server} --dbc {data} --spells --apply"),
         ];
         let got: Vec<String> = rendered(&stack)
             .into_iter()
@@ -1998,7 +2474,6 @@ mod tests {
             "--nav",
             "--talents",
             "import-class-spells.sh",
-            "--only",
             "debug_repair_after_publish",
             "arm_all_pools",
             "spacetime sql",
@@ -2011,14 +2486,18 @@ mod tests {
                 pair[1]
             );
         }
-        // ...and the curated overlay sits between the full Spell.dbc import and the caster
-        // allowlist, exactly like the bash flow.
+        // The curated overlay follows the full Spell.dbc catalogue and adds trainer bindings.
         assert!(pos(&calls, "--spells --apply") < pos(&calls, "import-class-spells.sh"));
         // The long children stream; the bookkeeping ones are captured.
         for call in stack.calls() {
             match call {
                 Call::Stream(spec) | Call::Wait(spec) => {
-                    assert_eq!(spec.cwd_value(), Some(project.root.as_path()), "{}", spec.render());
+                    assert_eq!(
+                        spec.cwd_value(),
+                        Some(project.root.as_path()),
+                        "{}",
+                        spec.render()
+                    );
                 }
                 other => panic!("unexpected call kind: {other:?}"),
             }
@@ -2081,7 +2560,9 @@ mod tests {
         .unwrap();
 
         assert!(
-            !rendered(&stack).iter().any(|c| c.contains("import-world.sh")),
+            !rendered(&stack)
+                .iter()
+                .any(|c| c.contains("import-world.sh")),
             "{:?}",
             rendered(&stack)
         );
@@ -2131,9 +2612,9 @@ mod tests {
             .expect("the floors were never read");
         assert_eq!(floors.program(), "bash");
         assert_eq!(floors.args()[0], "-c");
-        // ...with the canonical-run floor selection pinned, not inherited.
+        // Canonical profiles use conservative slice floors plus named corridor checks.
         assert_eq!(floors.env_value("MAP"), Some("0"));
-        assert_eq!(floors.env_value("SLICE"), Some("0"));
+        assert_eq!(floors.env_value("SLICE"), Some("1"));
     }
 
     #[test]
@@ -2181,9 +2662,93 @@ mod tests {
             // The class-spell overlay takes the client path as its argument and the database from
             // env — both explicit, because its DB default is how spells once landed elsewhere.
             if render.contains("import-class-spells.sh") {
-                assert_eq!(spec.args().last().map(String::as_str), Some(canonical.as_str()));
+                assert_eq!(
+                    spec.args().last().map(String::as_str),
+                    Some(canonical.as_str())
+                );
                 assert_eq!(spec.env_value("DB"), Some(ProjectLayout::DATABASE));
             }
+        }
+    }
+
+    #[test]
+    fn every_destination_child_names_its_shard_and_loopback_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        set_topology(&project, Topology::Sharded);
+        let stack = healthy();
+
+        run_world(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap();
+
+        let importer = project.importer_bin().to_string_lossy().to_string();
+        let server = ProjectLayout::stdb_uri();
+        let shards = [
+            ProjectLayout::DATABASE,
+            ProjectLayout::KALIMDOR_SHARD,
+            ProjectLayout::INSTANCE_POOL,
+        ];
+        for call in stack.calls() {
+            let (Call::Stream(spec) | Call::Wait(spec)) = call else {
+                panic!("unexpected call kind")
+            };
+            let render = spec.render();
+            if render.starts_with(&importer) {
+                assert!(shards.contains(&spec.args()[1].as_str()), "{render}");
+                assert_eq!(&spec.args()[2..4], &["--server", server.as_str()]);
+            }
+            if render.contains("import-class-spells.sh") {
+                assert!(shards.contains(&spec.env_value("DB").unwrap_or("")));
+                assert_eq!(spec.env_value("SPACETIME_SERVER"), Some(server.as_str()));
+            }
+            if render.starts_with("spacetime") {
+                assert!(render.contains(&format!("--server {server}")), "{render}");
+                assert!(
+                    shards.contains(&spec.args().get(3).map(String::as_str).unwrap_or_default()),
+                    "{render}"
+                );
+            }
+        }
+        let commands = rendered(&stack);
+        for shard in shards {
+            for reducer in ["debug_repair_after_publish", "arm_all_pools"] {
+                assert_eq!(
+                    commands
+                        .iter()
+                        .filter(|command| {
+                            command.as_str()
+                                == format!("spacetime call --server {server} {shard} {reducer}")
+                        })
+                        .count(),
+                    1,
+                    "{reducer} must run once on {shard}"
+                );
+            }
+            let shard_imports: Vec<&String> = commands
+                .iter()
+                .filter(|command| {
+                    command.starts_with(&importer)
+                        && command.contains(&format!("--db {shard} --server"))
+                })
+                .collect();
+            assert!(
+                shard_imports
+                    .iter()
+                    .any(|command| command.contains("--talents")),
+                "{shard}"
+            );
+            assert!(
+                shard_imports
+                    .iter()
+                    .any(|command| command.contains("--spells")),
+                "{shard}"
+            );
         }
     }
 
@@ -2243,7 +2808,13 @@ mod tests {
         let stack = healthy();
         let prompt = ScriptedPrompt::new(&["yes", &data.to_string_lossy()]);
 
-        run_world(&project, &stack.runner(), &prompt, &ImportOptions::default()).unwrap();
+        run_world(
+            &project,
+            &stack.runner(),
+            &prompt,
+            &ImportOptions::default(),
+        )
+        .unwrap();
 
         let asked = prompt.asked();
         assert_eq!(asked.len(), 2, "{asked:?}");
@@ -2260,6 +2831,7 @@ mod tests {
         let options = ImportOptions {
             accept: true,
             client_data: Some(tmp.path().join("nope").to_string_lossy().to_string()),
+            profile_shards: vec![],
         };
         let error = run_world(
             &project,
@@ -2332,9 +2904,14 @@ mod tests {
         let project = checkout(&tmp);
         let stack = healthy();
         let prompt = ScriptedPrompt::new(&["yes", ""]);
-        let error = run_world(&project, &stack.runner(), &prompt, &ImportOptions::default())
-            .unwrap_err()
-            .to_string();
+        let error = run_world(
+            &project,
+            &stack.runner(),
+            &prompt,
+            &ImportOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("--client-data"), "{error}");
     }
 
@@ -2382,7 +2959,13 @@ mod tests {
 
         let stack = healthy();
         let prompt = ScriptedPrompt::new(&["yes"]); // asking for a path would error: no 2nd answer
-        run_world(&project, &stack.runner(), &prompt, &ImportOptions::default()).unwrap();
+        run_world(
+            &project,
+            &stack.runner(),
+            &prompt,
+            &ImportOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             prompt.asked().len(),
@@ -2400,7 +2983,13 @@ mod tests {
         let stack = healthy();
         let prompt = ScriptedPrompt::new(&["yes", &data.to_string_lossy()]);
 
-        run_world(&project, &stack.runner(), &prompt, &ImportOptions::default()).unwrap();
+        run_world(
+            &project,
+            &stack.runner(),
+            &prompt,
+            &ImportOptions::default(),
+        )
+        .unwrap();
 
         let canonical = std::fs::canonicalize(&data).unwrap();
         let config = crate::config::Config::load(&project.config_file()).unwrap();
@@ -2423,7 +3012,13 @@ mod tests {
 
         let stack = healthy();
         let prompt = ScriptedPrompt::new(&["yes", &data.to_string_lossy()]);
-        run_world(&project, &stack.runner(), &prompt, &ImportOptions::default()).unwrap();
+        run_world(
+            &project,
+            &stack.runner(),
+            &prompt,
+            &ImportOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             prompt.asked().len(),
@@ -2461,7 +3056,7 @@ mod tests {
                 "import-class-spells.sh",
                 "requested 31 ids but matched 30",
                 "class spells",
-                "--only",
+                "debug_repair_after_publish",
             ),
         ] {
             let stack = healthy().fail_on(needle, child_says);
@@ -2482,6 +3077,38 @@ mod tests {
                 rendered(&stack)
             );
         }
+    }
+
+    #[test]
+    fn a_destination_failure_names_its_profile_and_stops_before_later_destinations() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        set_topology(&project, Topology::Sharded);
+        let stack = healthy().fail_on(
+            "--world-profile alliance-kalimdor",
+            "profile input did not match",
+        );
+
+        let error = run_world(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(ProjectLayout::KALIMDOR_SHARD), "{error}");
+        assert!(error.contains("alliance-kalimdor"), "{error}");
+        assert!(error.contains("world content"), "{error}");
+        assert!(error.contains("profile input did not match"), "{error}");
+        assert!(
+            !rendered(&stack)
+                .iter()
+                .any(|command| command.contains(ProjectLayout::INSTANCE_POOL)),
+            "later destinations must not start after a failure"
+        );
     }
 
     #[test]
@@ -2657,7 +3284,7 @@ mod tests {
     // ---- `import vmaps` ----
 
     #[test]
-    fn vmaps_drives_the_importer_per_world_shard_with_the_canonical_slice() {
+    fn vmaps_drive_each_world_shards_matching_profile() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let data = client_data(&tmp);
@@ -2667,7 +3294,7 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&data.to_string_lossy()),
+            &vmap_options(&data),
         )
         .unwrap();
 
@@ -2679,11 +3306,20 @@ mod tests {
             .collect();
         assert_eq!(
             vmap_runs,
-            vec![format!(
-                "{importer} --db {} --vmap {} --map 0 --box {CANONICAL_BOX} --apply",
-                ProjectLayout::DATABASE,
-                canonical.to_string_lossy()
-            )]
+            vec![
+                format!(
+                    "{importer} --db {} --server {} --vmap {} --world-profile alliance-eastern --apply",
+                    ProjectLayout::DATABASE,
+                    ProjectLayout::stdb_uri(),
+                    canonical.to_string_lossy()
+                ),
+                format!(
+                    "{importer} --db {} --server {} --vmap {} --world-profile alliance-kalimdor --apply",
+                    ProjectLayout::KALIMDOR_SHARD,
+                    ProjectLayout::stdb_uri(),
+                    canonical.to_string_lossy()
+                ),
+            ]
         );
         // The importer is built first, and everything runs from the checkout root.
         let calls = rendered(&stack);
@@ -2697,10 +3333,7 @@ mod tests {
     }
 
     #[test]
-    fn vmaps_skips_the_content_less_kalimdor_shard_rather_than_guessing_a_box() {
-        // The sharded default topology has a map-1 shard with no content and no derived box; a
-        // guessed rectangle is the expensive kind of wrong (the derive-not-guess rule). Skipped,
-        // never run.
+    fn vmaps_skip_the_instance_pool() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let data = client_data(&tmp);
@@ -2710,14 +3343,15 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&data.to_string_lossy()),
+            &vmap_options(&data),
         )
         .unwrap();
 
         assert!(
             !rendered(&stack)
                 .iter()
-                .any(|c| c.contains(ProjectLayout::KALIMDOR_SHARD)),
+                .filter(|command| command.contains("--vmap"))
+                .any(|command| command.contains(ProjectLayout::INSTANCE_POOL)),
             "{:?}",
             rendered(&stack)
         );
@@ -2740,7 +3374,7 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&data.to_string_lossy()),
+            &vmap_options(&data),
         )
         .unwrap();
 
@@ -2759,13 +3393,7 @@ mod tests {
         let stack = FakeStack::new();
         let prompt = ScriptedPrompt::new(&[]); // any question at all would error
 
-        run_vmaps(
-            &project,
-            &stack.runner(),
-            &prompt,
-            Some(&data.to_string_lossy()),
-        )
-        .unwrap();
+        run_vmaps(&project, &stack.runner(), &prompt, &vmap_options(&data)).unwrap();
         assert!(prompt.asked().is_empty());
     }
 
@@ -2782,8 +3410,11 @@ mod tests {
         let stack = FakeStack::new();
         let prompt = ScriptedPrompt::new(&[]);
 
-        run_vmaps(&project, &stack.runner(), &prompt, None).unwrap();
-        assert!(prompt.asked().is_empty(), "a configured path must not prompt");
+        run_vmaps(&project, &stack.runner(), &prompt, &VmapOptions::default()).unwrap();
+        assert!(
+            prompt.asked().is_empty(),
+            "a configured path must not prompt"
+        );
         assert!(rendered(&stack).iter().any(|c| c.contains("--vmap")));
     }
 
@@ -2797,7 +3428,10 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&tmp.path().join("nope").to_string_lossy()),
+            &VmapOptions {
+                client_data: Some(tmp.path().join("nope").to_string_lossy().to_string()),
+                profile_shards: vec![],
+            },
         )
         .unwrap_err();
         assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
@@ -2815,11 +3449,13 @@ mod tests {
             &project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            Some(&data.to_string_lossy()),
+            &vmap_options(&data),
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("no MCNK cells"), "{error}");
         assert!(error.contains("model.MPQ"), "{error}");
+        assert!(error.contains(ProjectLayout::DATABASE), "{error}");
+        assert!(error.contains("alliance-eastern"), "{error}");
     }
 }

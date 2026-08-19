@@ -13,7 +13,7 @@ pub mod update;
 use crate::project::{ClientBind, Component, Topology};
 use crate::{Error, Result};
 use account::PasswordSource;
-use import::ImportOptions;
+use import::{ImportOptions, VmapOptions};
 
 /// The default help: just enough to get a newcomer from a fresh checkout to a running server.
 /// Everything else — the commands you only need once you're developing LyraCore itself — lives in
@@ -29,8 +29,8 @@ USAGE:
   lyracore dev status      show whether the server is running
   lyracore dev down        stop the server
   lyracore import          replace the placeholder starter data with the real game
-                           world — quests, creatures, items — pulled from public game
-                           data and your own 1.12.1 client
+                           world — every Alliance early-game corridor — from public
+                           game data and your own 1.12.1 client
 
 Run `lyracore help --all` to see every command, including the ones for working on
 LyraCore itself.";
@@ -64,20 +64,24 @@ USAGE:
   lyracore account create USER [--password-stdin]
                                                provision an account's SRP6 credentials
   lyracore import [--client-data PATH]         build the REAL world in place of the seed
-                                               fixture: pull cmangos' classic-db, read your
-                                               own 1.12.1 client's Data/ archives, drive the
-                                               importer's modes in order and assert the
-                                               FLOOR_* import floors — on every database the
-                                               fixture populates, which includes the
-                                               instance pool. Asks for consent first,
-                                               every time
+                                               fixture: every Alliance early-game corridor
+                                               in Eastern Kingdoms and Kalimdor, plus the
+                                               instance maps. Pulls cmangos' classic-db,
+                                               reads your own 1.12.1 client's Data/ archives,
+                                               drives the importer and asserts the FLOOR_*
+                                               import floors on every destination. Asks for
+                                               consent first, every time
+  lyracore import world --profile-shard PROFILE=SHARD
+                                               explicitly assign all three sharded World Import
+                                               Profiles on an external realm; repeat for
+                                               alliance-eastern, alliance-kalimdor, and instances
   lyracore import world --accept               the same command by its full name (`import`
                                                is its alias), with the consent answered in
                                                advance (scripted runs)
   lyracore import vmaps [--client-data PATH]   exact model/WMO collision triangles for each
-                                               world shard, read from your own client's
-                                               archives — nothing is fetched, so there is
-                                               no consent gate
+                                               populated World Shard, including Kalimdor,
+                                               read from your own client's archives — nothing
+                                               is fetched, so there is no consent gate
   lyracore config                              show the persisted client-data path (or \"(unset)\")
   lyracore config set client-data PATH         validate and remember your 1.12.1 client's Data/
                                                directory, so `import` and `doctor` stop asking
@@ -116,7 +120,7 @@ pub enum Command {
     },
     ImportWorld(ImportOptions),
     ImportVmaps {
-        client_data: Option<String>,
+        options: VmapOptions,
     },
     ConfigShow,
     ConfigSetClientData {
@@ -419,10 +423,23 @@ fn parse_import_world(args: &[&str]) -> Result<Command> {
                     ))
                 }
             },
+            "--profile-shard" => match tail.split_first() {
+                Some((assignment, after)) if !assignment.starts_with('-') => {
+                    options.profile_shards.push((*assignment).to_string());
+                    rest = after;
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "`import --profile-shard` needs PROFILE=SHARD, e.g. \
+                         `--profile-shard alliance-kalimdor=lyracore-world-1`"
+                            .to_string(),
+                    ))
+                }
+            },
             other if other.starts_with('-') => {
                 return Err(Error::Usage(format!(
-                    "unknown `import` option '{other}' — the only ones are --accept and \
-                     --client-data PATH"
+                    "unknown `import` option '{other}' — the options are --accept, --client-data \
+                     PATH, and --profile-shard PROFILE=SHARD"
                 )))
             }
             other => {
@@ -440,13 +457,13 @@ fn parse_import_world(args: &[&str]) -> Result<Command> {
 /// to answer in advance — the vmaps import fetches nothing and reads only the operator's own
 /// client, so a flag that implied otherwise would misdescribe the command.
 fn parse_import_vmaps(args: &[&str]) -> Result<Command> {
-    let mut client_data = None;
+    let mut options = VmapOptions::default();
     let mut rest = args;
     while let Some((head, tail)) = rest.split_first() {
         match *head {
             "--client-data" => match tail.split_first() {
                 Some((path, after)) if !path.starts_with('-') => {
-                    client_data = Some((*path).to_string());
+                    options.client_data = Some((*path).to_string());
                     rest = after;
                 }
                 _ => {
@@ -457,10 +474,24 @@ fn parse_import_vmaps(args: &[&str]) -> Result<Command> {
                     ))
                 }
             },
+            "--profile-shard" => match tail.split_first() {
+                Some((assignment, after)) if !assignment.starts_with('-') => {
+                    options.profile_shards.push((*assignment).to_string());
+                    rest = after;
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "`import vmaps --profile-shard` needs PROFILE=SHARD, e.g. \
+                         `--profile-shard alliance-kalimdor=lyracore-world-1`"
+                            .to_string(),
+                    ))
+                }
+            },
             other if other.starts_with('-') => {
                 return Err(Error::Usage(format!(
-                    "unknown `import vmaps` option '{other}' — the only one is --client-data PATH \
-                     (there is no consent to --accept: nothing is fetched)"
+                    "unknown `import vmaps` option '{other}' — the options are --client-data PATH \
+                     and --profile-shard PROFILE=SHARD (there is no consent to --accept: nothing \
+                     is fetched)"
                 )))
             }
             other => {
@@ -471,7 +502,7 @@ fn parse_import_vmaps(args: &[&str]) -> Result<Command> {
             }
         }
     }
-    Ok(Command::ImportVmaps { client_data })
+    Ok(Command::ImportVmaps { options })
 }
 
 #[cfg(test)]
@@ -671,6 +702,7 @@ mod tests {
             Command::ImportWorld(import::ImportOptions {
                 accept: true,
                 client_data: None,
+                profile_shards: vec![],
             })
         );
         assert_eq!(
@@ -678,6 +710,7 @@ mod tests {
             Command::ImportWorld(import::ImportOptions {
                 accept: true,
                 client_data: Some("/games/wow/Data".to_string()),
+                profile_shards: vec![],
             })
         );
         assert_eq!(
@@ -685,7 +718,34 @@ mod tests {
             Command::ImportWorld(import::ImportOptions {
                 accept: true,
                 client_data: Some("/games/wow/Data".to_string()),
+                profile_shards: vec![],
             })
+        );
+    }
+
+    #[test]
+    fn import_parses_profile_shards_for_world_and_vmaps() {
+        let profile_shards = vec![
+            "alliance-eastern=lyracore".to_string(),
+            "alliance-kalimdor=lyracore-world-1".to_string(),
+            "instances=lyracore-instances".to_string(),
+        ];
+        assert_eq!(
+            parse("import world --profile-shard alliance-eastern=lyracore --profile-shard alliance-kalimdor=lyracore-world-1 --profile-shard instances=lyracore-instances").unwrap(),
+            Command::ImportWorld(import::ImportOptions {
+                accept: false,
+                client_data: None,
+                profile_shards: profile_shards.clone(),
+            })
+        );
+        assert_eq!(
+            parse("import vmaps --profile-shard alliance-eastern=lyracore --profile-shard alliance-kalimdor=lyracore-world-1 --profile-shard instances=lyracore-instances").unwrap(),
+            Command::ImportVmaps {
+                options: import::VmapOptions {
+                    client_data: None,
+                    profile_shards,
+                },
+            }
         );
     }
 
@@ -703,15 +763,20 @@ mod tests {
     }
 
     #[test]
-    fn import_vmaps_takes_only_the_client_data_option() {
+    fn import_vmaps_takes_client_data_and_profile_shards() {
         assert_eq!(
             parse("import vmaps").unwrap(),
-            Command::ImportVmaps { client_data: None }
+            Command::ImportVmaps {
+                options: import::VmapOptions::default()
+            }
         );
         assert_eq!(
             parse("import vmaps --client-data /games/wow/Data").unwrap(),
             Command::ImportVmaps {
-                client_data: Some("/games/wow/Data".to_string()),
+                options: import::VmapOptions {
+                    client_data: Some("/games/wow/Data".to_string()),
+                    profile_shards: vec![],
+                },
             }
         );
     }
@@ -765,6 +830,9 @@ mod tests {
         assert!(USAGE_ALL.contains("lyracore import vmaps"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--client-data"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--accept"), "{USAGE_ALL}");
+        assert!(USAGE.contains("every Alliance early-game corridor"), "{USAGE}");
+        assert!(USAGE_ALL.contains("Eastern Kingdoms and Kalimdor"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("populated World Shard"), "{USAGE_ALL}");
     }
 
     #[test]
