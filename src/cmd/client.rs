@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::ProjectLayout;
 use crate::{Error, Result};
+use std::path::{Path, PathBuf};
 
 pub fn sync(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     let config = Config::load(&project.config_file())?;
@@ -27,11 +28,8 @@ pub fn sync(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
                 .to_string(),
         )
     })?;
-    let path = std::path::Path::new(&raw);
-    for note in import::inspect_client_data(path)? {
-        println!("{note}");
-    }
-    println!("client data: {raw}");
+    let path = configured_client_data(project, &raw)?;
+    println!("client data: {}", path.display());
 
     println!("building the importer (cargo build --bin lyracore-importer)");
     runner
@@ -43,9 +41,12 @@ pub fn sync(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
             ))
         })?;
 
-    println!("packing patch-3.MPQ and this checkout's addons into {raw}");
+    println!(
+        "packing patch-3.MPQ and this checkout's addons into {}",
+        path.display()
+    );
     runner
-        .run_streaming(&pack_command(project, &raw))
+        .run_streaming(&pack_command(project, &path))
         .map_err(|e| {
             Error::Process(format!(
                 "client sync failed. Nothing is written to your client until client-patch/ and \
@@ -60,10 +61,31 @@ pub fn sync(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     Ok(())
 }
 
-fn pack_command(project: &ProjectLayout, client_data: &str) -> CommandSpec {
+fn configured_client_data(project: &ProjectLayout, raw: &str) -> Result<PathBuf> {
+    let configured = Path::new(raw);
+    // Config normally contains the canonical path written by `config set`, but older or manually
+    // edited files may be relative. Stored paths are checkout config, so resolve those from the
+    // checkout root — the same cwd the importer receives — rather than from the caller's subdir.
+    let resolved = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        project.root.join(configured)
+    };
+    // The optional model/wmo notes returned here describe world-import navigation work. A client
+    // sync performs none, so validate the installation without printing those unrelated notes.
+    import::inspect_client_data(&resolved).map_err(|error| {
+        Error::State(format!(
+            "configured client-data path '{raw}' is no longer valid: {error}\n  Re-set it with \
+             `lyracore config set client-data PATH`."
+        ))
+    })?;
+    Ok(std::fs::canonicalize(&resolved).unwrap_or(resolved))
+}
+
+fn pack_command(project: &ProjectLayout, client_data: &Path) -> CommandSpec {
     CommandSpec::new(project.importer_bin().to_string_lossy().to_string())
         .arg("--pack-client")
-        .arg(client_data)
+        .arg(client_data.to_string_lossy().to_string())
         .arg("--apply")
         .cwd(project.root.clone())
 }
@@ -150,7 +172,45 @@ mod tests {
 
         let error = sync(&project, &FakeStack::new().runner()).unwrap_err();
 
-        assert!(error.to_string().contains("no such directory"), "{error}");
+        assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE);
+        let message = error.to_string();
+        assert!(message.contains("no such directory"), "{message}");
+        assert!(message.contains("config set client-data"), "{message}");
+        assert!(!message.contains("--client-data"), "{message}");
+    }
+
+    #[test]
+    fn an_invalid_configured_directory_names_the_supported_remedy() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = tmp.path().join("invalid/Data");
+        std::fs::create_dir_all(&data).unwrap();
+        configured(&project, &data);
+
+        let error = sync(&project, &FakeStack::new().runner()).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("missing dbc.MPQ"), "{message}");
+        assert!(message.contains("config set client-data"), "{message}");
+        assert!(!message.contains("--client-data"), "{message}");
+    }
+
+    #[test]
+    fn a_relative_configured_path_is_resolved_from_the_checkout_root() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        configured(&project, Path::new("wow/Data"));
+
+        let stack = FakeStack::new();
+        sync(&project, &stack.runner()).unwrap();
+
+        let pack = stack
+            .rendered()
+            .into_iter()
+            .find(|call| call.contains("--pack-client"))
+            .expect("the packer never ran");
+        assert!(pack.contains(&data.to_string_lossy().to_string()), "{pack}");
     }
 
     #[test]
@@ -164,6 +224,6 @@ mod tests {
 
         let error = sync(&project, &stack.runner()).unwrap_err();
 
-        assert!(error.to_string().contains("collision"), "{error}");
+        assert!(error.to_string().contains("AutoLoot"), "{error}");
     }
 }
