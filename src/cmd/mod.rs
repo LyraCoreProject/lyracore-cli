@@ -42,10 +42,13 @@ lyracore — local LyraCore development
 USAGE:
   lyracore doctor                              check whether your machine is ready for `dev up`
   lyracore preflight                           the offline deploy gate: build, schema, filters
-  lyracore publish [DATABASE ...]              preflight, then publish the module (default:
-                                               the fixture database). Takes database NAMES
-                                               only — SpacetimeDB's data-wiping -c flag is
-                                               deliberately not exposed here
+  lyracore publish [DATABASE ...]              preflight, then publish the module. With no
+                                               names, publishes every database of the active
+                                               fixture topology (the default sharded topology
+                                               if none is recorded); named databases are
+                                               published exactly as given. Takes database
+                                               NAMES only — SpacetimeDB's data-wiping -c flag
+                                               is deliberately not exposed here
   lyracore publish --skip-preflight [DB ...]   publish without running the offline checks
                                                (preflight) first
   lyracore dev up                              start (or reuse) the local realm: four databases
@@ -101,6 +104,8 @@ pub enum Command {
     Doctor,
     Preflight,
     Publish {
+        /// The database names typed on the command line. Empty means none were — `publish::run`
+        /// resolves that against the recorded topology once it has discovered the project.
         databases: Vec<String>,
         skip_preflight: bool,
     },
@@ -154,7 +159,9 @@ impl Command {
             ))),
 
             // Everything that is not the one recognised option is a database NAME — and
-            // `publish::databases` is what refuses anything flag-shaped, including `-c`.
+            // `publish::databases` is what refuses anything flag-shaped, including `-c`. An empty
+            // result is not yet a default: `publish::run` resolves it against the recorded
+            // topology once it has discovered the project (parsing happens before that).
             ["publish", rest @ ..] => {
                 let skip_preflight = rest.contains(&"--skip-preflight");
                 let names: Vec<String> = rest
@@ -631,11 +638,14 @@ mod tests {
     }
 
     #[test]
-    fn publish_defaults_to_the_fixture_database_and_takes_names() {
+    fn publish_with_no_names_parses_to_an_empty_list_and_takes_names_verbatim() {
+        // Bare `publish` is resolved against the recorded topology inside `publish::run`, which
+        // is the earliest point a `ProjectLayout` exists to read it from — parsing itself only
+        // reflects what was typed.
         assert_eq!(
             parse("publish").unwrap(),
             Command::Publish {
-                databases: vec![crate::project::ProjectLayout::DATABASE.to_string()],
+                databases: vec![],
                 skip_preflight: false,
             }
         );
@@ -653,7 +663,7 @@ mod tests {
         assert_eq!(
             parse("publish --skip-preflight").unwrap(),
             Command::Publish {
-                databases: vec![crate::project::ProjectLayout::DATABASE.to_string()],
+                databases: vec![],
                 skip_preflight: true,
             }
         );
@@ -830,8 +840,14 @@ mod tests {
         assert!(USAGE_ALL.contains("lyracore import vmaps"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--client-data"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--accept"), "{USAGE_ALL}");
-        assert!(USAGE.contains("every Alliance early-game corridor"), "{USAGE}");
-        assert!(USAGE_ALL.contains("Eastern Kingdoms and Kalimdor"), "{USAGE_ALL}");
+        assert!(
+            USAGE.contains("every Alliance early-game corridor"),
+            "{USAGE}"
+        );
+        assert!(
+            USAGE_ALL.contains("Eastern Kingdoms and Kalimdor"),
+            "{USAGE_ALL}"
+        );
         assert!(USAGE_ALL.contains("populated World Shard"), "{USAGE_ALL}");
     }
 
