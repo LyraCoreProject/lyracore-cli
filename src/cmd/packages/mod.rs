@@ -21,6 +21,7 @@
 
 pub mod review;
 pub mod stamp;
+pub(crate) mod tree;
 
 use crate::cmd::import::Prompt;
 use crate::cmd::preflight;
@@ -112,11 +113,22 @@ pub fn inventory(project: &ProjectLayout) -> Result<Vec<InstalledPackage>> {
         if !root.is_dir() {
             continue;
         }
-        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .collect();
+        let mut dirs = Vec::new();
+        for result in std::fs::read_dir(&root)? {
+            let entry = result?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(Error::State(format!(
+                    "{} is a linked Package in the {} inventory. Refusing to follow it outside \
+                     the checkout; replace it with an ordinary copied directory.",
+                    entry.path().display(),
+                    state.as_str()
+                )));
+            }
+            if file_type.is_dir() {
+                dirs.push(entry.path());
+            }
+        }
         dirs.sort();
         for dir in dirs {
             let raw = dir.file_name().unwrap_or_default().to_string_lossy();
@@ -222,7 +234,6 @@ pub fn add(
     }
 
     let name = PackageName::parse(&source.file_name().unwrap_or_default().to_string_lossy())?;
-    validate_shape(&source)?;
 
     let destination = project.packages_dir().join(name.as_str());
     if source.starts_with(project.packages_dir())
@@ -234,7 +245,21 @@ pub fn add(
             source.display()
         )));
     }
+    if destination.starts_with(&source) {
+        return Err(Error::Usage(format!(
+            "cannot install {} into {} because the destination is inside the folder being copied. \
+             Choose the Package folder itself, not an ancestor of this checkout. Nothing was \
+             copied.",
+            source.display(),
+            destination.display()
+        )));
+    }
     check_collision(project, &name)?;
+    // Computing the identity validates the WHOLE tree (including client content) before the
+    // narrower shape and trust-review passes. The same identity must describe the staged copy
+    // after the operator answers, binding consent to the bytes that are actually installed.
+    let reviewed_identity = stamp::content_identity(&source)?;
+    validate_shape(&source)?;
 
     let review = TrustReview::scan(&source)?;
     println!();
@@ -243,9 +268,21 @@ pub fn add(
 
     confirm(prompt, &name, &destination, yes)?;
 
-    copy_tree(&source, &destination)?;
-    let identity = stamp::content_identity(&destination)?;
-    ProvenanceStamp::local(&source, identity.clone(), stamp::now_unix()).write(&destination)?;
+    let mut staged = StagedPackage::new(project, &name)?;
+    copy_tree(&source, staged.path())?;
+    let identity = stamp::content_identity(staged.path())?;
+    if identity != reviewed_identity {
+        return Err(Error::Process(format!(
+            "the Package Source changed after its trust review (reviewed {reviewed_identity}, \
+             copied {identity}). Nothing was installed; review the current source and run \
+             `lyracore packages add` again."
+        )));
+    }
+    ProvenanceStamp::local(&source, identity.clone(), stamp::now_unix()).write(staged.path())?;
+    // Recheck after the prompt and potentially long copy. A concurrent install must not be merged
+    // with or overwritten by this one.
+    check_collision(project, &name)?;
+    staged.install(&destination)?;
     println!();
     println!("installed {} -> {}", name.as_str(), destination.display());
     println!("  source    local {}", source.display());
@@ -257,10 +294,10 @@ pub fn add(
         Error::Process(format!(
             "preflight failed with '{}' installed, so it has NOT been published and the module on \
              the node is unchanged.\n  The Package is on disk at {}. Fix it there and re-run \
-             `lyracore preflight`, or undo the install with:\n      rm -rf {}\n  ({e})",
+             `lyracore preflight`, or undo the install with:\n      rm -rf -- {}\n  ({e})",
             name.as_str(),
             destination.display(),
-            destination.display()
+            shell_quote(&destination)
         ))
     })?;
 
@@ -298,37 +335,93 @@ fn confirm(prompt: &dyn Prompt, name: &PackageName, destination: &Path, yes: boo
     Ok(())
 }
 
-/// Copy a Package tree file by file.
-///
-/// Two things are refused rather than resolved. A SYMLINK anywhere in the tree would either be
-/// followed (smuggling content from outside the folder the operator reviewed) or recreated (an
-/// install that stops working when its target moves); both contradict "the copy is the installed
-/// Package". A `.git` directory is skipped, because a Package Source is often a checkout of its own
-/// and a nested repository inside `packages/` is not something the operator asked for.
+/// A staged Package outside the enabled inventory. Unless [`install`](Self::install) completes,
+/// dropping it removes the partial copy so a failed install cannot block the next attempt or enter
+/// a concurrent build.
+struct StagedPackage {
+    path: PathBuf,
+    installed: bool,
+}
+
+impl StagedPackage {
+    fn new(project: &ProjectLayout, name: &PackageName) -> Result<Self> {
+        let root = project.state_dir.join("package-installs");
+        std::fs::create_dir_all(&root)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = root.join(format!("{}-{}-{nonce}", name.as_str(), std::process::id()));
+        std::fs::create_dir(&path)?;
+        Ok(Self {
+            path,
+            installed: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn install(&mut self, destination: &Path) -> Result<()> {
+        let parent = destination.parent().ok_or_else(|| {
+            Error::State(format!(
+                "Package destination {} has no parent directory",
+                destination.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent)?;
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &self.path,
+            rustix::fs::CWD,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| {
+            if error == rustix::io::Errno::EXIST {
+                Error::Usage(format!(
+                    "cannot install: {} appeared while the Package was being reviewed and copied. \
+                     Nothing was merged or overwritten.",
+                    destination.display()
+                ))
+            } else {
+                Error::Process(format!(
+                    "could not atomically install the staged Package at {} without overwriting an \
+                     existing path: {error}. Nothing was merged or overwritten.",
+                    destination.display()
+                ))
+            }
+        })?;
+        self.installed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedPackage {
+    fn drop(&mut self) {
+        if !self.installed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Copy a validated Package tree file by file into a fresh staging directory.
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        if name == ".git" {
-            continue;
-        }
-        if entry.file_type()?.is_symlink() {
-            return Err(Error::Usage(format!(
-                "{} is a symlink. A Package is copied, never linked, so every file has to be one \
-                 this folder actually holds. Replace the link with its content and re-run.",
-                path.display()
-            )));
-        }
-        let target = destination.join(&name);
-        if path.is_dir() {
-            copy_tree(&path, &target)?;
-        } else {
-            std::fs::copy(&path, &target)?;
+    for entry in tree::collect(source)? {
+        let target = destination.join(&entry.relative);
+        match entry.kind {
+            tree::EntryKind::Directory => std::fs::create_dir(&target)?,
+            tree::EntryKind::File => {
+                std::fs::copy(&entry.path, &target)?;
+            }
         }
     }
     Ok(())
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 // =============================================================================================
@@ -373,7 +466,7 @@ pub fn list(project: &ProjectLayout) -> Result<()> {
                     "  installed {}",
                     blank_as_unrecorded(&recorded.installed_at)
                 );
-                println!("  identity  {identity}  {}", drift(recorded, &identity));
+                print!("{}", identity_report(recorded, &identity));
             }
             None => {
                 // Created by hand or installed before `packages add` existed. It is a real
@@ -397,6 +490,23 @@ fn drift(recorded: &ProvenanceStamp, current: &str) -> &'static str {
         "clean"
     } else {
         "LOCALLY DRIFTED — the installed copy no longer matches what was installed"
+    }
+}
+
+fn identity_report(recorded: &ProvenanceStamp, current: &str) -> String {
+    if recorded.content_identity.is_empty() {
+        format!(
+            "  identity  (unrecorded)  {}\n  current   {current}\n",
+            drift(recorded, current)
+        )
+    } else if recorded.content_identity == current {
+        format!("  identity  {}  clean\n", recorded.content_identity)
+    } else {
+        format!(
+            "  identity  {}  {}\n  current   {current}\n",
+            recorded.content_identity,
+            drift(recorded, current)
+        )
     }
 }
 
@@ -448,7 +558,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(
             dir.join("src/mod.rs"),
-            "#[spacetimedb::table(name = pkg_greeter_log)]\npub struct Log { pub id: u64 }\n\
+            "#[spacetimedb::table(accessor = pkg_greeter_log)]\npub struct Log { pub id: u64 }\n\
              game_hook!(on_login, fn greet(ctx, payload) { });\n",
         )
         .unwrap();
@@ -459,6 +569,17 @@ mod tests {
     impl Prompt for Answer {
         fn ask(&self, _question: &str) -> Result<String> {
             Ok(self.0.to_string())
+        }
+    }
+
+    struct MutatingAnswer {
+        file: PathBuf,
+    }
+
+    impl Prompt for MutatingAnswer {
+        fn ask(&self, _question: &str) -> Result<String> {
+            std::fs::write(&self.file, "pub fn code_the_operator_never_reviewed() {}\n")?;
+            Ok("yes".to_string())
         }
     }
 
@@ -633,6 +754,33 @@ mod tests {
     }
 
     #[test]
+    fn a_source_that_contains_the_checkout_is_refused_before_recursive_copying() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("greeter");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("src/mod.rs"), "pub fn greet() {}\n").unwrap();
+        let root = source.join("checkout");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(&root).unwrap();
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("destination is inside"),
+            "{error}"
+        );
+        assert!(!project.packages_dir().exists(), "{error}");
+    }
+
+    #[test]
     fn a_name_either_inventory_already_holds_is_refused_before_the_copy() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
@@ -696,7 +844,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains(&format!("rm -rf {}", installed.display())),
+                .contains(&format!("rm -rf -- {}", shell_quote(&installed))),
             "{error}"
         );
         assert!(
@@ -727,6 +875,69 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(
+            !project.packages_dir().join("greeter").exists(),
+            "a refused tree must leave no enabled partial Package: {error}"
+        );
+    }
+
+    #[test]
+    fn source_changes_after_the_review_are_not_installed() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &MutatingAnswer {
+                file: source.join("src/mod.rs"),
+            },
+            source.to_str().unwrap(),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("changed after its trust review"),
+            "{error}"
+        );
+        assert!(!project.packages_dir().join("greeter").exists());
+        let staging = project.state_dir.join("package-installs");
+        assert!(
+            !staging.exists() || std::fs::read_dir(staging).unwrap().next().is_none(),
+            "the rejected staged copy must be cleaned"
+        );
+    }
+
+    #[test]
+    fn the_final_claim_never_replaces_even_an_empty_destination() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let name = PackageName::parse("greeter").unwrap();
+        let mut staged = StagedPackage::new(&project, &name).unwrap();
+        std::fs::write(staged.path().join("payload.txt"), "staged").unwrap();
+        let destination = project.packages_dir().join(name.as_str());
+        std::fs::create_dir_all(&destination).unwrap();
+
+        let error = staged.install(&destination).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Nothing was merged or overwritten"));
+        assert!(std::fs::read_dir(&destination).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn linked_inventory_entries_are_reported_without_following_them() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.packages_dir()).unwrap();
+        std::os::unix::fs::symlink("/", project.packages_dir().join("outside")).unwrap();
+
+        let error = inventory(&project).unwrap_err();
+
+        assert!(error.to_string().contains("linked Package"), "{error}");
     }
 
     // ---- `packages list` ----
@@ -760,6 +971,11 @@ mod tests {
         assert!(
             drift(&recorded, &stamp::content_identity(&installed).unwrap()).contains("DRIFTED")
         );
+        let current = stamp::content_identity(&installed).unwrap();
+        let report = identity_report(&recorded, &current);
+        assert!(report.contains(&recorded.content_identity), "{report}");
+        assert!(report.contains(&current), "{report}");
+        assert!(report.contains("DRIFTED"), "{report}");
 
         // A disabled Package is in the inventory too, and `list` renders both.
         std::fs::create_dir_all(project.packages_disabled_dir().join("retired/src")).unwrap();
@@ -795,5 +1011,14 @@ mod tests {
         let project = checkout(&tmp);
         assert!(inventory(&project).unwrap().is_empty());
         list(&project).unwrap();
+    }
+
+    #[test]
+    fn recovery_paths_are_shell_quoted_as_one_literal_argument() {
+        let path = Path::new("/tmp/a package/'quoted';$(do-not-run)");
+        assert_eq!(
+            shell_quote(path),
+            "'/tmp/a package/'\"'\"'quoted'\"'\"';$(do-not-run)'"
+        );
     }
 }

@@ -14,6 +14,7 @@
 //! to a failed command — `packages list` has to describe a hand-edited or pre-existing Package
 //! sensibly.
 
+use super::tree::{self, EntryKind};
 use crate::Result;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,7 +61,11 @@ impl ProvenanceStamp {
     /// `packages add`, or its stamp file is unreadable. All three are states `packages list`
     /// describes; none of them is an error.
     pub fn read(package_dir: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(package_dir.join(STAMP_FILE)).ok()?;
+        let path = package_dir.join(STAMP_FILE);
+        if !std::fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+            return None;
+        }
+        let text = std::fs::read_to_string(path).ok()?;
         Some(Self::parse(&text))
     }
 
@@ -135,8 +140,9 @@ fn unquote(value: &str) -> String {
     out
 }
 
-/// The content identity of a Package tree: FNV-1a/64 over every file in it, in sorted relative-path
-/// order, as `<relative path>\0<byte length>\0<bytes>`.
+/// The content identity of a Package tree: FNV-1a/64 over every ordinary file AND directory in it,
+/// in sorted relative-path order. Typed directory entries make empty addons/client trees part of
+/// the identity rather than letting their removal appear clean.
 ///
 /// FNV-1a rather than a digest crate, and hand-written rather than `DefaultHasher`: this value is
 /// PERSISTED, so it needs an algorithm that is fixed forever, and `DefaultHasher`'s explicitly is
@@ -147,20 +153,30 @@ fn unquote(value: &str) -> String {
 /// The algorithm name is part of the recorded value, so replacing it later is a readable migration
 /// rather than a silent reinterpretation of old stamps.
 pub fn content_identity(package_dir: &Path) -> Result<String> {
-    let mut files = Vec::new();
-    collect_files(package_dir, package_dir, &mut files)?;
-    files.sort();
-
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for relative in &files {
-        let bytes = std::fs::read(package_dir.join(relative))?;
+    for entry in tree::collect(package_dir)? {
+        let relative = entry.relative.to_string_lossy().replace('\\', "/");
+        if entry.kind == EntryKind::File && relative == STAMP_FILE {
+            continue;
+        }
+        fnv(
+            &mut hash,
+            match entry.kind {
+                EntryKind::Directory => b"directory",
+                EntryKind::File => b"file",
+            },
+        );
+        fnv(&mut hash, &[0]);
         fnv(&mut hash, relative.as_bytes());
         fnv(&mut hash, &[0]);
-        fnv(&mut hash, bytes.len().to_string().as_bytes());
-        fnv(&mut hash, &[0]);
-        fnv(&mut hash, &bytes);
+        if entry.kind == EntryKind::File {
+            let bytes = std::fs::read(&entry.path)?;
+            fnv(&mut hash, bytes.len().to_string().as_bytes());
+            fnv(&mut hash, &[0]);
+            fnv(&mut hash, &bytes);
+        }
     }
-    Ok(format!("fnv1a64:{hash:016x}"))
+    Ok(format!("fnv1a64-tree-v1:{hash:016x}"))
 }
 
 fn fnv(hash: &mut u64, bytes: &[u8]) {
@@ -168,26 +184,6 @@ fn fnv(hash: &mut u64, bytes: &[u8]) {
         *hash ^= u64::from(*byte);
         *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-}
-
-/// Every file under `dir`, as `/`-separated paths relative to `root`, with the stamp itself left
-/// out. Directories contribute only through the paths of the files inside them, so an empty
-/// directory is not part of a Package's identity — nothing the build or the packer reads is.
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if path.is_dir() {
-            collect_files(root, &path, out)?;
-        } else if relative != STAMP_FILE {
-            out.push(relative);
-        }
-    }
-    Ok(())
 }
 
 pub fn now_unix() -> u64 {
@@ -247,7 +243,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let stamp = ProvenanceStamp::local(
             Path::new("/home/dev/my \"packages\"/greeter"),
-            "fnv1a64:0123456789abcdef".to_string(),
+            "fnv1a64-tree-v1:0123456789abcdef".to_string(),
             1_756_000_000,
         );
 
@@ -310,6 +306,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_directories_are_part_of_the_content_identity() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("client/addons/EmptyAddon")).unwrap();
+        let with_addon = content_identity(tmp.path()).unwrap();
+
+        std::fs::remove_dir(tmp.path().join("client/addons/EmptyAddon")).unwrap();
+
+        assert_ne!(content_identity(tmp.path()).unwrap(), with_addon);
+    }
+
+    #[test]
+    fn a_linked_stamp_is_not_followed_as_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside.toml");
+        std::fs::write(&outside, "source_kind = \"local\"\nsource = \"/secret\"\n").unwrap();
+        let package = tmp.path().join("package");
+        std::fs::create_dir(&package).unwrap();
+        std::os::unix::fs::symlink(&outside, package.join(STAMP_FILE)).unwrap();
+
+        assert_eq!(ProvenanceStamp::read(&package), None);
+    }
+
+    #[test]
     fn the_stamp_is_not_part_of_the_identity_it_records() {
         // It carries the hash, so it cannot be inside it.
         let tmp = TempDir::new().unwrap();
@@ -330,8 +349,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "src/mod.rs", "pub fn a() {}\n");
         let identity = content_identity(tmp.path()).unwrap();
-        assert!(identity.starts_with("fnv1a64:"), "{identity}");
-        assert_eq!(identity.len(), "fnv1a64:".len() + 16, "{identity}");
+        assert!(identity.starts_with("fnv1a64-tree-v1:"), "{identity}");
+        assert_eq!(identity.len(), "fnv1a64-tree-v1:".len() + 16, "{identity}");
     }
 
     #[test]

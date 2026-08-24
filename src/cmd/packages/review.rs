@@ -23,7 +23,8 @@
 //! The tests below pin the behaviour the port exists for — an inert commented-out marker, and
 //! marker syntax quoted inside a doc example.
 
-use crate::Result;
+use super::tree::{self, EntryKind};
+use crate::{Error, Result};
 use std::path::Path;
 
 /// The catalog of notify-hook events, as `module/build.rs` knows it. A `game_hook!` naming anything
@@ -51,7 +52,7 @@ const HOOK_EVENTS: [&str; 17] = [
 /// What a candidate Package would register, and how much unclassified Rust comes with it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustReview {
-    /// Table names from `#[table(name = ...)]`.
+    /// Table accessor names from SpacetimeDB 2.x's required `#[table(accessor = ...)]`.
     pub tables: Vec<String>,
     /// Function names carrying `#[reducer]`.
     pub reducers: Vec<String>,
@@ -73,49 +74,62 @@ impl TrustReview {
     /// Scan `package_dir`. Reads; never writes, never runs anything.
     pub fn scan(package_dir: &Path) -> Result<Self> {
         let mut review = Self::default();
+        let entries = tree::collect(package_dir)?;
 
-        let src = package_dir.join("src");
-        if src.is_dir() {
-            let mut files = Vec::new();
-            collect_rs_files(&src, &mut files)?;
-            files.sort();
-            review.rust_files = files.len();
-            for file in &files {
-                let raw = std::fs::read_to_string(file).unwrap_or_default();
-                review.rust_lines += raw.lines().count();
-                review.scan_source(&strip_comments_and_strings(&raw));
-            }
+        let rust_files: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::File
+                    && entry.relative.starts_with("src")
+                    && entry.relative.extension().map(|ext| ext == "rs") == Some(true)
+            })
+            .collect();
+        review.rust_files = rust_files.len();
+        for entry in rust_files {
+            let raw = std::fs::read_to_string(&entry.path).map_err(|error| {
+                Error::Usage(format!(
+                    "cannot read Rust source {} for the trust review: {error}. Nothing was copied.",
+                    entry.path.display()
+                ))
+            })?;
+            review.rust_lines += raw.lines().count();
+            review.scan_source(&strip_comments_and_strings(&raw));
         }
 
-        let addons = package_dir.join("client").join("addons");
-        if addons.is_dir() {
-            for entry in std::fs::read_dir(&addons)? {
-                let path = entry?.path();
-                if path.is_dir() {
-                    review.addons.push(
-                        path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into(),
-                    );
-                }
-            }
-            review.addons.sort();
-        }
-
-        let mpq = package_dir.join("client").join("mpq");
-        if mpq.is_dir() {
-            let mut overrides = Vec::new();
-            collect_files(&mpq, &mut overrides)?;
-            review.client_overrides = overrides.len();
-        }
+        review.addons = entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::Directory
+                    && entry.relative.parent() == Some(Path::new("client/addons"))
+            })
+            .map(|entry| {
+                entry
+                    .relative
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        review.addons.sort();
+        review.client_overrides = entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::File && entry.relative.starts_with("client/mpq")
+            })
+            .count();
 
         Ok(review)
     }
 
     fn scan_source(&mut self, content: &str) {
-        for args in attribute_args(content, "table") {
-            self.tables.push(named_argument(&args, "name"));
+        for head in attribute_heads(content, "table") {
+            let accessor = balanced(head.trim_start())
+                .and_then(|args| top_level_named_ident(&args, "accessor"))
+                .unwrap_or_else(|| {
+                    "(invalid table: missing required `accessor = name`)".to_string()
+                });
+            self.tables.push(accessor);
         }
         for head in attribute_heads(content, "reducer") {
             self.reducers.push(following_fn_name(head));
@@ -272,14 +286,6 @@ fn attribute_heads<'a>(content: &'a str, attr: &str) -> Vec<&'a str> {
     heads
 }
 
-/// The argument list of each `#[<attr>(...)]`, with balanced parentheses.
-fn attribute_args(content: &str, attr: &str) -> Vec<String> {
-    attribute_heads(content, attr)
-        .into_iter()
-        .filter_map(|head| balanced(head.trim_start()))
-        .collect()
-}
-
 fn balanced(head: &str) -> Option<String> {
     let inner = head.strip_prefix('(')?;
     let mut depth = 1usize;
@@ -298,17 +304,43 @@ fn balanced(head: &str) -> Option<String> {
     None
 }
 
-/// `name = <ident>` out of an attribute argument list. Absent means the macro defaults the table
-/// name to the struct's; the review says so rather than guessing at it.
-fn named_argument(args: &str, key: &str) -> String {
-    for part in args.split(',') {
-        if let Some((left, right)) = part.split_once('=') {
-            if left.trim() == key {
-                return right.trim().to_string();
+/// A top-level `key = identifier` argument. Nested `index(...)`/`scheduled(...)` options can carry
+/// their own `accessor` tokens, so commas and equals signs inside delimiters must not be mistaken
+/// for the table's required accessor.
+fn top_level_named_ident(args: &str, key: &str) -> Option<String> {
+    let mut round = 0usize;
+    let mut square = 0usize;
+    let mut curly = 0usize;
+    let mut start = 0usize;
+    for (index, c) in args
+        .char_indices()
+        .chain(std::iter::once((args.len(), ',')))
+    {
+        match c {
+            '(' => round += 1,
+            ')' => round = round.saturating_sub(1),
+            '[' => square += 1,
+            ']' => square = square.saturating_sub(1),
+            '{' => curly += 1,
+            '}' => curly = curly.saturating_sub(1),
+            ',' if round == 0 && square == 0 && curly == 0 => {
+                let part = &args[start..index];
+                if let Some((left, right)) = part.split_once('=') {
+                    if left.trim() == key {
+                        let right = right.trim();
+                        let ident = read_ident(right)?;
+                        let tail = &right[ident.len()..];
+                        if tail.trim().is_empty() {
+                            return Some(ident);
+                        }
+                    }
+                }
+                start = index + c.len_utf8();
             }
+            _ => {}
         }
     }
-    "(name defaulted to the struct)".to_string()
+    None
 }
 
 /// The first `fn NAME` after an attribute — the item it applies to, past any further attributes.
@@ -360,7 +392,9 @@ fn match_fn_name(rest: &str) -> Option<String> {
 
 fn read_ident(text: &str) -> Option<String> {
     let text = text.trim_start();
-    let end = text.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    let end = text
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(text.len());
     (end > 0).then(|| text[..end].to_string())
 }
 
@@ -503,30 +537,6 @@ fn strip_comments_and_strings(src: &str) -> String {
     out.into_iter().collect()
 }
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_rs_files(&path, out)?;
-        } else if path.extension().map(|e| e == "rs").unwrap_or(false) {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn collect_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_files(&path, out)?;
-        } else {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,7 +556,7 @@ mod tests {
     fn the_review_names_what_the_build_would_register() {
         let tmp = package(&[(
             "src/mod.rs",
-            "#[spacetimedb::table(name = pkg_greeter_log, public)]\n\
+            "#[spacetimedb::table(accessor = pkg_greeter_log, public)]\n\
              pub struct GreeterLog { pub id: u64 }\n\
              #[spacetimedb::reducer]\n\
              pub fn pkg_greeter_reset(ctx: &ReducerContext) {}\n\
@@ -572,6 +582,37 @@ mod tests {
     }
 
     #[test]
+    fn tables_use_the_pinned_spacetimedb_two_x_accessor_syntax() {
+        let tmp = package(&[(
+            "src/mod.rs",
+            "#[table(accessor = one)]\n\
+             pub struct One { pub id: u64 }\n\
+             #[spacetimedb::table(\n\
+                 index(name = by_id, btree(columns = [id])),\n\
+                 name = \"canonical_two\",\n\
+                 accessor = two,\n\
+             )]\n\
+             pub struct Two { pub id: u64 }\n\
+             #[table]\n\
+             pub struct Missing { pub id: u64 }\n\
+             #[table(name = legacy)]\n\
+             pub struct Legacy { pub id: u64 }\n",
+        )]);
+
+        let review = TrustReview::scan(tmp.path()).unwrap();
+
+        assert_eq!(
+            review.tables,
+            [
+                "(invalid table: missing required `accessor = name`)",
+                "(invalid table: missing required `accessor = name`)",
+                "one",
+                "two",
+            ]
+        );
+    }
+
+    #[test]
     fn a_commented_out_or_quoted_marker_registers_nothing() {
         // The property the ported stripper exists for: the server build ignores both of these, so
         // a review that counted them would describe an install that never happens.
@@ -589,6 +630,20 @@ mod tests {
         assert_eq!(review.hooks, [("on_login".to_string(), "real".to_string())]);
         assert!(review.tick_passes.is_empty(), "{review:?}");
         assert!(review.character_owned.is_empty(), "{review:?}");
+    }
+
+    #[test]
+    fn non_utf8_rust_is_refused_instead_of_rendered_as_empty_trusted_code() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/mod.rs"), [0xff, 0xfe]).unwrap();
+
+        let error = TrustReview::scan(tmp.path()).unwrap_err();
+
+        assert!(
+            error.to_string().contains("cannot read Rust source"),
+            "{error}"
+        );
     }
 
     #[test]
