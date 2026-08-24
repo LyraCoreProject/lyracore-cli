@@ -117,6 +117,9 @@ fn run(args: &[String]) -> Result<i32> {
         )
         .map(|_| EXIT_OK),
         Command::PackagesList => cmd::packages::list(&ProjectLayout::discover()?).map(|_| EXIT_OK),
+        Command::PackagesNew { name } => {
+            cmd::packages::new(&ProjectLayout::discover()?, &runner, &name).map(|_| EXIT_OK)
+        }
         Command::CharacterGm { name, enabled } => {
             let project = ProjectLayout::discover()?;
             cmd::character::gm(&project, &runner, &http, &name, enabled).map(|_| EXIT_OK)

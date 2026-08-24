@@ -26,6 +26,11 @@ pub const STAMP_FILE: &str = ".lyracore-package.toml";
 /// are separate issues; an unrecognised kind read back from disk is rendered verbatim rather than
 /// refused, because this file is operator-editable input.
 pub const SOURCE_LOCAL: &str = "local";
+/// The kind `packages new` records. A scaffolded Package has no Package Source — nothing the
+/// operator chose and could drift from — so this is a distinct kind from [`SOURCE_LOCAL`] rather
+/// than a `local()` stamp pointed at the reference Package, which would wrongly claim the operator
+/// picked and reviewed a source folder.
+pub const SOURCE_SCAFFOLD: &str = "scaffold";
 
 /// What `packages add` recorded about an install.
 ///
@@ -50,6 +55,18 @@ impl ProvenanceStamp {
         Self {
             source_kind: SOURCE_LOCAL.to_string(),
             source: source.to_string_lossy().to_string(),
+            content_identity,
+            installed_at: utc_rfc3339(now),
+        }
+    }
+
+    /// The stamp a scaffold (`packages new`) writes. `reference` names what it was scaffolded from
+    /// (e.g. `"packages/example/ (the reference Package)"`) — descriptive text, not a location the
+    /// operator chose, which is what [`SOURCE_LOCAL`] would wrongly imply.
+    pub fn scaffolded(reference: &str, content_identity: String, now: u64) -> Self {
+        Self {
+            source_kind: SOURCE_SCAFFOLD.to_string(),
+            source: reference.to_string(),
             content_identity,
             installed_at: utc_rfc3339(now),
         }
@@ -252,6 +269,23 @@ mod tests {
         assert_eq!(ProvenanceStamp::read(tmp.path()), Some(stamp.clone()));
         assert_eq!(stamp.source_kind, SOURCE_LOCAL);
         assert_eq!(stamp.source, "/home/dev/my \"packages\"/greeter");
+    }
+
+    #[test]
+    fn a_scaffold_stamp_is_a_distinct_kind_from_a_local_install() {
+        let tmp = TempDir::new().unwrap();
+        let stamp = ProvenanceStamp::scaffolded(
+            "packages/example/ (the reference Package)",
+            "fnv1a64:0123456789abcdef".to_string(),
+            1_756_000_000,
+        );
+
+        stamp.write(tmp.path()).unwrap();
+
+        assert_eq!(ProvenanceStamp::read(tmp.path()), Some(stamp.clone()));
+        assert_eq!(stamp.source_kind, SOURCE_SCAFFOLD);
+        assert_ne!(stamp.source_kind, SOURCE_LOCAL);
+        assert_eq!(stamp.source, "packages/example/ (the reference Package)");
     }
 
     #[test]

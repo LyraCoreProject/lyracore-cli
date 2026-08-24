@@ -106,6 +106,12 @@ USAGE:
                                                Package Source, its recorded content identity,
                                                whether the installed copy has drifted from it,
                                                and what it registers
+  lyracore packages new NAME                   scaffold a new Package offline, by copying and
+                                               renaming the maintained reference Package that ships
+                                               in this checkout (packages/example/). Refuses an
+                                               enabled or disabled name collision, then runs
+                                               preflight — no network access, no client content
+                                               (the printed next steps explain how to add it)
   lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
                                                read-only production topology, schema, connection,
                                                realm-core and listener verdicts
@@ -160,6 +166,9 @@ pub enum Command {
         yes: bool,
     },
     PackagesList,
+    PackagesNew {
+        name: String,
+    },
     ProductionStatus(production::StatusOptions),
     Update,
     Help,
@@ -293,8 +302,17 @@ impl Command {
             ["packages", "list", other, ..] => Err(Error::Usage(format!(
                 "`packages list` takes no arguments (got '{other}')"
             ))),
+            ["packages", "new", name] => Ok(Command::PackagesNew {
+                name: (*name).to_string(),
+            }),
+            ["packages", "new"] => Err(Error::Usage(
+                "`packages new` needs a name, e.g. `packages new my-package`".to_string(),
+            )),
+            ["packages", "new", _name, other, ..] => Err(Error::Usage(format!(
+                "`packages new` takes one name (got a second argument: '{other}')"
+            ))),
             ["packages", ..] => Err(Error::Usage(
-                "`packages` supports: add FOLDER [--yes], list".to_string(),
+                "`packages` supports: add FOLDER [--yes], list, new NAME".to_string(),
             )),
 
             ["production", "status", rest @ ..] => parse_production_status(rest),
@@ -1159,11 +1177,29 @@ mod tests {
     }
 
     #[test]
-    fn packages_without_a_recognised_verb_names_the_two_that_exist() {
+    fn packages_new_takes_one_name() {
+        assert_eq!(
+            parse("packages new greeter").unwrap(),
+            Command::PackagesNew {
+                name: "greeter".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn packages_new_refuses_no_name_and_a_second_argument() {
+        for line in ["packages new", "packages new greeter extra"] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+        }
+    }
+
+    #[test]
+    fn packages_without_a_recognised_verb_names_the_three_that_exist() {
         for line in ["packages", "packages remove greeter", "packages update"] {
             let error = parse(line).unwrap_err().to_string();
             assert!(
-                error.contains("add") && error.contains("list"),
+                error.contains("add") && error.contains("list") && error.contains("new"),
                 "{line}: {error}"
             );
         }
@@ -1173,6 +1209,7 @@ mod tests {
     fn the_help_text_documents_packages() {
         assert!(USAGE_ALL.contains("lyracore packages add"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("lyracore packages list"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("lyracore packages new"), "{USAGE_ALL}");
     }
 
     // ---- update ----
@@ -1256,6 +1293,7 @@ mod tests {
             "lyracore client sync",
             "lyracore packages add",
             "lyracore packages list",
+            "lyracore packages new",
             "lyracore character gm",
             "lyracore update",
             "--password-stdin",
