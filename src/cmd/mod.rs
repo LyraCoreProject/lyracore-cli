@@ -1,5 +1,6 @@
 pub mod account;
 pub mod character;
+pub mod client;
 pub mod config;
 pub mod dev;
 pub mod doctor;
@@ -88,6 +89,10 @@ USAGE:
   lyracore config                              show the persisted client-data path (or \"(unset)\")
   lyracore config set client-data PATH         validate and remember your 1.12.1 client's Data/
                                                directory, so `import` and `doctor` stop asking
+  lyracore client sync                         pack patch-3.MPQ and every enabled Package's
+                                               addons, then install them into the configured
+                                               client-data path. Warns (best-effort) about an
+                                               addon a disabled or removed Package left behind
   lyracore character gm NAME true|false        grant (true) or revoke (false) GM level for a
                                                character — tries every world shard in turn
   lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
@@ -131,6 +136,7 @@ pub enum Command {
     ConfigSetClientData {
         path: String,
     },
+    ClientSync,
     CharacterGm {
         name: String,
         enabled: bool,
@@ -231,6 +237,17 @@ impl Command {
             ["config", ..] => Err(Error::Usage(
                 "`config` supports: (bare, to show) or set client-data PATH".to_string(),
             )),
+
+            ["client", "sync"] => Ok(Command::ClientSync),
+            ["client", "sync", other, ..] => Err(Error::Usage(format!(
+                "`client sync` takes no arguments (got '{other}')"
+            ))),
+            ["client"] => Err(Error::Usage(
+                "`client` needs a subcommand: sync".to_string(),
+            )),
+            ["client", other, ..] => Err(Error::Usage(format!(
+                "unknown `client` subcommand '{other}' — expected sync"
+            ))),
 
             // Only `gm` today, but the catch-all below names it as ONE arm among future
             // `character` verbs rather than "unknown command" — the shape this whole surface is
@@ -965,6 +982,27 @@ mod tests {
         assert!(USAGE_ALL.contains("client-data"), "{USAGE_ALL}");
     }
 
+    // ---- client sync ----
+
+    #[test]
+    fn client_sync_takes_no_arguments() {
+        assert_eq!(parse("client sync").unwrap(), Command::ClientSync);
+        assert!(parse("client sync extra").is_err());
+    }
+
+    #[test]
+    fn client_without_a_recognised_verb_names_sync_as_the_one_that_exists() {
+        for line in ["client", "client pack", "client install"] {
+            let error = parse(line).unwrap_err().to_string();
+            assert!(error.contains("sync"), "{line}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_help_text_documents_client_sync() {
+        assert!(USAGE_ALL.contains("lyracore client sync"), "{USAGE_ALL}");
+    }
+
     // ---- character gm ----
 
     #[test]
@@ -1089,6 +1127,7 @@ mod tests {
             "lyracore account create",
             "lyracore import",
             "lyracore config",
+            "lyracore client sync",
             "lyracore character gm",
             "lyracore update",
             "--password-stdin",

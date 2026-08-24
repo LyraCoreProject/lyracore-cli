@@ -676,13 +676,13 @@ fn validate_client_data(path: &Path) -> Result<()> {
 pub fn inspect_client_data(path: &Path) -> Result<Vec<String>> {
     if !path.exists() {
         return Err(Error::Usage(format!(
-            "no such directory: {}. Point --client-data at your 1.12.1 client's Data/ directory.",
+            "no such directory: {}. Set client-data to your 1.12.1 client's Data/ directory.",
             path.display()
         )));
     }
     if !path.is_dir() {
         return Err(Error::Usage(format!(
-            "{} is not a directory. --client-data wants the client's Data/ directory itself, not a \
+            "{} is not a directory. client-data must name the client's Data/ directory, not a \
              file inside it.",
             path.display()
         )));
@@ -703,8 +703,8 @@ pub fn inspect_client_data(path: &Path) -> Result<Vec<String>> {
             .all(|(name, _)| nested.join(name).exists())
         {
             return Err(Error::Usage(format!(
-                "{} looks like the client's INSTALL directory, not its Data/ directory. Use:\n  \
-                 --client-data {}",
+                "{} looks like the client's INSTALL directory, not its Data/ directory. Use the \
+                 Data/ directory itself:\n  {}",
                 path.display(),
                 nested.display()
             )));
@@ -762,7 +762,9 @@ fn pull_command(project: &ProjectLayout) -> CommandSpec {
     from_root(project, project.pull_classic_db_script())
 }
 
-fn build_importer_command(project: &ProjectLayout) -> CommandSpec {
+/// Shared with `cmd/client.rs`: `client sync` builds the same pinned importer binary before
+/// driving its `--pack-client` mode.
+pub(crate) fn build_importer_command(project: &ProjectLayout) -> CommandSpec {
     CommandSpec::new("cargo")
         .arg("build")
         .arg("-q")

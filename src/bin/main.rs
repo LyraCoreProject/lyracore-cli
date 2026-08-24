@@ -105,6 +105,9 @@ fn run(args: &[String]) -> Result<i32> {
         Command::ConfigSetClientData { path } => {
             cmd::config::set_client_data(&ProjectLayout::discover()?, &path).map(|_| EXIT_OK)
         }
+        Command::ClientSync => {
+            cmd::client::sync(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
+        }
         Command::CharacterGm { name, enabled } => {
             let project = ProjectLayout::discover()?;
             cmd::character::gm(&project, &runner, &http, &name, enabled).map(|_| EXIT_OK)
