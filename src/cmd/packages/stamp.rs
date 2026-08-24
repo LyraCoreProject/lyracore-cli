@@ -26,6 +26,11 @@ pub const STAMP_FILE: &str = ".lyracore-package.toml";
 /// are separate issues; an unrecognised kind read back from disk is rendered verbatim rather than
 /// refused, because this file is operator-editable input.
 pub const SOURCE_LOCAL: &str = "local";
+/// The kind `packages new` records. A scaffolded Package has no Package Source — nothing the
+/// operator chose and could drift from — so this is a distinct kind from [`SOURCE_LOCAL`] rather
+/// than a `local()` stamp pointed at the reference Package, which would wrongly claim the operator
+/// picked and reviewed a source folder.
+pub const SOURCE_SCAFFOLD: &str = "scaffold";
 
 /// What `packages add` recorded about an install.
 ///
@@ -55,6 +60,18 @@ impl ProvenanceStamp {
         }
     }
 
+    /// The stamp a scaffold (`packages new`) writes. `reference` names what it was scaffolded from
+    /// (e.g. `"packages/example/ (the reference Package)"`) — descriptive text, not a location the
+    /// operator chose, which is what [`SOURCE_LOCAL`] would wrongly imply.
+    pub fn scaffolded(reference: &str, content_identity: String, now: u64) -> Self {
+        Self {
+            source_kind: SOURCE_SCAFFOLD.to_string(),
+            source: reference.to_string(),
+            content_identity,
+            installed_at: utc_rfc3339(now),
+        }
+    }
+
     /// Read the stamp out of a Package directory.
     ///
     /// `None` means this Package has no readable stamp — it was created by hand, predates
@@ -75,11 +92,16 @@ impl ProvenanceStamp {
     }
 
     pub fn render(&self) -> String {
+        let written_by = match self.source_kind.as_str() {
+            SOURCE_LOCAL => "`lyracore packages add`",
+            SOURCE_SCAFFOLD => "`lyracore packages new`",
+            _ => "LyraCore Package tooling (unrecognised source kind)",
+        };
         format!(
-            "# Written by `lyracore packages add`. It records where this Package came from and\n\
-             # what its content was at install time; `lyracore packages list` compares the tree\n\
-             # against `content_identity` to report local drift. This file is excluded from that\n\
-             # hash. Editing it changes only the report, never the Package.\n\
+            "# Written by {written_by}. It records where this Package came from and what its\n\
+             # content was at install time; `lyracore packages list` compares the tree against\n\
+             # `content_identity` to report local drift. This file is excluded from that hash.\n\
+             # Editing it changes only the report, never the Package.\n\
              source_kind = {}\n\
              source = {}\n\
              content_identity = {}\n\
@@ -252,6 +274,44 @@ mod tests {
         assert_eq!(ProvenanceStamp::read(tmp.path()), Some(stamp.clone()));
         assert_eq!(stamp.source_kind, SOURCE_LOCAL);
         assert_eq!(stamp.source, "/home/dev/my \"packages\"/greeter");
+    }
+
+    #[test]
+    fn a_scaffold_stamp_is_a_distinct_kind_from_a_local_install() {
+        let tmp = TempDir::new().unwrap();
+        let stamp = ProvenanceStamp::scaffolded(
+            "packages/example/ (the reference Package)",
+            "fnv1a64-tree-v1:0123456789abcdef".to_string(),
+            1_756_000_000,
+        );
+
+        stamp.write(tmp.path()).unwrap();
+
+        assert_eq!(ProvenanceStamp::read(tmp.path()), Some(stamp.clone()));
+        assert_eq!(stamp.source_kind, SOURCE_SCAFFOLD);
+        assert_ne!(stamp.source_kind, SOURCE_LOCAL);
+        assert_eq!(stamp.source, "packages/example/ (the reference Package)");
+    }
+
+    #[test]
+    fn the_rendered_stamp_names_the_command_that_actually_wrote_it() {
+        // A scaffold was never installed by `packages add` — the file's own header must say so,
+        // not just its `source_kind` key, since the header is what a human reads first.
+        let scaffolded = ProvenanceStamp::scaffolded("packages/example/", String::new(), 0);
+        assert!(scaffolded.render().contains("lyracore packages new"));
+        assert!(!scaffolded.render().contains("lyracore packages add"));
+
+        let installed = ProvenanceStamp::local(Path::new("/src/greeter"), String::new(), 0);
+        assert!(installed.render().contains("lyracore packages add"));
+        assert!(!installed.render().contains("lyracore packages new"));
+
+        let unknown = ProvenanceStamp {
+            source_kind: "future".to_string(),
+            ..Default::default()
+        };
+        assert!(unknown.render().contains("unrecognised source kind"));
+        assert!(!unknown.render().contains("lyracore packages add"));
+        assert!(!unknown.render().contains("lyracore packages new"));
     }
 
     #[test]

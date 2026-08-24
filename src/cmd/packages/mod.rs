@@ -1,11 +1,13 @@
-//! `lyracore packages add <local-folder>` and `lyracore packages list`.
+//! `lyracore packages add <local-folder>`, `lyracore packages new <name>`, and
+//! `lyracore packages list`.
 //!
 //! A Package is a drop-in folder under `packages/<name>/` that the server build compiles into the
 //! module with no core-file edits: `module/build.rs` discovers it, generates `pub mod pkg_<name>`
 //! for its `src/mod.rs`, and registers every marker it finds. `importer --pack-client` picks up its
 //! `client/` half the same way. Installing one is therefore not a configuration change — it is
 //! adding trusted code to the realm — so `add` shows a deterministic inventory of what it registers
-//! and asks before it copies anything.
+//! and asks before it copies anything. `new` copies from inside the checkout itself (the reference
+//! Package), so there is nothing external to review or ask about.
 //!
 //! COPY, NEVER SYMLINK. A symlinked Package would compile from a folder outside the checkout, so
 //! `preflight`, `publish` and `client sync` would each read whatever that folder happened to say at
@@ -14,10 +16,10 @@
 //!
 //! WHERE PACKAGES LIVE: enabled ones in `packages/` (what the build reads), disabled ones in
 //! `.lyracore/packages-disabled/` (git-ignored local state the build cannot see). Enabling and
-//! disabling are separate issues; `add` and `list` only have to know that BOTH are inventories a
-//! new name must not collide with — an installed name that reappears when a Package is re-enabled
-//! is a collision the operator would meet much later, holding two folders and no way to tell which
-//! one the build compiled.
+//! disabling are separate issues; `add`, `new` and `list` only have to know that BOTH are
+//! inventories a new name must not collide with — an installed name that reappears when a Package
+//! is re-enabled is a collision the operator would meet much later, holding two folders and no way
+//! to tell which one the build compiled.
 
 pub mod review;
 pub mod stamp;
@@ -31,6 +33,11 @@ use crate::{Error, Result};
 use review::TrustReview;
 use stamp::ProvenanceStamp;
 use std::path::{Path, PathBuf};
+
+/// The folder name of the maintained reference Package, checked into every LyraCore checkout
+/// (including the public mirror) at `packages/example/`. `packages new` copies and renames it; see
+/// its own doc comment for what a Package's Rust half looks like.
+pub const REFERENCE_PACKAGE: &str = "example";
 
 /// A Package folder name the server build will accept.
 ///
@@ -281,6 +288,7 @@ pub fn add(
     ProvenanceStamp::local(&source, identity.clone(), stamp::now_unix()).write(staged.path())?;
     // Recheck after the prompt and potentially long copy. A concurrent install must not be merged
     // with or overwritten by this one.
+    let _claim = PackageClaim::acquire(project, &name)?;
     check_collision(project, &name)?;
     staged.install(&destination)?;
     println!();
@@ -341,6 +349,40 @@ fn confirm(prompt: &dyn Prompt, name: &PackageName, destination: &Path, yes: boo
 struct StagedPackage {
     path: PathBuf,
     installed: bool,
+}
+
+/// An interprocess lock for one generated Rust module identifier.
+///
+/// The final no-replace rename protects one folder spelling. This lock protects the wider build
+/// collision: `foo-bar` and `foo_bar` have different destinations but both generate
+/// `pkg_foo_bar`. Holding it across the last inventory check and rename makes that decision one
+/// atomic critical section across `packages add` and `packages new` processes.
+#[derive(Debug)]
+struct PackageClaim {
+    _file: std::fs::File,
+}
+
+impl PackageClaim {
+    fn acquire(project: &ProjectLayout, name: &PackageName) -> Result<Self> {
+        let root = project.state_dir.join("package-locks");
+        std::fs::create_dir_all(&root)?;
+        let path = root.join(format!("{}.lock", name.rust_ident()));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |error| {
+                Error::Process(format!(
+                "another Package install is currently claiming module `pkg_{}` ({error}). Wait \
+                 for it to finish, then retry; nothing was installed by this process.",
+                name.rust_ident()
+            ))
+            },
+        )?;
+        Ok(Self { _file: file })
+    }
 }
 
 impl StagedPackage {
@@ -422,6 +464,115 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+// =============================================================================================
+//  `packages new`
+// =============================================================================================
+
+/// Scaffold a new Package by copying and renaming the reference Package (`packages/example/`,
+/// checked into this checkout). Fetching the template needs no network; the ordinary preflight at
+/// the end still uses Cargo's configured cache/network like `lyracore preflight` itself. Nothing
+/// came from outside the checkout, so unlike `add` there is no Package Source or trust review to
+/// show.
+pub fn new(project: &ProjectLayout, runner: &dyn ProcessRunner, name: &str) -> Result<()> {
+    let name = PackageName::parse(name)?;
+    check_collision(project, &name)?;
+
+    let reference = project.packages_dir().join(REFERENCE_PACKAGE);
+    if !reference.is_dir() {
+        return Err(Error::Usage(format!(
+            "no reference Package at {}. `packages new` scaffolds by copying `packages/{}/` out of \
+             this checkout, so a checkout missing it cannot scaffold — that is a broken or partial \
+             checkout, not a problem with the name '{}'.",
+            reference.display(),
+            REFERENCE_PACKAGE,
+            name.as_str()
+        )));
+    }
+    // Validate the complete maintained tree with the same no-links/no-special-files policy as a
+    // local install, before an enabled destination exists.
+    stamp::content_identity(&reference)?;
+    validate_shape(&reference)?;
+
+    let destination = project.packages_dir().join(name.as_str());
+    let mut staged = StagedPackage::new(project, &name)?;
+    copy_tree(&reference, staged.path())?;
+    rewrite_reference_name(staged.path(), &name)?;
+
+    let identity = stamp::content_identity(staged.path())?;
+    ProvenanceStamp::scaffolded(
+        &format!("packages/{REFERENCE_PACKAGE}/ (the reference Package)"),
+        identity.clone(),
+        stamp::now_unix(),
+    )
+    .write(staged.path())?;
+    let _claim = PackageClaim::acquire(project, &name)?;
+    check_collision(project, &name)?;
+    staged.install(&destination)?;
+    println!();
+    println!("scaffolded {} -> {}", name.as_str(), destination.display());
+    println!("  from      packages/{REFERENCE_PACKAGE}/ (the reference Package)");
+    println!("  identity  {identity}");
+
+    println!();
+    println!("running preflight with the Package compiled in");
+    preflight::run(project, runner).map_err(|e| {
+        Error::Process(format!(
+            "preflight failed after '{}' was scaffolded, so it has NOT been published and the \
+             module on the node is unchanged.\n  The Package remains at {}. The failure below may \
+             be in its code or in another preflight prerequisite; fix the reported cause and \
+             re-run `lyracore preflight`, or undo the scaffold with:\n      rm -rf -- {}\n  ({e})",
+            name.as_str(),
+            destination.display(),
+            shell_quote(&destination)
+        ))
+    })?;
+
+    println!();
+    println!(
+        "'{}' is scaffolded and preflight is green. It has no client/ directory yet, so:",
+        name.as_str()
+    );
+    println!("  lyracore publish       compile the Package into the module and publish it to every database");
+    println!(
+        "  lyracore client sync   nothing to install yet — add a client/ directory (addons under"
+    );
+    println!(
+        "                         client/addons/<Name>/, overrides under client/mpq/) and re-run"
+    );
+    println!(
+        "grow the Rust half in packages/{}/src/: wire more hooks from the catalog in",
+        name.as_str()
+    );
+    println!("module/src/hooks.rs, following the pattern already in its src/mod.rs.");
+    Ok(())
+}
+
+/// Replace the reference Package's own name inside the copied tree's file contents, so a scaffold
+/// named `greeter` does not keep saying `example` in its identifiers. The reference Package is
+/// maintained to use the literal word "example" ONLY inside an identifier, never in prose (see its
+/// own doc comment), so a whole-file substring replace is exact rather than approximate. A file that
+/// is not valid UTF-8 is left untouched — the reference Package ships none, and a future one that
+/// did would not be text this rewrite could safely touch anyway.
+fn rewrite_reference_name(destination: &Path, name: &PackageName) -> Result<()> {
+    let ident = name.rust_ident();
+    for entry in tree::collect(destination)? {
+        if entry.kind != tree::EntryKind::File || entry.relative == Path::new(stamp::STAMP_FILE) {
+            continue;
+        }
+        match std::fs::read_to_string(&entry.path) {
+            Ok(text) if text.contains(REFERENCE_PACKAGE) => {
+                std::fs::write(&entry.path, text.replace(REFERENCE_PACKAGE, &ident))?;
+            }
+            Ok(_) => {}
+            // A future reference may carry binary client assets; they have no textual identifier
+            // to rewrite and are copied byte-for-byte.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 // =============================================================================================
@@ -929,6 +1080,21 @@ mod tests {
     }
 
     #[test]
+    fn folded_package_names_share_one_interprocess_claim() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let hyphen = PackageName::parse("foo-bar").unwrap();
+        let underscore = PackageName::parse("foo_bar").unwrap();
+
+        let first = PackageClaim::acquire(&project, &hyphen).unwrap();
+        let error = PackageClaim::acquire(&project, &underscore).unwrap_err();
+
+        assert!(error.to_string().contains("pkg_foo_bar"), "{error}");
+        drop(first);
+        PackageClaim::acquire(&project, &underscore).unwrap();
+    }
+
+    #[test]
     fn linked_inventory_entries_are_reported_without_following_them() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
@@ -938,6 +1104,113 @@ mod tests {
         let error = inventory(&project).unwrap_err();
 
         assert!(error.to_string().contains("linked Package"), "{error}");
+    }
+
+    // ---- `packages new` ----
+
+    /// A checkout that also carries a reference Package, standing in for the real
+    /// `packages/example/` this CLI ships in the LyraCore repo. Its source deliberately spells the
+    /// literal word "example" only inside an identifier, matching the real reference Package's own
+    /// constraint, so a scaffold test can assert the rename actually happened.
+    fn checkout_with_reference(tmp: &TempDir) -> ProjectLayout {
+        let project = checkout(tmp);
+        let reference = project.packages_dir().join(REFERENCE_PACKAGE).join("src");
+        std::fs::create_dir_all(&reference).unwrap();
+        std::fs::write(
+            reference.join("mod.rs"),
+            "crate::game_hook!(on_group_invite, fn example_on_group_invite(_ctx, _payload) { });\n",
+        )
+        .unwrap();
+        project
+    }
+
+    #[test]
+    fn a_scaffold_copies_the_reference_renames_it_stamps_it_and_stops_short_of_publishing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout_with_reference(&tmp);
+        let stack = FakeStack::new();
+
+        new(&project, &stack.runner(), "greeter").unwrap();
+
+        let scaffolded = project.packages_dir().join("greeter");
+        let source = std::fs::read_to_string(scaffolded.join("src/mod.rs")).unwrap();
+        assert!(
+            source.contains("greeter_on_group_invite"),
+            "the reference Package's own name must be renamed: {source}"
+        );
+        assert!(!source.contains("example_on_group_invite"), "{source}");
+
+        let recorded = ProvenanceStamp::read(&scaffolded).expect("no provenance stamp");
+        assert_eq!(recorded.source_kind, stamp::SOURCE_SCAFFOLD);
+        assert_eq!(
+            recorded.content_identity,
+            stamp::content_identity(&scaffolded).unwrap(),
+            "the stamp must record the identity of what was actually written"
+        );
+        // The remaining steps are PRINTED, never run: nothing here may touch the node.
+        for call in stack.rendered() {
+            assert!(!call.contains("spacetime publish"), "{call}");
+            assert!(!call.contains("--pack-client"), "{call}");
+        }
+    }
+
+    #[test]
+    fn a_scaffold_name_either_inventory_already_holds_is_refused_before_anything_is_written() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout_with_reference(&tmp);
+        std::fs::create_dir_all(project.packages_dir().join("greeter")).unwrap();
+
+        let error = new(&project, &FakeStack::new().runner(), "greeter").unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(error.to_string().contains("enabled"), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_scaffold_name_is_refused_before_anything_is_written() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout_with_reference(&tmp);
+
+        let error = new(&project, &FakeStack::new().runner(), "2fast").unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(!project.packages_dir().join("2fast").exists(), "{error}");
+    }
+
+    #[test]
+    fn a_checkout_missing_the_reference_package_cannot_scaffold() {
+        // `checkout()`, not `checkout_with_reference()` — a checkout without `packages/example/` is
+        // exactly the broken/partial state this error names, not something `new` can paper over.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+
+        let error = new(&project, &FakeStack::new().runner(), "greeter").unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(error.to_string().contains("reference Package"), "{error}");
+        assert!(!project.packages_dir().join("greeter").exists(), "{error}");
+    }
+
+    #[test]
+    fn a_failed_preflight_after_scaffolding_publishes_nothing_and_says_how_to_undo_it() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout_with_reference(&tmp);
+        let stack = FakeStack::new().fail_on("cargo check", "the scaffold does not compile");
+
+        let error = new(&project, &stack.runner(), "greeter").unwrap_err();
+
+        let scaffolded = project.packages_dir().join("greeter");
+        assert!(error.to_string().contains("preflight failed"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("rm -rf -- {}", shell_quote(&scaffolded))),
+            "{error}"
+        );
+        assert!(
+            scaffolded.is_dir(),
+            "the scaffold stays so it can be fixed in place"
+        );
     }
 
     // ---- `packages list` ----
