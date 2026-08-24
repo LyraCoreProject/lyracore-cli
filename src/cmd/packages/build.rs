@@ -8,7 +8,8 @@
 //! 2. `bun install --frozen-lockfile` installs exactly what `datascripts/bun.lock` records. Frozen,
 //!    not merely locked: a build that silently resolved a newer dependency would typecheck against
 //!    a library the next author does not have.
-//! 3. `bun x tsc --noEmit` is the gate. Nothing is emitted — the answer is the exit code.
+//! 3. Bun runs the locked, project-local TypeScript compiler with `--noEmit`. Nothing is emitted —
+//!    the answer is the exit code.
 //!
 //! All three STREAM to the terminal rather than being captured. `tsc` writes its diagnostics to
 //! stdout, so a captured run surfaced an empty error and lost the file and line this command
@@ -27,6 +28,7 @@
 //! Bun is needed HERE and nowhere else. An Operator applying a prebuilt Package Delta runs no part
 //! of this, which is why `doctor`'s Bun check is a warning rather than a launch blocker.
 
+use crate::cmd::preflight;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::ProjectLayout;
 use crate::{Error, Result};
@@ -38,19 +40,7 @@ use crate::{Error, Result};
 /// mention: `module/build.rs` compiles every enabled Package into the same wasm, so their tables
 /// are in the schema this reads.
 pub fn typegen_command(project: &ProjectLayout) -> CommandSpec {
-    CommandSpec::new("spacetime")
-        .arg("generate")
-        .arg("--lang")
-        .arg("typescript")
-        .arg("--module-path")
-        .arg(project.module_dir().to_string_lossy().to_string())
-        .arg("--out-dir")
-        .arg(project.datascript_types_dir().to_string_lossy().to_string())
-        .arg(format!(
-            "--build-options={}",
-            ProjectLayout::DEPLOY_FEATURES
-        ))
-        .arg("-y")
+    preflight::schema_command_for_language(project, &project.datascript_types_dir(), "typescript")
 }
 
 /// Install exactly what the lockfile records, and fail rather than update it.
@@ -64,21 +54,26 @@ pub fn install_command(project: &ProjectLayout) -> CommandSpec {
 /// The gate. `--noEmit`: this build produces typings and a verdict, never JavaScript.
 pub fn typecheck_command(project: &ProjectLayout) -> CommandSpec {
     CommandSpec::new("bun")
-        .arg("x")
-        .arg("tsc")
+        // Do not use `bun x tsc`: bunx may fall back to npm/global cache when the local binary is
+        // absent, and TypeScript's node shebang may then require an unreported Node runtime.
+        .arg("./node_modules/typescript/bin/tsc")
         .arg("--noEmit")
         .cwd(project.datascripts_dir())
 }
 
 pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     let datascripts = project.datascripts_dir();
-    if !datascripts.join("package.json").is_file() {
-        return Err(Error::Usage(format!(
-            "no Datascript project at {}. `packages build` regenerates the Module typings into \
-             datascripts/generated/ and typechecks the Datascripts against them, so it needs the \
-             checked-in Bun project (package.json, bun.lock, tsconfig.json). A checkout missing it \
-             is a partial checkout.",
-            datascripts.display()
+    let missing = ["package.json", "bun.lock", "tsconfig.json"]
+        .into_iter()
+        .filter(|name| !datascripts.join(name).is_file())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(Error::PrerequisiteMissing(format!(
+            "the Datascript project at {} is incomplete (missing {}). `packages build` needs the \
+             checked-in Bun project before it can regenerate datascripts/generated/ and \
+             typecheck the Datascripts. Restore the missing files from this checkout's branch.",
+            datascripts.display(),
+            missing.join(", ")
         )));
     }
 
@@ -90,12 +85,11 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
         .run_streaming(&typegen_command(project))
         .map_err(|e| {
             Error::Process(format!(
-            "could not extract the Module schema as TypeScript. This builds the module wasm and \
-             reads it — the same step `lyracore preflight` runs — so a module that does not \
-             compile fails here first. Nothing was typechecked.\n  ({e})"
-        ))
+                "could not extract the Module schema as TypeScript. This builds the module wasm and \
+                reads it — the same step `lyracore preflight` runs — so a module that does not \
+                 compile fails here first. Nothing was typechecked.\n  ({e})"
+            ))
         })?;
-
     println!("installing the pinned Datascript dependencies (bun.lock)");
     runner
         .run_streaming(&install_command(project))
@@ -137,6 +131,7 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(root.join("datascripts/package.json"), "{}\n").unwrap();
         std::fs::write(root.join("datascripts/bun.lock"), "{}\n").unwrap();
+        std::fs::write(root.join("datascripts/tsconfig.json"), "{}\n").unwrap();
         ProjectLayout::from_root(&root).unwrap()
     }
 
@@ -156,7 +151,10 @@ mod tests {
             calls[1].contains("bun install --frozen-lockfile"),
             "{calls:?}"
         );
-        assert!(calls[2].contains("tsc --noEmit"), "{calls:?}");
+        assert_eq!(
+            calls[2], "bun ./node_modules/typescript/bin/tsc --noEmit",
+            "{calls:?}"
+        );
     }
 
     #[test]
@@ -168,6 +166,11 @@ mod tests {
         let rendered = typegen_command(&project).render();
 
         assert!(rendered.contains("datascripts/generated"), "{rendered}");
+        assert!(rendered.contains("--no-config"), "{rendered}");
+        assert_eq!(
+            typegen_command(&project).cwd_value(),
+            Some(project.root.as_path())
+        );
         // The deploy feature set, so the typings describe the module that actually publishes.
         assert!(
             rendered.contains(ProjectLayout::DEPLOY_FEATURES),
@@ -234,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn a_checkout_without_the_datascript_project_is_refused_before_anything_runs() {
+    fn a_checkout_without_the_datascript_project_is_an_operational_failure() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bare");
         std::fs::create_dir_all(&root).unwrap();
@@ -244,7 +247,23 @@ mod tests {
 
         let error = run(&project, &stack.runner()).unwrap_err();
 
-        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE, "{error}");
+        assert!(error.to_string().contains("package.json"), "{error}");
+        assert!(error.to_string().contains("bun.lock"), "{error}");
+        assert!(error.to_string().contains("tsconfig.json"), "{error}");
+        assert!(stack.rendered().is_empty(), "{error}");
+    }
+
+    #[test]
+    fn every_required_datascript_project_file_is_checked_before_typegen() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::remove_file(project.datascripts_dir().join("tsconfig.json")).unwrap();
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("tsconfig.json"), "{error}");
         assert!(stack.rendered().is_empty(), "{error}");
     }
 

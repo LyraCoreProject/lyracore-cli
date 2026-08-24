@@ -16,10 +16,9 @@ use std::process::{Command, Stdio};
 /// Keep this in step with that pin (LyraCore's `module/Cargo.toml` + `gateway/Cargo.toml`).
 pub const REQUIRED_SPACETIME: Version = Version(2, 7, 1);
 
-/// The Bun version the Datascript toolchain is pinned to, asked as a **floor** (`>=`) exactly like
-/// [`REQUIRED_SPACETIME`]. The authoritative pin is the checkout's own `datascripts/package.json`
-/// (`engines.bun`) together with `datascripts/bun.lock`; this constant is the copy `doctor` can
-/// answer with before it knows whether a checkout is in scope. Keep the two in step.
+/// The Bun version the Datascript toolchain is pinned to exactly. Bun itself interprets
+/// `engines.bun` as a compatibility range, but Package authors need the verified runtime as well
+/// as the locked dependency graph. Keep this in step with the checkout's Datascript toolchain.
 pub const REQUIRED_BUN: Version = Version(1, 3, 7);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -207,7 +206,7 @@ fn check_spacetime() -> Check {
     }
 }
 
-/// Is Bun present, and new enough to read the checkout's `datascripts/bun.lock`?
+/// Is Bun present at the exact version verified for the checkout's Datascript toolchain?
 ///
 /// Never launch-blocking, and that is the design rather than an omission. Bun is AUTHOR-side only:
 /// `lyracore packages build` runs Datascript typegen and the `tsc --noEmit` gate through it. An
@@ -215,34 +214,51 @@ fn check_spacetime() -> Check {
 /// toolchain at all — so a machine without Bun is a machine that cannot author Datascripts, not a
 /// broken one.
 fn check_bun() -> Check {
-    let Some(text) = version_output("bun", &["--version"]) else {
+    let text = version_output("bun", &["--version"]);
+    check_bun_banner(text.as_deref())
+}
+
+fn check_bun_banner(text: Option<&str>) -> Check {
+    let install = format!("`curl -fsSL https://bun.sh/install | bash -s \"bun-v{REQUIRED_BUN}\"`");
+    let Some(text) = text else {
         return Check::warn(
             "Bun",
             format!(
                 "`bun` not found — needed only by `lyracore packages build` (Datascript typegen \
-                 and typecheck); install {REQUIRED_BUN} or newer with \
-                 `curl -fsSL https://bun.sh/install | bash`"
+                 and typecheck); install the pinned {REQUIRED_BUN} with {install}"
             ),
         );
     };
-    match parse_version(&text) {
-        Some(found) if found >= REQUIRED_BUN => {
-            Check::pass("Bun", format!("{found} (requires {REQUIRED_BUN})"))
-        }
+    match parse_bare_version(text) {
+        Some(found) if found == REQUIRED_BUN => Check::pass("Bun", format!("{found} (pinned)")),
         Some(found) => Check::warn(
             "Bun",
             format!(
-                "found {found}, but {REQUIRED_BUN} is required — upgrade with `bun upgrade`. \
-                 `lyracore packages build` will not read datascripts/bun.lock until you do"
+                "found {found}, but this checkout's Datascript toolchain is pinned to \
+                 {REQUIRED_BUN} — install that exact version with {install}. `lyracore packages \
+                 build` is not verified with a different Bun runtime"
             ),
         ),
         None => Check::warn(
             "Bun",
             format!(
-                "could not read a version from `bun --version`; expected {REQUIRED_BUN} or newer"
+                "could not read a version from `bun --version`; expected exactly {REQUIRED_BUN}. \
+                 Reinstall it with {install}"
             ),
         ),
     }
+}
+
+/// Bun's banner is exactly `x.y.z`; unlike the chatty SpacetimeDB banner, trailing components or
+/// surrounding words are malformed rather than details to ignore.
+fn parse_bare_version(text: &str) -> Option<Version> {
+    let mut parts = text.trim().split('.');
+    let version = Version(
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(version)
 }
 
 fn check_wasm_target() -> Check {
@@ -476,19 +492,30 @@ mod tests {
     // ---- the Bun check ----
 
     #[test]
-    fn the_required_bun_version_is_enforced_as_a_floor() {
-        assert!(Version(1, 3, 7) >= REQUIRED_BUN);
-        assert!(Version(1, 4, 0) >= REQUIRED_BUN);
-        assert!(Version(2, 0, 0) >= REQUIRED_BUN);
-        assert!(Version(1, 3, 6) < REQUIRED_BUN);
-        assert!(Version(1, 2, 9) < REQUIRED_BUN);
-        assert!(Version(0, 9, 9) < REQUIRED_BUN);
+    fn the_required_bun_version_is_an_exact_pin() {
+        assert!(matches!(
+            check_bun_banner(Some("1.3.7\n")),
+            Check::Pass { .. }
+        ));
+        for version in ["1.3.6", "1.4.0", "2.0.0"] {
+            let Check::Warn { guidance, .. } = check_bun_banner(Some(version)) else {
+                panic!("{version} must not satisfy the Bun pin");
+            };
+            assert!(guidance.contains("bun-v1.3.7"), "{guidance}");
+        }
     }
 
     #[test]
     fn bun_reports_its_bare_version_banner() {
         // `bun --version` prints just `1.3.7`, with no tool name around it.
-        assert_eq!(parse_version("1.3.7\n"), Some(Version(1, 3, 7)));
+        assert_eq!(parse_bare_version("1.3.7\n"), Some(Version(1, 3, 7)));
+        for malformed in ["bun 1.3.7", "1.3.7.99", "1.3", "1.3.seven"] {
+            assert_eq!(parse_bare_version(malformed), None, "{malformed}");
+            assert!(matches!(
+                check_bun_banner(Some(malformed)),
+                Check::Warn { .. }
+            ));
+        }
     }
 
     #[test]
@@ -496,6 +523,15 @@ mod tests {
         // Bun is author-side only. An Operator applying a prebuilt Package Delta needs none, so
         // `doctor` must not exit nonzero over it on their machine.
         assert!(!check_bun().is_blocking(), "Bun may never block a launch");
+    }
+
+    #[test]
+    fn missing_bun_has_the_exact_version_install_command() {
+        let Check::Warn { guidance, .. } = check_bun_banner(None) else {
+            panic!("missing Bun must warn");
+        };
+        assert!(guidance.contains("bun-v1.3.7"), "{guidance}");
+        assert!(guidance.contains("bash -s"), "{guidance}");
     }
 
     // ---- the client-data check ----

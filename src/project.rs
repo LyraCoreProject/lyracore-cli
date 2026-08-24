@@ -357,8 +357,8 @@ impl ProjectLayout {
     pub const DATASCRIPTS_DIR: &'static str = "datascripts";
     /// Where `packages build` writes the TypeScript typings extracted from the Module wasm.
     ///
-    /// `spacetime generate` OWNS this directory: run with `-y` it deletes whatever it did not
-    /// write, so nothing hand-authored may live here. Datascripts import from it; they sit in
+    /// `spacetime generate` owns this directory and removes stale files carrying its generated
+    /// header, so nothing hand-authored may live here. Datascripts import from it; they sit in
     /// `datascripts/src/`.
     pub const DATASCRIPT_TYPES_DIR: &'static str = "generated";
 
