@@ -86,14 +86,14 @@ fn run(args: &[String]) -> Result<i32> {
         Command::ImportWorld(options) => cmd::import::run_world(
             &ProjectLayout::discover()?,
             &runner,
-            &cmd::import::TtyPrompt,
+            &cmd::import::TtyPrompt::import_world(),
             &options,
         )
         .map(|_| EXIT_OK),
         Command::ImportVmaps { options } => cmd::import::run_vmaps(
             &ProjectLayout::discover()?,
             &runner,
-            &cmd::import::TtyPrompt,
+            &cmd::import::TtyPrompt::import_vmaps(),
             &options,
         )
         .map(|_| EXIT_OK),
@@ -108,6 +108,15 @@ fn run(args: &[String]) -> Result<i32> {
         Command::ClientSync => {
             cmd::client::sync(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
         }
+        Command::PackagesAdd { folder, yes } => cmd::packages::add(
+            &ProjectLayout::discover()?,
+            &runner,
+            &cmd::import::TtyPrompt::packages_add(),
+            &folder,
+            yes,
+        )
+        .map(|_| EXIT_OK),
+        Command::PackagesList => cmd::packages::list(&ProjectLayout::discover()?).map(|_| EXIT_OK),
         Command::CharacterGm { name, enabled } => {
             let project = ProjectLayout::discover()?;
             cmd::character::gm(&project, &runner, &http, &name, enabled).map(|_| EXIT_OK)

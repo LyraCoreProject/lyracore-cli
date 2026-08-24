@@ -23,6 +23,7 @@ path = "src/bin/main.rs"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rustix = { version = "1", features = ["fs"] }
 # Same pin as the gateway: the provisioning password is held in a wiped buffer end to end.
 zeroize = "=1.8.1"
 

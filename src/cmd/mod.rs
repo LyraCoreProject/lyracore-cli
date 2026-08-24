@@ -6,6 +6,7 @@ pub mod dev;
 pub mod doctor;
 mod gateway_log;
 pub mod import;
+pub mod packages;
 pub mod preflight;
 pub mod production;
 pub mod publish;
@@ -95,6 +96,16 @@ USAGE:
                                                addon a disabled or removed Package left behind
   lyracore character gm NAME true|false        grant (true) or revoke (false) GM level for a
                                                character — tries every world shard in turn
+  lyracore packages add FOLDER [--yes]        install a Package from a folder on this machine:
+                                               copies it into packages/, records where it came
+                                               from, prints a deterministic review of the tables,
+                                               reducers, hooks, addons and client overrides it
+                                               registers, asks before copying, then runs preflight.
+                                               It never publishes — it prints the steps left
+  lyracore packages list                       every installed Package: enabled or disabled, its
+                                               Package Source, its recorded content identity,
+                                               whether the installed copy has drifted from it,
+                                               and what it registers
   lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
                                                read-only production topology, schema, connection,
                                                realm-core and listener verdicts
@@ -141,6 +152,14 @@ pub enum Command {
         name: String,
         enabled: bool,
     },
+    PackagesAdd {
+        /// The folder to install, as typed. Resolved against the filesystem in `packages::add`,
+        /// which is the earliest point the checkout it is being installed into is known.
+        folder: String,
+        /// `--yes`: the install confirmation was answered in advance (scripted runs).
+        yes: bool,
+    },
+    PackagesList,
     ProductionStatus(production::StatusOptions),
     Update,
     Help,
@@ -267,6 +286,17 @@ impl Command {
                 "`character` supports: gm NAME true|false".to_string(),
             )),
 
+            // `add` takes exactly one positional: the folder. `--yes` may come on either side of
+            // it, like every other flag on this surface.
+            ["packages", "add", rest @ ..] => parse_packages_add(rest),
+            ["packages", "list"] => Ok(Command::PackagesList),
+            ["packages", "list", other, ..] => Err(Error::Usage(format!(
+                "`packages list` takes no arguments (got '{other}')"
+            ))),
+            ["packages", ..] => Err(Error::Usage(
+                "`packages` supports: add FOLDER [--yes], list".to_string(),
+            )),
+
             ["production", "status", rest @ ..] => parse_production_status(rest),
             ["production", ..] => Err(Error::Usage(
                 "`production` supports: status --server URI --gateway-log PATH --realm-core DB \
@@ -385,6 +415,40 @@ fn parse_production_status(args: &[&str]) -> Result<Command> {
         realm_core,
         databases,
     }))
+}
+
+/// `packages add FOLDER [--yes]`.
+///
+/// `--yes` answers the install confirmation in advance, the same way `import --accept` answers the
+/// consent question: a scripted install must be possible, and a prompt read from `/dev/tty` cannot
+/// be answered by a pipeline. It is a separate flag from the folder so a path that happens to start
+/// with `-` is still refused rather than read as an option.
+fn parse_packages_add(args: &[&str]) -> Result<Command> {
+    let mut folder: Option<String> = None;
+    let mut yes = false;
+    for arg in args {
+        match *arg {
+            "--yes" => yes = true,
+            option if option.starts_with('-') => {
+                return Err(Error::Usage(format!(
+                    "unknown `packages add` option '{option}' — the only one is --yes"
+                )))
+            }
+            path if folder.is_none() => folder = Some(path.to_string()),
+            extra => {
+                return Err(Error::Usage(format!(
+                    "`packages add` installs one folder at a time (got a second: '{extra}')"
+                )))
+            }
+        }
+    }
+    match folder {
+        Some(folder) => Ok(Command::PackagesAdd { folder, yes }),
+        None => Err(Error::Usage(
+            "`packages add` needs the folder to install, e.g. `packages add ~/src/my-package`"
+                .to_string(),
+        )),
+    }
 }
 
 /// `dev up [--single] [--lan <IP>]`, in either order.
@@ -1049,6 +1113,68 @@ mod tests {
         assert!(USAGE_ALL.contains("character gm"), "{USAGE_ALL}");
     }
 
+    // ---- packages ----
+
+    #[test]
+    fn packages_add_takes_one_folder_and_the_confirmation_flag_in_either_order() {
+        assert_eq!(
+            parse("packages add /src/greeter").unwrap(),
+            Command::PackagesAdd {
+                folder: "/src/greeter".to_string(),
+                yes: false,
+            }
+        );
+        for line in [
+            "packages add /src/greeter --yes",
+            "packages add --yes /src/greeter",
+        ] {
+            assert_eq!(
+                parse(line).unwrap(),
+                Command::PackagesAdd {
+                    folder: "/src/greeter".to_string(),
+                    yes: true,
+                },
+                "`{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn packages_add_refuses_no_folder_two_folders_and_invented_options() {
+        for line in [
+            "packages add",
+            "packages add --yes",
+            "packages add /src/one /src/two",
+            "packages add /src/greeter --force",
+        ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+        }
+    }
+
+    #[test]
+    fn packages_list_takes_no_arguments() {
+        assert_eq!(parse("packages list").unwrap(), Command::PackagesList);
+        assert!(parse("packages list --all").is_err());
+    }
+
+    #[test]
+    fn packages_without_a_recognised_verb_names_the_two_that_exist() {
+        for line in ["packages", "packages remove greeter", "packages update"] {
+            let error = parse(line).unwrap_err().to_string();
+            assert!(
+                error.contains("add") && error.contains("list"),
+                "{line}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_text_documents_packages() {
+        assert!(USAGE_ALL.contains("lyracore packages add"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("lyracore packages list"), "{USAGE_ALL}");
+    }
+
     // ---- update ----
 
     #[test]
@@ -1128,6 +1254,8 @@ mod tests {
             "lyracore import",
             "lyracore config",
             "lyracore client sync",
+            "lyracore packages add",
+            "lyracore packages list",
             "lyracore character gm",
             "lyracore update",
             "--password-stdin",

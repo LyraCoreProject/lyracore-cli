@@ -74,22 +74,46 @@ pub trait Prompt {
     fn ask(&self, question: &str) -> Result<String>;
 }
 
-/// The real one: prompts on the controlling terminal, not on stdin.
+/// The real prompt: reads the controlling terminal, not stdin, with a remedy tailored to the
+/// command that requested the answer.
 ///
 /// `/dev/tty` rather than stdin deliberately — `lyracore import < /dev/null` or a run inside a
 /// pipeline must not be able to "answer" the consent question with an EOF that some readers
-/// report as an empty line. No terminal means no consent, and the error says to use `--accept`.
-pub struct TtyPrompt;
+/// report as an empty line.
+pub struct TtyPrompt {
+    no_terminal_remedy: &'static str,
+}
+
+impl TtyPrompt {
+    pub const fn import_world() -> Self {
+        Self {
+            no_terminal_remedy: "pass --accept (and --client-data PATH) to answer in advance",
+        }
+    }
+
+    pub const fn import_vmaps() -> Self {
+        Self {
+            no_terminal_remedy: "pass --client-data PATH to provide the answer in advance",
+        }
+    }
+
+    pub const fn packages_add() -> Self {
+        Self {
+            no_terminal_remedy: "pass --yes to confirm the Package install in advance",
+        }
+    }
+
+    fn unavailable(&self) -> Error {
+        Error::Usage(format!(
+            "no terminal to ask on. Re-run attached to a terminal, or {}.",
+            self.no_terminal_remedy
+        ))
+    }
+}
 
 impl Prompt for TtyPrompt {
     fn ask(&self, question: &str) -> Result<String> {
-        let tty = std::fs::File::open("/dev/tty").map_err(|_| {
-            Error::Usage(
-                "no terminal to ask on. Re-run attached to a terminal, or pass --accept (and \
-                 --client-data PATH) to answer in advance."
-                    .to_string(),
-            )
-        })?;
+        let tty = std::fs::File::open("/dev/tty").map_err(|_| self.unavailable())?;
         eprint!("{question}");
         std::io::stderr().flush()?;
         let mut answer = String::new();
@@ -2085,6 +2109,19 @@ mod tests {
     }
 
     // ---- consent ----
+
+    #[test]
+    fn tty_prompt_remedies_name_only_flags_the_calling_command_accepts() {
+        let world = TtyPrompt::import_world().unavailable().to_string();
+        assert!(world.contains("--accept"), "{world}");
+        let vmaps = TtyPrompt::import_vmaps().unavailable().to_string();
+        assert!(vmaps.contains("--client-data"), "{vmaps}");
+        assert!(!vmaps.contains("--accept"), "{vmaps}");
+        let packages = TtyPrompt::packages_add().unavailable().to_string();
+        assert!(packages.contains("--yes"), "{packages}");
+        assert!(!packages.contains("--accept"), "{packages}");
+        assert!(!packages.contains("--client-data"), "{packages}");
+    }
 
     #[test]
     fn without_yes_or_accept_nothing_runs() {
