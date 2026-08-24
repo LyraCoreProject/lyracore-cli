@@ -102,6 +102,11 @@ USAGE:
                                                reducers, hooks, addons and client overrides it
                                                registers, asks before copying, then runs preflight.
                                                It never publishes — it prints the steps left
+  lyracore packages build                      regenerate the Module schema typings into
+                                               datascripts/generated/, install the pinned Bun
+                                               dependencies from datascripts/bun.lock, then
+                                               typecheck every Datascript against them. Author-side
+                                               only: applying a prebuilt Package needs no Bun
   lyracore packages list                       every installed Package: enabled or disabled, its
                                                Package Source, its recorded content identity,
                                                whether the installed copy has drifted from it,
@@ -169,6 +174,7 @@ pub enum Command {
     PackagesNew {
         name: String,
     },
+    PackagesBuild,
     ProductionStatus(production::StatusOptions),
     Update,
     Help,
@@ -311,8 +317,12 @@ impl Command {
             ["packages", "new", _name, other, ..] => Err(Error::Usage(format!(
                 "`packages new` takes one name (got a second argument: '{other}')"
             ))),
+            ["packages", "build"] => Ok(Command::PackagesBuild),
+            ["packages", "build", other, ..] => Err(Error::Usage(format!(
+                "`packages build` takes no arguments (got '{other}')"
+            ))),
             ["packages", ..] => Err(Error::Usage(
-                "`packages` supports: add FOLDER [--yes], list, new NAME".to_string(),
+                "`packages` supports: add FOLDER [--yes], build, list, new NAME".to_string(),
             )),
 
             ["production", "status", rest @ ..] => parse_production_status(rest),
@@ -1195,11 +1205,22 @@ mod tests {
     }
 
     #[test]
-    fn packages_without_a_recognised_verb_names_the_three_that_exist() {
+    fn packages_build_takes_no_arguments() {
+        assert_eq!(parse("packages build").unwrap(), Command::PackagesBuild);
+        for line in ["packages build --watch", "packages build my-package"] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn packages_without_a_recognised_verb_names_the_four_that_exist() {
         for line in ["packages", "packages remove greeter", "packages update"] {
             let error = parse(line).unwrap_err().to_string();
             assert!(
-                error.contains("add") && error.contains("list") && error.contains("new"),
+                error.contains("add")
+                    && error.contains("build")
+                    && error.contains("list")
+                    && error.contains("new"),
                 "{line}: {error}"
             );
         }
@@ -1208,6 +1229,7 @@ mod tests {
     #[test]
     fn the_help_text_documents_packages() {
         assert!(USAGE_ALL.contains("lyracore packages add"), "{USAGE_ALL}");
+        assert!(USAGE_ALL.contains("lyracore packages build"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("lyracore packages list"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("lyracore packages new"), "{USAGE_ALL}");
     }
@@ -1292,6 +1314,7 @@ mod tests {
             "lyracore config",
             "lyracore client sync",
             "lyracore packages add",
+            "lyracore packages build",
             "lyracore packages list",
             "lyracore packages new",
             "lyracore character gm",

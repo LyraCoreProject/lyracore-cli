@@ -16,6 +16,12 @@ use std::process::{Command, Stdio};
 /// Keep this in step with that pin (LyraCore's `module/Cargo.toml` + `gateway/Cargo.toml`).
 pub const REQUIRED_SPACETIME: Version = Version(2, 7, 1);
 
+/// The Bun version the Datascript toolchain is pinned to, asked as a **floor** (`>=`) exactly like
+/// [`REQUIRED_SPACETIME`]. The authoritative pin is the checkout's own `datascripts/package.json`
+/// (`engines.bun`) together with `datascripts/bun.lock`; this constant is the copy `doctor` can
+/// answer with before it knows whether a checkout is in scope. Keep the two in step.
+pub const REQUIRED_BUN: Version = Version(1, 3, 7);
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Check {
     Pass { label: String, detail: String },
@@ -99,6 +105,7 @@ pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
             "Cargo ships with Rust — see https://rustup.rs/",
         ),
         check_spacetime(),
+        check_bun(),
         check_wasm_target(),
         check_wasm_opt(),
         check_ports(),
@@ -196,6 +203,44 @@ fn check_spacetime() -> Check {
         None => Check::warn(
             "SpacetimeDB",
             format!("could not read a version from `spacetime --version`; expected {REQUIRED_SPACETIME}"),
+        ),
+    }
+}
+
+/// Is Bun present, and new enough to read the checkout's `datascripts/bun.lock`?
+///
+/// Never launch-blocking, and that is the design rather than an omission. Bun is AUTHOR-side only:
+/// `lyracore packages build` runs Datascript typegen and the `tsc --noEmit` gate through it. An
+/// Operator applying a prebuilt Package Delta, and anyone running `dev up`, need no JavaScript
+/// toolchain at all — so a machine without Bun is a machine that cannot author Datascripts, not a
+/// broken one.
+fn check_bun() -> Check {
+    let Some(text) = version_output("bun", &["--version"]) else {
+        return Check::warn(
+            "Bun",
+            format!(
+                "`bun` not found — needed only by `lyracore packages build` (Datascript typegen \
+                 and typecheck); install {REQUIRED_BUN} or newer with \
+                 `curl -fsSL https://bun.sh/install | bash`"
+            ),
+        );
+    };
+    match parse_version(&text) {
+        Some(found) if found >= REQUIRED_BUN => {
+            Check::pass("Bun", format!("{found} (requires {REQUIRED_BUN})"))
+        }
+        Some(found) => Check::warn(
+            "Bun",
+            format!(
+                "found {found}, but {REQUIRED_BUN} is required — upgrade with `bun upgrade`. \
+                 `lyracore packages build` will not read datascripts/bun.lock until you do"
+            ),
+        ),
+        None => Check::warn(
+            "Bun",
+            format!(
+                "could not read a version from `bun --version`; expected {REQUIRED_BUN} or newer"
+            ),
         ),
     }
 }
@@ -426,6 +471,31 @@ mod tests {
         // Exercises the real function (whichever branch this CI host takes): present or absent,
         // a missing wasm-opt must never fail `doctor`.
         assert!(!check_wasm_opt().is_blocking());
+    }
+
+    // ---- the Bun check ----
+
+    #[test]
+    fn the_required_bun_version_is_enforced_as_a_floor() {
+        assert!(Version(1, 3, 7) >= REQUIRED_BUN);
+        assert!(Version(1, 4, 0) >= REQUIRED_BUN);
+        assert!(Version(2, 0, 0) >= REQUIRED_BUN);
+        assert!(Version(1, 3, 6) < REQUIRED_BUN);
+        assert!(Version(1, 2, 9) < REQUIRED_BUN);
+        assert!(Version(0, 9, 9) < REQUIRED_BUN);
+    }
+
+    #[test]
+    fn bun_reports_its_bare_version_banner() {
+        // `bun --version` prints just `1.3.7`, with no tool name around it.
+        assert_eq!(parse_version("1.3.7\n"), Some(Version(1, 3, 7)));
+    }
+
+    #[test]
+    fn a_missing_or_old_bun_is_a_warning_never_a_launch_blocker() {
+        // Bun is author-side only. An Operator applying a prebuilt Package Delta needs none, so
+        // `doctor` must not exit nonzero over it on their machine.
+        assert!(!check_bun().is_blocking(), "Bun may never block a launch");
     }
 
     // ---- the client-data check ----

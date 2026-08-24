@@ -21,6 +21,7 @@
 //! is re-enabled is a collision the operator would meet much later, holding two folders and no way
 //! to tell which one the build compiled.
 
+pub mod build;
 pub mod review;
 pub mod stamp;
 pub(crate) mod tree;
