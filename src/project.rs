@@ -341,6 +341,16 @@ impl ProjectLayout {
     /// in the core repo; this CLI only orders its modes.
     pub const IMPORTER_BIN: &'static str = "target/debug/lyracore-importer";
 
+    /// The ENABLED Package inventory: the drop-in folders `module/build.rs` discovers and compiles
+    /// into the module wasm, and the `client/` halves `importer --pack-client` packs. A Package is
+    /// enabled by being here and by nothing else — there is no manifest, so this directory listing
+    /// IS the enabled set.
+    pub const PACKAGES_DIR: &'static str = "packages";
+    /// The DISABLED Package inventory, under the git-ignored state directory: a Package kept but
+    /// held out of the build. Nothing reads it, which is the point — the build cannot see a
+    /// directory it does not scan.
+    pub const PACKAGES_DISABLED_DIR: &'static str = "packages-disabled";
+
     /// The pinned wire-harness release this checkout consumes (#246).
     pub const WIRE_HARNESS_PIN: &'static str = ".wire-harness-rev";
     /// Paths INSIDE a harness checkout. `dev smoke` drives the generic login smoke through the
@@ -459,6 +469,14 @@ impl ProjectLayout {
         self.module_dir().join("src")
     }
 
+    pub fn packages_dir(&self) -> PathBuf {
+        self.root.join(Self::PACKAGES_DIR)
+    }
+
+    pub fn packages_disabled_dir(&self) -> PathBuf {
+        self.state_dir.join(Self::PACKAGES_DISABLED_DIR)
+    }
+
     pub fn rust_toolchain_file(&self) -> PathBuf {
         self.root.join(Self::RUST_TOOLCHAIN)
     }
@@ -542,6 +560,25 @@ mod tests {
             layout.config_file(),
             tmp.path().join(".lyracore/config.json")
         );
+    }
+
+    #[test]
+    fn only_the_enabled_package_inventory_is_somewhere_the_build_can_see() {
+        // `module/build.rs` scans `<root>/packages/`. A disabled Package must therefore live
+        // somewhere it does NOT scan, and the git-ignored state directory is the one place in a
+        // checkout that qualifies — a disabled Package that still showed up in `git status` would
+        // be a local decision the repository carried.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let layout = ProjectLayout::from_root(tmp.path()).unwrap();
+        assert_eq!(layout.packages_dir(), tmp.path().join("packages"));
+        assert_eq!(
+            layout.packages_disabled_dir(),
+            tmp.path().join(".lyracore/packages-disabled")
+        );
+        assert!(!layout
+            .packages_disabled_dir()
+            .starts_with(layout.packages_dir()));
     }
 
     // ---- the `--lan` bind contract ----
