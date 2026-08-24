@@ -351,6 +351,17 @@ impl ProjectLayout {
     /// directory it does not scan.
     pub const PACKAGES_DISABLED_DIR: &'static str = "packages-disabled";
 
+    /// The Datascript toolchain's home: a committed Bun project holding the pinned `package.json`,
+    /// `bun.lock` and `tsconfig.json`, plus the Datascripts written against the Module schema. It
+    /// is AUTHOR-side only — nothing an Operator runs to apply a prebuilt Package touches it.
+    pub const DATASCRIPTS_DIR: &'static str = "datascripts";
+    /// Where `packages build` writes the TypeScript typings extracted from the Module wasm.
+    ///
+    /// `spacetime generate` owns this directory and removes stale files carrying its generated
+    /// header, so nothing hand-authored may live here. Datascripts import from it; they sit in
+    /// `datascripts/src/`.
+    pub const DATASCRIPT_TYPES_DIR: &'static str = "generated";
+
     /// The pinned wire-harness release this checkout consumes (#246).
     pub const WIRE_HARNESS_PIN: &'static str = ".wire-harness-rev";
     /// Paths INSIDE a harness checkout. `dev smoke` drives the generic login smoke through the
@@ -475,6 +486,14 @@ impl ProjectLayout {
 
     pub fn packages_disabled_dir(&self) -> PathBuf {
         self.state_dir.join(Self::PACKAGES_DISABLED_DIR)
+    }
+
+    pub fn datascripts_dir(&self) -> PathBuf {
+        self.root.join(Self::DATASCRIPTS_DIR)
+    }
+
+    pub fn datascript_types_dir(&self) -> PathBuf {
+        self.datascripts_dir().join(Self::DATASCRIPT_TYPES_DIR)
     }
 
     pub fn rust_toolchain_file(&self) -> PathBuf {

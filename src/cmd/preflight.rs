@@ -243,10 +243,22 @@ pub fn deploy_check_command(project: &ProjectLayout) -> CommandSpec {
 /// through it — the same code path that rejects a bad `#[default]` literal, reproducing publish's
 /// error verbatim. It needs no node and touches no database.
 pub fn schema_command(project: &ProjectLayout, out_dir: &Path) -> CommandSpec {
+    schema_command_for_language(project, out_dir, "rust")
+}
+
+/// Build the one schema-extraction command shared by preflight and Package Datascript builds.
+///
+/// The language and destination differ, but the module path, deploy feature set and
+/// non-interactive overwrite policy must stay identical: both commands describe the same wasm.
+pub(crate) fn schema_command_for_language(
+    project: &ProjectLayout,
+    out_dir: &Path,
+    language: &str,
+) -> CommandSpec {
     CommandSpec::new("spacetime")
         .arg("generate")
         .arg("--lang")
-        .arg("rust")
+        .arg(language)
         .arg("--module-path")
         .arg(project.module_dir().to_string_lossy().to_string())
         .arg("--out-dir")
@@ -255,7 +267,11 @@ pub fn schema_command(project: &ProjectLayout, out_dir: &Path) -> CommandSpec {
             "--build-options={}",
             ProjectLayout::DEPLOY_FEATURES
         ))
+        // The invocation is fully specified. Ignore any spacetime.json found by walking upward
+        // from the contributor's caller directory; its generate entries could change the output.
+        .arg("--no-config")
         .arg("-y")
+        .cwd(&project.root)
 }
 
 /// The verdict lines out of a chatty extractor log, falling back to the whole thing.
