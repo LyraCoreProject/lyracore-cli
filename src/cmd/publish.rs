@@ -26,6 +26,7 @@
 use crate::cmd::preflight;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::ProjectLayout;
+use crate::state::RuntimeState;
 use crate::{Error, Result};
 
 /// Flags that would destroy data. They are refused by the general flag guard below; naming them
@@ -68,15 +69,32 @@ pub fn validate_database(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Which databases a bare argument list means. No arguments is the single seeded fixture database.
+/// Validate the database names given on the command line. Empty means "none named" — `run` then
+/// resolves that against the persisted topology once it has a [`ProjectLayout`] to read; parsing
+/// happens before the project is discovered, so it cannot make that call itself.
 pub fn databases(args: &[String]) -> Result<Vec<String>> {
-    if args.is_empty() {
-        return Ok(vec![ProjectLayout::DATABASE.to_string()]);
-    }
     for name in args {
         validate_database(name)?;
     }
     Ok(args.to_vec())
+}
+
+/// What a bare `lyracore publish` means: every database in the topology `dev up` and `dev status`
+/// already treat as the truth, in the same order — a schema change must reach all of them, not just
+/// the one the fixture happened to seed first.
+///
+/// No recorded state (a fresh clone, or one that has never run `dev up`) reads back as the default
+/// topology, same as `RuntimeState::topology` everywhere else: `Topology::Sharded`, not the single
+/// legacy fixture. A contributor who has not brought the stack up yet still gets a publish that
+/// matches what their first `dev up` will build.
+fn recorded_databases(project: &ProjectLayout) -> Result<Vec<String>> {
+    let state = RuntimeState::load(&project.state_file())?;
+    Ok(state
+        .topology()
+        .databases()
+        .into_iter()
+        .map(str::to_string)
+        .collect())
 }
 
 /// The ONE correct publish invocation.
@@ -107,6 +125,12 @@ pub fn run(
     databases: &[String],
     skip_preflight: bool,
 ) -> Result<()> {
+    let databases = if databases.is_empty() {
+        recorded_databases(project)?
+    } else {
+        databases.to_vec()
+    };
+
     if skip_preflight {
         println!(
             "· skipping preflight (--skip-preflight): nothing has validated this module's schema, \
@@ -116,7 +140,7 @@ pub fn run(
         preflight::run(project, runner)?;
     }
 
-    for database in databases {
+    for database in &databases {
         println!();
         println!("==> publishing to {database}");
         runner.run_streaming(&publish_command(project, database)?)?;
@@ -209,8 +233,11 @@ mod tests {
     }
 
     #[test]
-    fn no_arguments_means_the_single_seeded_fixture_database() {
-        assert_eq!(databases(&[]).unwrap(), vec![ProjectLayout::DATABASE]);
+    fn no_arguments_validate_to_an_empty_list_rather_than_a_guessed_default() {
+        // `databases` runs at parse time, before a `ProjectLayout` exists to read the recorded
+        // topology from — so it can only reflect what was actually typed. `run` (below) is what
+        // turns an empty list into the recorded topology's databases.
+        assert_eq!(databases(&[]).unwrap(), Vec::<String>::new());
     }
 
     // ---- what the rendered command must always contain ----
@@ -279,6 +306,104 @@ mod tests {
         )
         .unwrap();
         ProjectLayout::from_root(root).unwrap()
+    }
+
+    // ---- bare `publish` resolves against the recorded topology, not a hardcoded default ----
+
+    fn record_topology(project: &ProjectLayout, topology: &str) {
+        let state = crate::state::RuntimeState {
+            topology: topology.to_string(),
+            ..Default::default()
+        };
+        state.save(&project.state_file()).unwrap();
+    }
+
+    #[test]
+    fn bare_publish_targets_every_database_of_an_active_sharded_fixture() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        record_topology(&project, "sharded");
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner(), &[], true).unwrap();
+
+        let published: Vec<String> = stack
+            .rendered()
+            .into_iter()
+            .filter(|r| r.starts_with("spacetime publish"))
+            .collect();
+        assert_eq!(
+            published.len(),
+            crate::project::Topology::Sharded.databases().len(),
+            "{published:?}"
+        );
+        for database in crate::project::Topology::Sharded.databases() {
+            assert!(
+                published.iter().any(|r| r.ends_with(database)),
+                "{database} missing from {published:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_publish_targets_the_one_database_of_an_active_single_fixture() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        record_topology(&project, "single");
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner(), &[], true).unwrap();
+
+        let published: Vec<String> = stack
+            .rendered()
+            .into_iter()
+            .filter(|r| r.starts_with("spacetime publish"))
+            .collect();
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert!(
+            published[0].ends_with(ProjectLayout::DATABASE),
+            "{published:?}"
+        );
+    }
+
+    #[test]
+    fn bare_publish_with_no_recorded_state_uses_the_default_sharded_topology() {
+        // A fresh clone that has never run `dev up` has no `state.json` at all. It must publish
+        // what its first `dev up` will build, not the single legacy fixture.
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner(), &[], true).unwrap();
+
+        let published: Vec<String> = stack
+            .rendered()
+            .into_iter()
+            .filter(|r| r.starts_with("spacetime publish"))
+            .collect();
+        assert_eq!(
+            published.len(),
+            crate::project::Topology::Sharded.databases().len(),
+            "{published:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_names_are_never_overridden_by_the_recorded_topology() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        record_topology(&project, "sharded");
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner(), &names(&["realm-core"]), true).unwrap();
+
+        let published: Vec<String> = stack
+            .rendered()
+            .into_iter()
+            .filter(|r| r.starts_with("spacetime publish"))
+            .collect();
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert!(published[0].ends_with("realm-core"), "{published:?}");
     }
 
     #[test]
