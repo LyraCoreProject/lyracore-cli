@@ -25,7 +25,7 @@
 
 use crate::cmd::preflight;
 use crate::proc::{CommandSpec, ProcessRunner};
-use crate::project::ProjectLayout;
+use crate::project::{Component, ProjectLayout, Topology};
 use crate::state::RuntimeState;
 use crate::{Error, Result};
 
@@ -83,18 +83,33 @@ pub fn databases(args: &[String]) -> Result<Vec<String>> {
 /// already treat as the truth, in the same order — a schema change must reach all of them, not just
 /// the one the fixture happened to seed first.
 ///
-/// No recorded state (a fresh clone, or one that has never run `dev up`) reads back as the default
-/// topology, same as `RuntimeState::topology` everywhere else: `Topology::Sharded`, not the single
-/// legacy fixture. A contributor who has not brought the stack up yet still gets a publish that
-/// matches what their first `dev up` will build.
+/// No active recorded fixture (a fresh clone, one that has never run `dev up`, or one after
+/// `dev down`) uses `Topology::Sharded`, not the last topology left in diagnostic state. A
+/// contributor who has not brought the stack up still gets a publish that matches what their next
+/// `dev up` will build.
 fn recorded_databases(project: &ProjectLayout) -> Result<Vec<String>> {
     let state = RuntimeState::load(&project.state_file())?;
-    Ok(state
-        .topology()
+    // `dev down` deliberately keeps diagnostic state such as the last topology, but without a
+    // recorded gateway there is no active fixture for that topology to describe. In that case the
+    // safe publish target is what a fresh `dev up` would provision: the default sharded topology.
+    let topology = if state.record(Component::Gateway).is_some() {
+        state.topology()
+    } else {
+        Topology::Sharded
+    };
+    Ok(topology
         .databases()
         .into_iter()
         .map(str::to_string)
         .collect())
+}
+
+fn database_list(databases: &[String]) -> String {
+    if databases.is_empty() {
+        "(none)".to_string()
+    } else {
+        databases.join(" ")
+    }
 }
 
 /// The ONE correct publish invocation.
@@ -140,10 +155,16 @@ pub fn run(
         preflight::run(project, runner)?;
     }
 
-    for database in &databases {
+    for (index, database) in databases.iter().enumerate() {
         println!();
         println!("==> publishing to {database}");
-        runner.run_streaming(&publish_command(project, database)?)?;
+        if let Err(error) = runner.run_streaming(&publish_command(project, database)?) {
+            return Err(Error::Process(format!(
+                "{error}\n  publish stopped at: {database}\n  completed: {}\n  not attempted: {}",
+                database_list(&databases[..index]),
+                database_list(&databases[index + 1..])
+            )));
+        }
     }
 
     println!();
@@ -310,9 +331,13 @@ mod tests {
 
     // ---- bare `publish` resolves against the recorded topology, not a hardcoded default ----
 
-    fn record_topology(project: &ProjectLayout, topology: &str) {
+    fn record_active_topology(project: &ProjectLayout, topology: Topology) {
         let state = crate::state::RuntimeState {
-            topology: topology.to_string(),
+            gateway: Some(crate::state::ProcessRecord {
+                pid: 42,
+                identity: "recorded fixture gateway".to_string(),
+            }),
+            topology: topology.as_str().to_string(),
             ..Default::default()
         };
         state.save(&project.state_file()).unwrap();
@@ -322,7 +347,7 @@ mod tests {
     fn bare_publish_targets_every_database_of_an_active_sharded_fixture() {
         let tmp = TempDir::new().unwrap();
         let project = healthy(&tmp);
-        record_topology(&project, "sharded");
+        record_active_topology(&project, Topology::Sharded);
         let stack = FakeStack::new();
 
         run(&project, &stack.runner(), &[], true).unwrap();
@@ -349,7 +374,7 @@ mod tests {
     fn bare_publish_targets_the_one_database_of_an_active_single_fixture() {
         let tmp = TempDir::new().unwrap();
         let project = healthy(&tmp);
-        record_topology(&project, "single");
+        record_active_topology(&project, Topology::Single);
         let stack = FakeStack::new();
 
         run(&project, &stack.runner(), &[], true).unwrap();
@@ -389,10 +414,33 @@ mod tests {
     }
 
     #[test]
+    fn bare_publish_ignores_the_stale_topology_of_a_stopped_fixture() {
+        // `dev down` clears the gateway record but retains the last topology for diagnostics. That
+        // stale value must not turn "no active fixture" back into the unsafe one-database default.
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        let state = crate::state::RuntimeState {
+            topology: Topology::Single.as_str().to_string(),
+            ..Default::default()
+        };
+        state.save(&project.state_file()).unwrap();
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner(), &[], true).unwrap();
+
+        let published: Vec<String> = stack
+            .rendered()
+            .into_iter()
+            .filter(|r| r.starts_with("spacetime publish"))
+            .collect();
+        assert_eq!(published.len(), Topology::Sharded.databases().len());
+    }
+
+    #[test]
     fn explicit_names_are_never_overridden_by_the_recorded_topology() {
         let tmp = TempDir::new().unwrap();
         let project = healthy(&tmp);
-        record_topology(&project, "sharded");
+        record_active_topology(&project, Topology::Sharded);
         let stack = FakeStack::new();
 
         run(&project, &stack.runner(), &names(&["realm-core"]), true).unwrap();
@@ -437,6 +485,13 @@ mod tests {
 
         let error = run(&healthy(&tmp), &stack.runner(), &wanted, true).unwrap_err();
         assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE);
+        let message = error.to_string();
+        assert!(
+            message.contains("publish stopped at: lyracore-world-1"),
+            "{message}"
+        );
+        assert!(message.contains("completed: lyracore\n"), "{message}");
+        assert!(message.contains("not attempted: realm-core"), "{message}");
         assert!(
             !stack.rendered().iter().any(|r| r.ends_with("realm-core")),
             "the run must stop at the failure: {:?}",

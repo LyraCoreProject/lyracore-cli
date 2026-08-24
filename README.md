@@ -73,13 +73,15 @@ no publish, reducer, SQL write, signal, or restart is available through it.
 ## `publish` — the one correct deploy
 
 ```bash
-lyracore publish                                   # the fixture database
+lyracore publish                                   # every database in the active fixture topology
 lyracore publish lyracore lyracore-world-1 realm-core
 ```
 
 Runs `preflight`, then `spacetime publish -s local -p <checkout>/module
 --build-options=--features=debug_reducers --yes <DATABASE>` for each database in turn, stopping at
-the first failure. It takes database **NAMES**:
+the first failure. With no names, it publishes the active fixture's recorded topology; with no
+active fixture, it uses the default sharded topology that the next `dev up` would provision.
+Explicit database **NAMES** are published exactly as given:
 
 * `--features=debug_reducers` is baked in — a plain build omits the debug module, so publish reports
   a FALSE "Removed table" breaking change and aborts;
