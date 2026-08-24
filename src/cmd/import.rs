@@ -762,7 +762,9 @@ fn pull_command(project: &ProjectLayout) -> CommandSpec {
     from_root(project, project.pull_classic_db_script())
 }
 
-fn build_importer_command(project: &ProjectLayout) -> CommandSpec {
+/// Shared with `cmd/client.rs`: `client sync` builds the same pinned importer binary before
+/// driving its `--pack-client` mode.
+pub(crate) fn build_importer_command(project: &ProjectLayout) -> CommandSpec {
     CommandSpec::new("cargo")
         .arg("build")
         .arg("-q")
