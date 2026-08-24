@@ -92,11 +92,16 @@ impl ProvenanceStamp {
     }
 
     pub fn render(&self) -> String {
+        let written_by = if self.source_kind == SOURCE_SCAFFOLD {
+            "lyracore packages new"
+        } else {
+            "lyracore packages add"
+        };
         format!(
-            "# Written by `lyracore packages add`. It records where this Package came from and\n\
-             # what its content was at install time; `lyracore packages list` compares the tree\n\
-             # against `content_identity` to report local drift. This file is excluded from that\n\
-             # hash. Editing it changes only the report, never the Package.\n\
+            "# Written by `{written_by}`. It records where this Package came from and what its\n\
+             # content was at install time; `lyracore packages list` compares the tree against\n\
+             # `content_identity` to report local drift. This file is excluded from that hash.\n\
+             # Editing it changes only the report, never the Package.\n\
              source_kind = {}\n\
              source = {}\n\
              content_identity = {}\n\
@@ -286,6 +291,19 @@ mod tests {
         assert_eq!(stamp.source_kind, SOURCE_SCAFFOLD);
         assert_ne!(stamp.source_kind, SOURCE_LOCAL);
         assert_eq!(stamp.source, "packages/example/ (the reference Package)");
+    }
+
+    #[test]
+    fn the_rendered_stamp_names_the_command_that_actually_wrote_it() {
+        // A scaffold was never installed by `packages add` — the file's own header must say so,
+        // not just its `source_kind` key, since the header is what a human reads first.
+        let scaffolded = ProvenanceStamp::scaffolded("packages/example/", String::new(), 0);
+        assert!(scaffolded.render().contains("lyracore packages new"));
+        assert!(!scaffolded.render().contains("lyracore packages add"));
+
+        let installed = ProvenanceStamp::local(Path::new("/src/greeter"), String::new(), 0);
+        assert!(installed.render().contains("lyracore packages add"));
+        assert!(!installed.render().contains("lyracore packages new"));
     }
 
     #[test]
