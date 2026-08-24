@@ -92,13 +92,13 @@ impl ProvenanceStamp {
     }
 
     pub fn render(&self) -> String {
-        let written_by = if self.source_kind == SOURCE_SCAFFOLD {
-            "lyracore packages new"
-        } else {
-            "lyracore packages add"
+        let written_by = match self.source_kind.as_str() {
+            SOURCE_LOCAL => "`lyracore packages add`",
+            SOURCE_SCAFFOLD => "`lyracore packages new`",
+            _ => "LyraCore Package tooling (unrecognised source kind)",
         };
         format!(
-            "# Written by `{written_by}`. It records where this Package came from and what its\n\
+            "# Written by {written_by}. It records where this Package came from and what its\n\
              # content was at install time; `lyracore packages list` compares the tree against\n\
              # `content_identity` to report local drift. This file is excluded from that hash.\n\
              # Editing it changes only the report, never the Package.\n\
@@ -281,7 +281,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let stamp = ProvenanceStamp::scaffolded(
             "packages/example/ (the reference Package)",
-            "fnv1a64:0123456789abcdef".to_string(),
+            "fnv1a64-tree-v1:0123456789abcdef".to_string(),
             1_756_000_000,
         );
 
@@ -304,6 +304,14 @@ mod tests {
         let installed = ProvenanceStamp::local(Path::new("/src/greeter"), String::new(), 0);
         assert!(installed.render().contains("lyracore packages add"));
         assert!(!installed.render().contains("lyracore packages new"));
+
+        let unknown = ProvenanceStamp {
+            source_kind: "future".to_string(),
+            ..Default::default()
+        };
+        assert!(unknown.render().contains("unrecognised source kind"));
+        assert!(!unknown.render().contains("lyracore packages add"));
+        assert!(!unknown.render().contains("lyracore packages new"));
     }
 
     #[test]

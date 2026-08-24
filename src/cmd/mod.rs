@@ -106,12 +106,12 @@ USAGE:
                                                Package Source, its recorded content identity,
                                                whether the installed copy has drifted from it,
                                                and what it registers
-  lyracore packages new NAME                   scaffold a new Package offline, by copying and
-                                               renaming the maintained reference Package that ships
-                                               in this checkout (packages/example/). Refuses an
-                                               enabled or disabled name collision, then runs
-                                               preflight — no network access, no client content
-                                               (the printed next steps explain how to add it)
+  lyracore packages new NAME                   scaffold from the maintained reference Package in
+                                               this checkout (packages/example/), without fetching
+                                               a template. Refuses enabled/disabled collisions,
+                                               then runs ordinary preflight (whose Cargo checks may
+                                               use its configured cache/network). No client content;
+                                               the printed next steps explain how to add it
   lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
                                                read-only production topology, schema, connection,
                                                realm-core and listener verdicts

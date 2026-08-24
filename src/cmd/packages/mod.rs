@@ -288,6 +288,7 @@ pub fn add(
     ProvenanceStamp::local(&source, identity.clone(), stamp::now_unix()).write(staged.path())?;
     // Recheck after the prompt and potentially long copy. A concurrent install must not be merged
     // with or overwritten by this one.
+    let _claim = PackageClaim::acquire(project, &name)?;
     check_collision(project, &name)?;
     staged.install(&destination)?;
     println!();
@@ -348,6 +349,40 @@ fn confirm(prompt: &dyn Prompt, name: &PackageName, destination: &Path, yes: boo
 struct StagedPackage {
     path: PathBuf,
     installed: bool,
+}
+
+/// An interprocess lock for one generated Rust module identifier.
+///
+/// The final no-replace rename protects one folder spelling. This lock protects the wider build
+/// collision: `foo-bar` and `foo_bar` have different destinations but both generate
+/// `pkg_foo_bar`. Holding it across the last inventory check and rename makes that decision one
+/// atomic critical section across `packages add` and `packages new` processes.
+#[derive(Debug)]
+struct PackageClaim {
+    _file: std::fs::File,
+}
+
+impl PackageClaim {
+    fn acquire(project: &ProjectLayout, name: &PackageName) -> Result<Self> {
+        let root = project.state_dir.join("package-locks");
+        std::fs::create_dir_all(&root)?;
+        let path = root.join(format!("{}.lock", name.rust_ident()));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |error| {
+                Error::Process(format!(
+                "another Package install is currently claiming module `pkg_{}` ({error}). Wait \
+                 for it to finish, then retry; nothing was installed by this process.",
+                name.rust_ident()
+            ))
+            },
+        )?;
+        Ok(Self { _file: file })
+    }
 }
 
 impl StagedPackage {
@@ -436,10 +471,10 @@ fn shell_quote(path: &Path) -> String {
 // =============================================================================================
 
 /// Scaffold a new Package by copying and renaming the reference Package (`packages/example/`,
-/// checked into this checkout). Offline: nothing is fetched or reviewed, because nothing came from
-/// outside the checkout — unlike `add`, there is no Package Source and no trust review to show. The
-/// same order as `add` otherwise: every refusal happens before anything is copied, and preflight
-/// runs after so a scaffold that fails to build is caught here rather than at the next `publish`.
+/// checked into this checkout). Fetching the template needs no network; the ordinary preflight at
+/// the end still uses Cargo's configured cache/network like `lyracore preflight` itself. Nothing
+/// came from outside the checkout, so unlike `add` there is no Package Source or trust review to
+/// show.
 pub fn new(project: &ProjectLayout, runner: &dyn ProcessRunner, name: &str) -> Result<()> {
     let name = PackageName::parse(name)?;
     check_collision(project, &name)?;
@@ -455,22 +490,26 @@ pub fn new(project: &ProjectLayout, runner: &dyn ProcessRunner, name: &str) -> R
             name.as_str()
         )));
     }
+    // Validate the complete maintained tree with the same no-links/no-special-files policy as a
+    // local install, before an enabled destination exists.
+    stamp::content_identity(&reference)?;
     validate_shape(&reference)?;
 
     let destination = project.packages_dir().join(name.as_str());
-    copy_tree(&reference, &destination)?;
-    // The reference Package ships no stamp of its own, but never carry one forward if it ever did:
-    // a scaffold's stamp must describe the scaffold, not whatever the reference last recorded.
-    let _ = std::fs::remove_file(destination.join(stamp::STAMP_FILE));
-    rewrite_reference_name(&destination, &name)?;
+    let mut staged = StagedPackage::new(project, &name)?;
+    copy_tree(&reference, staged.path())?;
+    rewrite_reference_name(staged.path(), &name)?;
 
-    let identity = stamp::content_identity(&destination)?;
+    let identity = stamp::content_identity(staged.path())?;
     ProvenanceStamp::scaffolded(
         &format!("packages/{REFERENCE_PACKAGE}/ (the reference Package)"),
         identity.clone(),
         stamp::now_unix(),
     )
-    .write(&destination)?;
+    .write(staged.path())?;
+    let _claim = PackageClaim::acquire(project, &name)?;
+    check_collision(project, &name)?;
+    staged.install(&destination)?;
     println!();
     println!("scaffolded {} -> {}", name.as_str(), destination.display());
     println!("  from      packages/{REFERENCE_PACKAGE}/ (the reference Package)");
@@ -480,12 +519,13 @@ pub fn new(project: &ProjectLayout, runner: &dyn ProcessRunner, name: &str) -> R
     println!("running preflight with the Package compiled in");
     preflight::run(project, runner).map_err(|e| {
         Error::Process(format!(
-            "preflight failed on the freshly scaffolded '{}', so it has NOT been published and the \
-             module on the node is unchanged.\n  The Package is on disk at {}. Fix it there and \
-             re-run `lyracore preflight`, or undo the scaffold with:\n      rm -rf {}\n  ({e})",
+            "preflight failed after '{}' was scaffolded, so it has NOT been published and the \
+             module on the node is unchanged.\n  The Package remains at {}. The failure below may \
+             be in its code or in another preflight prerequisite; fix the reported cause and \
+             re-run `lyracore preflight`, or undo the scaffold with:\n      rm -rf -- {}\n  ({e})",
             name.as_str(),
             destination.display(),
-            destination.display()
+            shell_quote(&destination)
         ))
     })?;
 
@@ -499,7 +539,7 @@ pub fn new(project: &ProjectLayout, runner: &dyn ProcessRunner, name: &str) -> R
         "  lyracore client sync   nothing to install yet — add a client/ directory (addons under"
     );
     println!(
-        "                         client/addons/<Name>/, overrides under client/patch/) and re-run"
+        "                         client/addons/<Name>/, overrides under client/mpq/) and re-run"
     );
     println!(
         "grow the Rust half in packages/{}/src/: wire more hooks from the catalog in",
@@ -517,26 +557,19 @@ pub fn new(project: &ProjectLayout, runner: &dyn ProcessRunner, name: &str) -> R
 /// did would not be text this rewrite could safely touch anyway.
 fn rewrite_reference_name(destination: &Path, name: &PackageName) -> Result<()> {
     let ident = name.rust_ident();
-    let mut files = Vec::new();
-    collect_files(destination, &mut files)?;
-    for file in files {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+    for entry in tree::collect(destination)? {
+        if entry.kind != tree::EntryKind::File || entry.relative == Path::new(stamp::STAMP_FILE) {
             continue;
-        };
-        if text.contains(REFERENCE_PACKAGE) {
-            std::fs::write(&file, text.replace(REFERENCE_PACKAGE, &ident))?;
         }
-    }
-    Ok(())
-}
-
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_files(&path, out)?;
-        } else {
-            out.push(path);
+        match std::fs::read_to_string(&entry.path) {
+            Ok(text) if text.contains(REFERENCE_PACKAGE) => {
+                std::fs::write(&entry.path, text.replace(REFERENCE_PACKAGE, &ident))?;
+            }
+            Ok(_) => {}
+            // A future reference may carry binary client assets; they have no textual identifier
+            // to rewrite and are copied byte-for-byte.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
@@ -1047,6 +1080,21 @@ mod tests {
     }
 
     #[test]
+    fn folded_package_names_share_one_interprocess_claim() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let hyphen = PackageName::parse("foo-bar").unwrap();
+        let underscore = PackageName::parse("foo_bar").unwrap();
+
+        let first = PackageClaim::acquire(&project, &hyphen).unwrap();
+        let error = PackageClaim::acquire(&project, &underscore).unwrap_err();
+
+        assert!(error.to_string().contains("pkg_foo_bar"), "{error}");
+        drop(first);
+        PackageClaim::acquire(&project, &underscore).unwrap();
+    }
+
+    #[test]
     fn linked_inventory_entries_are_reported_without_following_them() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
@@ -1156,7 +1204,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains(&format!("rm -rf {}", scaffolded.display())),
+                .contains(&format!("rm -rf -- {}", shell_quote(&scaffolded))),
             "{error}"
         );
         assert!(
