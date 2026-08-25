@@ -374,15 +374,15 @@ fn check_rls(project: &ProjectLayout, bindings: Option<&Path>, failures: &mut Fa
 /// script's own `$DB` override into it.
 ///
 /// Only scripts that DEFINE an override are worth checking: one with no override always hits the
-/// default database, which is a different (deliberate) thing. Backslash continuations are joined
-/// first, because a real invocation spans lines and may carry `--db "$DB"` on a later one.
+/// default database, which is a different (deliberate) thing. Comments are stripped and backslash
+/// continuations joined first, because a tool named in prose is not an invocation and a real
+/// invocation spans lines and may carry `--db "$DB"` on a later one.
 pub fn db_threading_offenders(script: &str) -> Vec<String> {
     if !script.lines().any(defines_db_override) {
         return Vec::new();
     }
     join_continuations(script)
         .into_iter()
-        .filter(|line| !line.trim_start().starts_with('#'))
         .filter(|line| drives_a_database_tool(line))
         .filter(|line| !threads_db(line))
         .collect()
@@ -396,10 +396,36 @@ fn defines_db_override(line: &str) -> bool {
     name.ends_with("DB") && line[name.len()..].starts_with('=')
 }
 
+/// The shell-visible part of one physical line: everything before an unquoted `#` that starts a
+/// word. A `#` inside quotes or glued to the previous word is data, not a comment. Stripping runs
+/// before continuation joining because a backslash inside a comment does not continue the line.
+fn strip_inline_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let (mut single, mut double) = (false, false);
+    let mut word_start = true;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' if !single => {
+                word_start = false;
+                at += 2;
+                continue;
+            }
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            b'#' if !single && !double && word_start => return line[..at].trim_end(),
+            _ => {}
+        }
+        word_start = matches!(bytes[at], b' ' | b'\t');
+        at += 1;
+    }
+    line
+}
+
 fn join_continuations(script: &str) -> Vec<String> {
     let mut joined: Vec<String> = Vec::new();
     let mut pending: Option<String> = None;
-    for line in script.lines() {
+    for line in script.lines().map(strip_inline_comment) {
         let continues = line.ends_with('\\');
         let piece = if continues {
             format!("{} ", &line[..line.len() - 1])
@@ -762,6 +788,27 @@ mod tests {
         // ...but `$DBC` alone must NOT satisfy the threading requirement.
         let sneaky = "DB=lyracore\n./target/debug/lyracore-importer --dbc \"$DBC\"\n";
         assert_eq!(db_threading_offenders(sneaky).len(), 1);
+    }
+
+    #[test]
+    fn a_tool_named_in_an_inline_comment_is_not_an_offender() {
+        // The LyraCore#326 false positive: a function-definition line whose trailing comment
+        // mentions `spacetime sql` flagged a script that threads $DB in every real invocation.
+        let script = "DB=${DB:-lyracore}\n\
+             verify_eventai_catalogue() { # O(1) `spacetime sql` calls: six, whatever the rule count is.\n\
+             spacetime sql \"$DB\" 'SELECT 1'\n";
+        assert!(db_threading_offenders(script).is_empty());
+    }
+
+    #[test]
+    fn an_inline_comment_neither_hides_an_offender_nor_truncates_its_line() {
+        // The code before the comment is still checked...
+        let script = "DB=lyracore\nspacetime sql 'SELECT 1' # threads nothing\n";
+        assert_eq!(db_threading_offenders(script).len(), 1);
+
+        // ...and a quoted `#` is data: the `$DB` after it must still count as threaded.
+        let quoted = "DB=lyracore\nspacetime sql \"SELECT '#'\" \"$DB\"\n";
+        assert!(db_threading_offenders(quoted).is_empty());
     }
 
     #[test]
