@@ -96,15 +96,17 @@ USAGE:
                                                addon a disabled or removed Package left behind
   lyracore character gm NAME true|false        grant (true) or revoke (false) GM level for a
                                                character — tries every world shard in turn
-  lyracore packages add FOLDER|GIT-URL [--yes]
-                                               install a Package from a folder on this machine, or
-                                               from a repository whose root is one Package: copies
-                                               it into packages/, records where it came from (and
-                                               the exact commit, for a Git Package Source), prints
-                                               a deterministic review of the tables, reducers,
-                                               hooks, addons and client overrides it registers,
-                                               asks before copying, then runs preflight. It never
-                                               publishes — it prints the steps left
+  lyracore packages add FOLDER|GIT-URL|NAME [--yes]
+                                               install a Package from a folder on this machine,
+                                               from a repository whose root is one Package, or by
+                                               bare NAME from the Official Package Collection:
+                                               copies it into packages/, records where it came from
+                                               (and the exact commit, for a Git Package Source or
+                                               the collection), prints a deterministic review of
+                                               the tables, reducers, hooks, addons and client
+                                               overrides it registers, asks before copying, then
+                                               runs preflight. It never publishes — it prints the
+                                               steps left
   lyracore packages update [NAME] [--yes]      advance a Git-backed Package to the repository's
                                                current commit, or every Git-backed Package when no
                                                name is given. Refuses a folder that has drifted
@@ -184,9 +186,10 @@ pub enum Command {
         enabled: bool,
     },
     PackagesAdd {
-        /// The Package Source to install, as typed: a folder on this machine or a Git URL.
-        /// `packages::add` decides which and resolves it there, the earliest point the checkout it
-        /// is being installed into is known.
+        /// The Package Source to install, as typed: a folder on this machine, a Git URL, or a bare
+        /// name to resolve against the Official Package Collection. `packages::add` decides which
+        /// and resolves it there, the earliest point the checkout it is being installed into is
+        /// known.
         source: String,
         /// `--yes`: the install confirmation was answered in advance (scripted runs).
         yes: bool,
@@ -493,7 +496,7 @@ fn parse_production_status(args: &[&str]) -> Result<Command> {
     }))
 }
 
-/// `packages add FOLDER|GIT-URL [--yes]`.
+/// `packages add FOLDER|GIT-URL|NAME [--yes]`.
 ///
 /// `--yes` answers the install confirmation in advance, the same way `import --accept` answers the
 /// consent question: a scripted install must be possible, and a prompt read from `/dev/tty` cannot
@@ -521,8 +524,8 @@ fn parse_packages_add(args: &[&str]) -> Result<Command> {
     match source {
         Some(source) => Ok(Command::PackagesAdd { source, yes }),
         None => Err(Error::Usage(
-            "`packages add` needs the folder or repository URL to install, e.g. `packages add \
-             ~/src/my-package`"
+            "`packages add` needs the folder, repository URL, or Official Package Collection \
+             name to install, e.g. `packages add ~/src/my-package`"
                 .to_string(),
         )),
     }

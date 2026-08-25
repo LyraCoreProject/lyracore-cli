@@ -41,12 +41,13 @@ pub(crate) struct GitSource {
 }
 
 impl GitSource {
-    /// The argument spellings `packages add` reads as a repository rather than a path: the three
-    /// URL schemes git speaks, and the scp-style `user@host:path` form. Everything else is a path
-    /// on this machine, which is what a `packages add` argument has always been.
+    /// The argument spellings `packages add` reads as a repository rather than a path: the URL
+    /// schemes git speaks, and the scp-style `user@host:path` form. Everything else is a path on
+    /// this machine, or a bare Package name for `add` to resolve against the Official Package
+    /// Collection — see [`official`](super::official).
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         let url = raw.trim();
-        let is_url = ["https://", "ssh://", "git://"]
+        let is_url = ["https://", "http://", "ssh://", "git://"]
             .iter()
             .any(|scheme| url.starts_with(scheme))
             || is_scp_style(url);
@@ -100,13 +101,17 @@ fn is_scp_style(url: &str) -> bool {
 
 /// A repository cloned into this checkout's scratch space, at the commit its default branch points
 /// at right now. Dropping it removes the clone.
-struct RepositoryClone {
+///
+/// `pub(crate)`: [`official`](super::official) clones the Official Package Collection through the
+/// same machinery, rather than a second copy of it, so a clone behaves identically (depth-1,
+/// `GIT_TERMINAL_PROMPT` disabled, scratch space cleaned up) whichever the two commands runs it.
+pub(crate) struct RepositoryClone {
     dir: PathBuf,
     revision: String,
 }
 
 impl RepositoryClone {
-    fn fetch(
+    pub(crate) fn fetch(
         project: &ProjectLayout,
         runner: &dyn ProcessRunner,
         source: &GitSource,
@@ -166,11 +171,11 @@ impl RepositoryClone {
         Ok(clone)
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.dir
     }
 
-    fn revision(&self) -> &str {
+    pub(crate) fn revision(&self) -> &str {
         &self.revision
     }
 }
@@ -686,6 +691,7 @@ mod tests {
     fn a_url_is_a_package_source_and_everything_else_stays_a_path() {
         for url in [
             "https://example.invalid/greeter.git",
+            "http://example.invalid/greeter.git",
             "ssh://git@example.invalid/team/greeter.git",
             "git://example.invalid/greeter",
             "git@example.invalid:team/greeter.git",
@@ -693,8 +699,8 @@ mod tests {
             assert!(GitSource::parse(url).is_some(), "{url}");
         }
         // A path is a path, including one with a colon or an '@' in it, and including a bare name:
-        // resolving a bare name as an Official Package is a Package Source kind this CLI does not
-        // have, and reading one as a URL here would take that decision away from it.
+        // `add` resolves a bare name against the Official Package Collection instead, and reading
+        // one as a URL here would take that decision away from it.
         for path in [
             "/home/dev/src/greeter",
             "./greeter",

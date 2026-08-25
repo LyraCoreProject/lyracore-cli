@@ -1,6 +1,7 @@
-//! `lyracore packages add <folder|git-url>`, `lyracore packages new <name>`, `lyracore packages
-//! list`, the lifecycle verbs in [`lifecycle`] (`enable`, `disable`, `remove`), and the Git
-//! Package Source verbs in [`git`] (the URL form of `add`, and `update`).
+//! `lyracore packages add <folder|git-url|name>`, `lyracore packages new <name>`, `lyracore
+//! packages list`, the lifecycle verbs in [`lifecycle`] (`enable`, `disable`, `remove`), the Git
+//! Package Source verbs in [`git`] (the URL form of `add`, and `update`), and the Official Package
+//! Collection form of `add` in [`official`] (the bare-name form).
 //!
 //! A Package is a drop-in folder under `packages/<name>/` that the server build compiles into the
 //! module with no core-file edits: `module/build.rs` discovers it, generates `pub mod pkg_<name>`
@@ -26,6 +27,7 @@
 pub mod build;
 pub mod git;
 pub mod lifecycle;
+pub mod official;
 pub mod review;
 pub mod stamp;
 pub(crate) mod tree;
@@ -234,12 +236,14 @@ pub fn validate_shape(source: &Path) -> Result<()> {
 //  `packages add`
 // =============================================================================================
 
-/// Install a Package from a folder on this machine or from a Git Package Source.
+/// Install a Package from a folder on this machine, a Git Package Source, or the Official Package
+/// Collection.
 ///
-/// The argument decides which: a Git URL is cloned first, and everything after that is the same
-/// contract a local folder goes through. Anything that is not a URL is a path — including a bare
-/// name, which resolves against the filesystem exactly as it always has. Looking a bare name up as
-/// an Official Package is a Package Source kind this CLI does not have yet.
+/// The argument decides which, in this order: a Git URL is cloned first, and everything after that
+/// is the same contract a local folder goes through. Anything else that already names a real path
+/// on this machine — including a bare word that happens to be a local directory — is that local
+/// folder, unchanged. Only what is left, a bare word that is a usable Package name and names
+/// nothing here, is looked up in the Official Package Collection.
 pub fn add(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
@@ -249,8 +253,24 @@ pub fn add(
 ) -> Result<()> {
     match git::GitSource::parse(source) {
         Some(repository) => git::add(project, runner, prompt, &repository, yes),
-        None => add_folder(project, runner, prompt, source, yes),
+        None => match official_candidate(source, Path::new(source).exists()) {
+            Some(name) => official::add(project, runner, prompt, &name, yes),
+            None => add_folder(project, runner, prompt, source, yes),
+        },
     }
+}
+
+/// `source` is an Official Package Collection candidate exactly when it is a usable Package name
+/// that nothing on this machine already answers to. `exists_locally` is a parameter rather than a
+/// filesystem check made here so the rule reads and tests the same way regardless of what is on
+/// disk: a path with a `/`, a leading `.` or `~`, or anything else [`PackageName::parse`] refuses
+/// is never a candidate either way, and a bare word that IS a local directory keeps its existing
+/// folder resolution rather than being shadowed by the collection.
+fn official_candidate(source: &str, exists_locally: bool) -> Option<PackageName> {
+    if exists_locally {
+        return None;
+    }
+    PackageName::parse(source).ok()
 }
 
 /// Install a local folder as an enabled Package.
@@ -315,6 +335,7 @@ fn add_folder(
 pub(crate) enum Origin<'a> {
     Local(&'a Path),
     Git { url: &'a str, revision: &'a str },
+    Official { revision: &'a str },
 }
 
 impl Origin<'_> {
@@ -329,24 +350,43 @@ impl Origin<'_> {
                 content_identity,
                 stamp::now_unix(),
             ),
+            Origin::Official { revision } => ProvenanceStamp::official(
+                official::COLLECTION_URL,
+                (*revision).to_string(),
+                content_identity,
+                stamp::now_unix(),
+            ),
         }
     }
 
-    /// The source lines of the install report, in the same shape `packages list` prints.
+    /// The source lines of the install report, in the same shape `packages list` prints them (see
+    /// [`provenance_report`]) — minus the `installed` line, which an install has not recorded yet
+    /// at either point this is called.
     fn report(&self) -> String {
         match self {
-            Origin::Local(folder) => format!("  source    local {}\n", folder.display()),
-            Origin::Git { url, revision } => {
-                format!("  source    git {url}\n  revision  {revision}\n")
+            Origin::Local(folder) => {
+                source_and_revision(stamp::SOURCE_LOCAL, &folder.display().to_string(), "")
+            }
+            Origin::Git { url, revision } => source_and_revision(stamp::SOURCE_GIT, url, revision),
+            Origin::Official { revision } => {
+                source_and_revision(stamp::SOURCE_OFFICIAL, official::COLLECTION_URL, revision)
             }
         }
     }
 
-    /// The Package Source as the operator typed it, for the one sentence they answer.
+    /// The Package Source as the operator recognises it, for the one sentence they answer. Never a
+    /// scratch-clone path: a Git Package Source names the URL it was cloned from, and an Official
+    /// Package Source names the collection, not the directory `add` cloned it into.
     fn named(&self) -> String {
         match self {
             Origin::Local(folder) => folder.display().to_string(),
             Origin::Git { url, .. } => (*url).to_string(),
+            Origin::Official { .. } => {
+                format!(
+                    "the Official Package Collection ({})",
+                    official::COLLECTION_URL
+                )
+            }
         }
     }
 }
@@ -827,20 +867,32 @@ pub fn list(project: &ProjectLayout) -> Result<()> {
 pub(crate) fn provenance_report(stamp: Option<&ProvenanceStamp>) -> String {
     match stamp {
         Some(recorded) => format!(
-            "  source    {} {}\n{}  installed {}\n",
-            blank_as_unrecorded(&recorded.source_kind),
-            blank_as_unrecorded(&recorded.source),
-            if recorded.revision.is_empty() {
-                String::new()
-            } else {
-                format!("  revision  {}\n", recorded.revision)
-            },
+            "{}  installed {}\n",
+            source_and_revision(
+                blank_as_unrecorded(&recorded.source_kind),
+                blank_as_unrecorded(&recorded.source),
+                &recorded.revision,
+            ),
             blank_as_unrecorded(&recorded.installed_at)
         ),
         None => "  source    (unrecorded — no provenance stamp: created by hand, or predates \
                  `packages add`)\n"
             .to_string(),
     }
+}
+
+/// The `source` and `revision` lines shared by [`provenance_report`] and [`Origin::report`] —
+/// [`Origin::report`] has no `installed` line to append yet, and [`provenance_report`] appends its
+/// own after this.
+fn source_and_revision(kind: &str, source: &str, revision: &str) -> String {
+    format!(
+        "  source    {kind} {source}\n{}",
+        if revision.is_empty() {
+            String::new()
+        } else {
+            format!("  revision  {revision}\n")
+        }
+    )
 }
 
 fn drift(recorded: &ProvenanceStamp, current: &str) -> &'static str {
@@ -979,6 +1031,27 @@ pub(super) mod tests {
             PackageName::parse("my_package").unwrap().rust_ident(),
             "my_package"
         );
+    }
+
+    // ---- which bare words become an Official Package Collection lookup ----
+
+    #[test]
+    fn a_bare_name_is_an_official_candidate_only_when_nothing_local_answers_to_it() {
+        assert_eq!(
+            official_candidate("greeter", false).unwrap().as_str(),
+            "greeter"
+        );
+        assert!(
+            official_candidate("greeter", true).is_none(),
+            "an existing local match keeps today's folder resolution"
+        );
+        assert!(
+            official_candidate("2fast", false).is_none(),
+            "not a usable Package name, so not a candidate either way"
+        );
+        assert!(official_candidate("../greeter", false).is_none());
+        assert!(official_candidate("/abs/greeter", false).is_none());
+        assert!(official_candidate("~/greeter", false).is_none());
     }
 
     // ---- the shape contract ----
