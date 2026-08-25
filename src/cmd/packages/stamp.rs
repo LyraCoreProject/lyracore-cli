@@ -9,9 +9,9 @@
 //! The stamp is deliberately excluded from the content identity it carries: a hash cannot cover
 //! the file it is written into.
 //!
-//! TOML, hand-written and hand-read. Four flat string keys do not earn a parser dependency, and a
-//! stamp is read on a path where being unable to read one must degrade to "unrecorded" rather than
-//! to a failed command — `packages list` has to describe a hand-edited or pre-existing Package
+//! TOML, hand-written and hand-read. A handful of flat string keys do not earn a parser dependency,
+//! and a stamp is read on a path where being unable to read one must degrade to "unrecorded" rather
+//! than to a failed command — `packages list` has to describe a hand-edited or pre-existing Package
 //! sensibly.
 
 use super::tree::{self, EntryKind};
@@ -22,10 +22,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The stamp's file name inside the Package directory.
 pub const STAMP_FILE: &str = ".lyracore-package.toml";
 
-/// The Package Source kind a local-folder install records. Git URLs and Official Package lookups
-/// are separate issues; an unrecognised kind read back from disk is rendered verbatim rather than
-/// refused, because this file is operator-editable input.
+/// The Package Source kind a local-folder install records. An unrecognised kind read back from disk
+/// is rendered verbatim rather than refused, because this file is operator-editable input.
 pub const SOURCE_LOCAL: &str = "local";
+/// The kind an install from a Git Package Source records. Its [`source`](ProvenanceStamp::source)
+/// is the repository URL and its [`revision`](ProvenanceStamp::revision) is the exact commit that
+/// was installed, which is what `packages update` advances from.
+pub const SOURCE_GIT: &str = "git";
 /// The kind `packages new` records. A scaffolded Package has no Package Source — nothing the
 /// operator chose and could drift from — so this is a distinct kind from [`SOURCE_LOCAL`] rather
 /// than a `local()` stamp pointed at the reference Package, which would wrongly claim the operator
@@ -39,10 +42,15 @@ pub const SOURCE_SCAFFOLD: &str = "scaffold";
 /// still has.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProvenanceStamp {
-    /// `local` today. The vocabulary this field may grow: `git`, `official`.
+    /// [`SOURCE_LOCAL`], [`SOURCE_GIT`] or [`SOURCE_SCAFFOLD`]. The vocabulary this field may still
+    /// grow: `official`.
     pub source_kind: String,
-    /// The absolute folder the Package was copied FROM.
+    /// The absolute folder the Package was copied FROM, or the repository URL it was cloned from.
     pub source: String,
+    /// The exact commit a Git Package Source was installed at. Empty for every other kind: a local
+    /// folder and a scaffold have no revision, so there is nothing for `packages update` to advance
+    /// from and nothing to report.
+    pub revision: String,
     /// [`content_identity`] of the copied tree at install time.
     pub content_identity: String,
     /// UTC, RFC 3339, second resolution.
@@ -55,6 +63,20 @@ impl ProvenanceStamp {
         Self {
             source_kind: SOURCE_LOCAL.to_string(),
             source: source.to_string_lossy().to_string(),
+            revision: String::new(),
+            content_identity,
+            installed_at: utc_rfc3339(now),
+        }
+    }
+
+    /// The stamp an install from a Git Package Source writes. `revision` is the exact commit the
+    /// installed tree was taken from, so a later `packages update` knows what it is advancing FROM
+    /// rather than trusting the repository's current default branch to still point there.
+    pub fn git(url: &str, revision: String, content_identity: String, now: u64) -> Self {
+        Self {
+            source_kind: SOURCE_GIT.to_string(),
+            source: url.to_string(),
+            revision,
             content_identity,
             installed_at: utc_rfc3339(now),
         }
@@ -67,6 +89,7 @@ impl ProvenanceStamp {
         Self {
             source_kind: SOURCE_SCAFFOLD.to_string(),
             source: reference.to_string(),
+            revision: String::new(),
             content_identity,
             installed_at: utc_rfc3339(now),
         }
@@ -91,26 +114,32 @@ impl ProvenanceStamp {
         Ok(())
     }
 
+    /// The file's own text. `revision` is written only when there is one, so a local install and a
+    /// scaffold keep the four keys they have always had rather than gaining an empty fifth.
     pub fn render(&self) -> String {
         let written_by = match self.source_kind.as_str() {
             SOURCE_LOCAL => "`lyracore packages add`",
+            SOURCE_GIT => "`lyracore packages add` or `lyracore packages update`",
             SOURCE_SCAFFOLD => "`lyracore packages new`",
             _ => "LyraCore Package tooling (unrecognised source kind)",
         };
-        format!(
+        let mut text = format!(
             "# Written by {written_by}. It records where this Package came from and what its\n\
              # content was at install time; `lyracore packages list` compares the tree against\n\
              # `content_identity` to report local drift. This file is excluded from that hash.\n\
-             # Editing it changes only the report, never the Package.\n\
-             source_kind = {}\n\
-             source = {}\n\
-             content_identity = {}\n\
-             installed_at = {}\n",
-            quote(&self.source_kind),
-            quote(&self.source),
-            quote(&self.content_identity),
-            quote(&self.installed_at),
-        )
+             # Editing it changes only the report, never the Package.\n"
+        );
+        let mut key = |name: &str, value: &str| {
+            text.push_str(&format!("{name} = {}\n", quote(value)));
+        };
+        key("source_kind", &self.source_kind);
+        key("source", &self.source);
+        if !self.revision.is_empty() {
+            key("revision", &self.revision);
+        }
+        key("content_identity", &self.content_identity);
+        key("installed_at", &self.installed_at);
+        text
     }
 
     /// Flat `key = "value"` lines. Never fails: an unrecognised key is ignored and a missing one
@@ -129,6 +158,7 @@ impl ProvenanceStamp {
             match key.trim() {
                 "source_kind" => stamp.source_kind = value,
                 "source" => stamp.source = value,
+                "revision" => stamp.revision = value,
                 "content_identity" => stamp.content_identity = value,
                 "installed_at" => stamp.installed_at = value,
                 _ => {}
@@ -291,6 +321,45 @@ mod tests {
         assert_eq!(stamp.source_kind, SOURCE_SCAFFOLD);
         assert_ne!(stamp.source_kind, SOURCE_LOCAL);
         assert_eq!(stamp.source, "packages/example/ (the reference Package)");
+    }
+
+    #[test]
+    fn a_git_stamp_records_the_repository_and_the_exact_commit() {
+        let tmp = TempDir::new().unwrap();
+        let stamp = ProvenanceStamp::git(
+            "https://example.invalid/greeter.git",
+            "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_string(),
+            "fnv1a64-tree-v1:0123456789abcdef".to_string(),
+            1_756_000_000,
+        );
+
+        stamp.write(tmp.path()).unwrap();
+
+        assert_eq!(ProvenanceStamp::read(tmp.path()), Some(stamp.clone()));
+        assert_eq!(stamp.source_kind, SOURCE_GIT);
+        assert_eq!(stamp.source, "https://example.invalid/greeter.git");
+        assert_eq!(stamp.revision, "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b");
+    }
+
+    #[test]
+    fn a_stamp_written_before_revisions_existed_still_reads() {
+        // Every Package installed by the local-folder `packages add` has a four-key stamp. Reading
+        // one back must not invent a revision or fail: `packages update` decides what it can act on
+        // from `source_kind`, and a Package with no revision is one it has to turn away by name.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(STAMP_FILE),
+            "source_kind = \"local\"\nsource = \"/src/greeter\"\n\
+             content_identity = \"fnv1a64-tree-v1:0123456789abcdef\"\n\
+             installed_at = \"2025-08-24T15:59:59Z\"\n",
+        )
+        .unwrap();
+
+        let stamp = ProvenanceStamp::read(tmp.path()).unwrap();
+
+        assert_eq!(stamp.revision, "");
+        assert_eq!(stamp.source_kind, SOURCE_LOCAL);
+        assert!(!stamp.render().contains("revision"));
     }
 
     #[test]

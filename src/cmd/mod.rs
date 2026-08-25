@@ -96,12 +96,21 @@ USAGE:
                                                addon a disabled or removed Package left behind
   lyracore character gm NAME true|false        grant (true) or revoke (false) GM level for a
                                                character — tries every world shard in turn
-  lyracore packages add FOLDER [--yes]        install a Package from a folder on this machine:
-                                               copies it into packages/, records where it came
-                                               from, prints a deterministic review of the tables,
-                                               reducers, hooks, addons and client overrides it
-                                               registers, asks before copying, then runs preflight.
-                                               It never publishes — it prints the steps left
+  lyracore packages add FOLDER|GIT-URL [--yes]
+                                               install a Package from a folder on this machine, or
+                                               from a repository whose root is one Package: copies
+                                               it into packages/, records where it came from (and
+                                               the exact commit, for a Git Package Source), prints
+                                               a deterministic review of the tables, reducers,
+                                               hooks, addons and client overrides it registers,
+                                               asks before copying, then runs preflight. It never
+                                               publishes — it prints the steps left
+  lyracore packages update [NAME] [--yes]      advance a Git-backed Package to the repository's
+                                               current commit, or every Git-backed Package when no
+                                               name is given. Refuses a folder that has drifted
+                                               from its recorded content identity, reviews and asks
+                                               before replacing it, and keeps the previous revision
+                                               until the new one preflights
   lyracore packages enable NAME                move a disabled Package back into packages/, where
                                                the build compiles it again. Its provenance stamp
                                                travels with the folder
@@ -175,10 +184,17 @@ pub enum Command {
         enabled: bool,
     },
     PackagesAdd {
-        /// The folder to install, as typed. Resolved against the filesystem in `packages::add`,
-        /// which is the earliest point the checkout it is being installed into is known.
-        folder: String,
+        /// The Package Source to install, as typed: a folder on this machine or a Git URL.
+        /// `packages::add` decides which and resolves it there, the earliest point the checkout it
+        /// is being installed into is known.
+        source: String,
         /// `--yes`: the install confirmation was answered in advance (scripted runs).
+        yes: bool,
+    },
+    PackagesUpdate {
+        /// The Package to advance. `None` means every Git-backed one.
+        name: Option<String>,
+        /// `--yes`: the update confirmation was answered in advance (scripted runs).
         yes: bool,
     },
     PackagesList,
@@ -323,9 +339,10 @@ impl Command {
                 "`character` supports: gm NAME true|false".to_string(),
             )),
 
-            // `add` takes exactly one positional: the folder. `--yes` may come on either side of
-            // it, like every other flag on this surface.
+            // `add` takes exactly one positional: the Package Source. `--yes` may come on either
+            // side of it, like every other flag on this surface.
             ["packages", "add", rest @ ..] => parse_packages_add(rest),
+            ["packages", "update", rest @ ..] => parse_packages_update(rest),
             ["packages", "list"] => Ok(Command::PackagesList),
             ["packages", "list", other, ..] => Err(Error::Usage(format!(
                 "`packages list` takes no arguments (got '{other}')"
@@ -351,8 +368,8 @@ impl Command {
             }),
             ["packages", "remove", rest @ ..] => parse_packages_remove(rest),
             ["packages", ..] => Err(Error::Usage(
-                "`packages` supports: add FOLDER [--yes], build, disable NAME, enable NAME, list, \
-                 new NAME, remove NAME [--yes]"
+                "`packages` supports: add FOLDER|GIT-URL [--yes], build, disable NAME, enable \
+                 NAME, list, new NAME, remove NAME [--yes], update [NAME] [--yes]"
                     .to_string(),
             )),
 
@@ -476,14 +493,14 @@ fn parse_production_status(args: &[&str]) -> Result<Command> {
     }))
 }
 
-/// `packages add FOLDER [--yes]`.
+/// `packages add FOLDER|GIT-URL [--yes]`.
 ///
 /// `--yes` answers the install confirmation in advance, the same way `import --accept` answers the
 /// consent question: a scripted install must be possible, and a prompt read from `/dev/tty` cannot
-/// be answered by a pipeline. It is a separate flag from the folder so a path that happens to start
-/// with `-` is still refused rather than read as an option.
+/// be answered by a pipeline. It is a separate flag from the Package Source so a path that happens
+/// to start with `-` is still refused rather than read as an option.
 fn parse_packages_add(args: &[&str]) -> Result<Command> {
-    let mut folder: Option<String> = None;
+    let mut source: Option<String> = None;
     let mut yes = false;
     for arg in args {
         match *arg {
@@ -493,21 +510,50 @@ fn parse_packages_add(args: &[&str]) -> Result<Command> {
                     "unknown `packages add` option '{option}' — the only one is --yes"
                 )))
             }
-            path if folder.is_none() => folder = Some(path.to_string()),
+            candidate if source.is_none() => source = Some(candidate.to_string()),
             extra => {
                 return Err(Error::Usage(format!(
-                    "`packages add` installs one folder at a time (got a second: '{extra}')"
+                    "`packages add` installs one Package at a time (got a second: '{extra}')"
                 )))
             }
         }
     }
-    match folder {
-        Some(folder) => Ok(Command::PackagesAdd { folder, yes }),
+    match source {
+        Some(source) => Ok(Command::PackagesAdd { source, yes }),
         None => Err(Error::Usage(
-            "`packages add` needs the folder to install, e.g. `packages add ~/src/my-package`"
+            "`packages add` needs the folder or repository URL to install, e.g. `packages add \
+             ~/src/my-package`"
                 .to_string(),
         )),
     }
+}
+
+/// `packages update [NAME] [--yes]`, in either order.
+///
+/// The name is optional because "every Git-backed Package" is the ordinary intent: an operator who
+/// installed three Packages from repositories wants all three current, and naming them one at a
+/// time is the exception.
+fn parse_packages_update(args: &[&str]) -> Result<Command> {
+    let mut name: Option<String> = None;
+    let mut yes = false;
+    for arg in args {
+        match *arg {
+            "--yes" => yes = true,
+            option if option.starts_with('-') => {
+                return Err(Error::Usage(format!(
+                    "unknown `packages update` option '{option}' — the only one is --yes"
+                )))
+            }
+            candidate if name.is_none() => name = Some(candidate.to_string()),
+            extra => {
+                return Err(Error::Usage(format!(
+                    "`packages update` takes at most one Package name (got a second: '{extra}'). \
+                     With no name it updates every Git-backed Package."
+                )))
+            }
+        }
+    }
+    Ok(Command::PackagesUpdate { name, yes })
 }
 
 /// `packages enable NAME` and `packages disable NAME`: one Package name, no options.
@@ -1228,11 +1274,11 @@ mod tests {
     // ---- packages ----
 
     #[test]
-    fn packages_add_takes_one_folder_and_the_confirmation_flag_in_either_order() {
+    fn packages_add_takes_one_package_source_and_the_confirmation_flag_in_either_order() {
         assert_eq!(
             parse("packages add /src/greeter").unwrap(),
             Command::PackagesAdd {
-                folder: "/src/greeter".to_string(),
+                source: "/src/greeter".to_string(),
                 yes: false,
             }
         );
@@ -1243,7 +1289,7 @@ mod tests {
             assert_eq!(
                 parse(line).unwrap(),
                 Command::PackagesAdd {
-                    folder: "/src/greeter".to_string(),
+                    source: "/src/greeter".to_string(),
                     yes: true,
                 },
                 "`{line}`"
@@ -1252,13 +1298,70 @@ mod tests {
     }
 
     #[test]
-    fn packages_add_refuses_no_folder_two_folders_and_invented_options() {
+    fn a_git_url_reaches_add_verbatim() {
+        // Parsing never decides what a Package Source IS: `packages::add` does, against the
+        // filesystem. A URL mangled here (a stripped suffix, a normalised host) would be a URL
+        // nobody typed being cloned.
+        for url in [
+            "https://example.invalid/greeter.git",
+            "ssh://git@example.invalid/greeter.git",
+            "git://example.invalid/greeter",
+            "git@example.invalid:team/greeter.git",
+        ] {
+            assert_eq!(
+                parse(&format!("packages add {url}")).unwrap(),
+                Command::PackagesAdd {
+                    source: url.to_string(),
+                    yes: false,
+                },
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn packages_add_refuses_no_source_two_sources_and_invented_options() {
         for line in [
             "packages add",
             "packages add --yes",
             "packages add /src/one /src/two",
             "packages add /src/greeter --force",
         ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+        }
+    }
+
+    #[test]
+    fn packages_update_takes_an_optional_name_and_the_confirmation_flag() {
+        assert_eq!(
+            parse("packages update").unwrap(),
+            Command::PackagesUpdate {
+                name: None,
+                yes: false
+            }
+        );
+        assert_eq!(
+            parse("packages update --yes").unwrap(),
+            Command::PackagesUpdate {
+                name: None,
+                yes: true
+            }
+        );
+        for line in [
+            "packages update greeter --yes",
+            "packages update --yes greeter",
+        ] {
+            assert_eq!(
+                parse(line).unwrap(),
+                Command::PackagesUpdate {
+                    name: Some("greeter".to_string()),
+                    yes: true
+                },
+                "{line}"
+            );
+        }
+        for line in ["packages update one two", "packages update greeter --force"] {
             let error = parse(line).unwrap_err();
             assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
         }
@@ -1356,18 +1459,22 @@ mod tests {
     }
 
     #[test]
-    fn packages_without_a_recognised_verb_names_the_seven_that_exist() {
-        for line in ["packages", "packages install greeter", "packages update"] {
+    fn packages_without_a_recognised_verb_names_the_eight_that_exist() {
+        for line in ["packages", "packages install greeter", "packages upgrade"] {
             let error = parse(line).unwrap_err().to_string();
-            for verb in ["add", "build", "disable", "enable", "list", "new", "remove"] {
+            for verb in PACKAGES_VERBS {
                 assert!(error.contains(verb), "{line}: {error}");
             }
         }
     }
 
+    const PACKAGES_VERBS: [&str; 8] = [
+        "add", "build", "disable", "enable", "list", "new", "remove", "update",
+    ];
+
     #[test]
     fn the_help_text_documents_packages() {
-        for verb in ["add", "build", "disable", "enable", "list", "new", "remove"] {
+        for verb in PACKAGES_VERBS {
             assert!(
                 USAGE_ALL.contains(&format!("lyracore packages {verb}")),
                 "{USAGE_ALL}"

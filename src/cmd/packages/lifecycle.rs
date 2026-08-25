@@ -22,8 +22,8 @@
 
 use super::stamp::{self, SOURCE_LOCAL};
 use super::{
-    collision, collision_reason, confirm, inventory, review::TrustReview, shell_quote,
-    InstalledPackage, PackageName, PackageState,
+    collision, collision_reason, confirm, find, review::TrustReview, shell_quote, InstalledPackage,
+    PackageName, PackageState,
 };
 use crate::cmd::import::Prompt;
 use crate::project::ProjectLayout;
@@ -180,39 +180,6 @@ pub fn remove(project: &ProjectLayout, prompt: &dyn Prompt, name: &str, yes: boo
     Ok(())
 }
 
-/// The one installed Package with this exact folder name, from either inventory.
-///
-/// Exact, not folded: these commands move or delete a FOLDER, and picking a near-miss for the
-/// operator would act on a directory they did not name. A fold-equal Package is named in the error
-/// instead, because it is almost always the one they meant.
-fn find(project: &ProjectLayout, name: &PackageName) -> Result<InstalledPackage> {
-    let mut folded = None;
-    for installed in inventory(project)? {
-        if installed.name == *name {
-            return Ok(installed);
-        }
-        if installed.name.rust_ident() == name.rust_ident() {
-            folded = Some(installed);
-        }
-    }
-    Err(Error::Usage(match folded {
-        Some(near) => format!(
-            "no Package called '{}'. The {} Package '{}' folds onto the same module `pkg_{}`, but \
-             these commands move a folder, so its name has to be typed exactly. Nothing was \
-             changed.",
-            name.as_str(),
-            near.state.as_str(),
-            near.name.as_str(),
-            name.rust_ident()
-        ),
-        None => format!(
-            "no Package called '{}'. `lyracore packages list` shows every installed Package in \
-             both inventories. Nothing was changed.",
-            name.as_str()
-        ),
-    }))
-}
-
 /// Rename one Package directory into the other inventory, refusing every collision first.
 ///
 /// Returns the `from`/`to` report lines, so the caller prints one shape whichever way it moved.
@@ -359,8 +326,8 @@ fn client_sync_step(review: &TrustReview) -> String {
 mod tests {
     use super::stamp::ProvenanceStamp;
     use super::*;
-    use crate::cmd::packages::add;
     use crate::cmd::packages::tests::{candidate, checkout, Answer};
+    use crate::cmd::packages::{add, inventory};
     use crate::proc::fake::FakeStack;
     use tempfile::TempDir;
 

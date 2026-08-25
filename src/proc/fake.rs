@@ -40,6 +40,8 @@ struct Inner {
     /// A spawned gateway's whole log file, in place of the one derived from its environment. For
     /// the case the derivation cannot express: a build that never logs its shard connections.
     log_override: Option<String>,
+    /// The working copy a `git clone` on this stack produces. See [`FakeStack::with_git_clone`].
+    git_clone: Option<PathBuf>,
     /// A spawn whose render matches `needle` (0) models a version-manager shim's `exec` (#431):
     /// `identity()` reports `before` (1) on its first read for that PID and `after` (2) on every
     /// read after. See [`FakeStack::with_shim_exec`].
@@ -110,6 +112,18 @@ impl FakeStack {
             .unwrap()
             .stdouts
             .insert(needle.to_string(), stdout.to_string());
+        self
+    }
+
+    /// The tree any `git clone` on this stack writes into its destination, plus the `.git` a real
+    /// clone always leaves behind.
+    ///
+    /// A fake that only recorded the call would leave everything an install does with a clone —
+    /// hashing it, reviewing it, stripping its `.git`, copying it into an inventory — unexercisable.
+    /// Calling this again re-points the same stack, which is how a test models a repository that
+    /// moved on: install from one tree, then update to the next.
+    pub fn with_git_clone(self, tree: &Path) -> Self {
+        self.0.lock().unwrap().git_clone = Some(tree.to_path_buf());
         self
     }
 
@@ -324,12 +338,49 @@ fn materialize_generated_bindings(cmd: &CommandSpec) {
     );
 }
 
+/// `git clone` writes a working copy into its last argument. The `.git` is part of it: stripping
+/// that directory is the step that turns a clone into an installable Package tree, and a fake that
+/// never created one could not prove it happens.
+fn materialize_clone(cmd: &CommandSpec, tree: &Path) {
+    let Some(destination) = cmd.args().last().map(Path::new) else {
+        return;
+    };
+    if copy_tree(tree, destination).is_err() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(destination.join(".git"));
+    let _ = std::fs::write(
+        destination.join(".git/HEAD"),
+        "ref: refs/heads/main\n".as_bytes(),
+    );
+}
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 impl ProcessRunner for FakeProcessRunner {
     fn run_and_wait(&self, cmd: &CommandSpec) -> Result<String> {
         let render = cmd.render();
         self.record(Call::Wait(cmd.clone()), &render)?;
         if render.contains("spacetime generate") {
             materialize_generated_bindings(cmd);
+        }
+        if render.starts_with("git clone") {
+            let tree = self.0.lock().unwrap().git_clone.clone();
+            if let Some(tree) = tree {
+                materialize_clone(cmd, &tree);
+            }
         }
         let canned = {
             let inner = self.0.lock().unwrap();

@@ -108,11 +108,19 @@ fn run(args: &[String]) -> Result<i32> {
         Command::ClientSync => {
             cmd::client::sync(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
         }
-        Command::PackagesAdd { folder, yes } => cmd::packages::add(
+        Command::PackagesAdd { source, yes } => cmd::packages::add(
             &ProjectLayout::discover()?,
             &runner,
             &cmd::import::TtyPrompt::packages_add(),
-            &folder,
+            &source,
+            yes,
+        )
+        .map(|_| EXIT_OK),
+        Command::PackagesUpdate { name, yes } => cmd::packages::git::update(
+            &ProjectLayout::discover()?,
+            &runner,
+            &cmd::import::TtyPrompt::packages_update(),
+            name.as_deref(),
             yes,
         )
         .map(|_| EXIT_OK),
