@@ -554,10 +554,17 @@ impl Drop for PreservedPackage {
     }
 }
 
-/// A commit, shortened for prose. The conventional 7 characters, or whatever git gave us if it was
-/// somehow shorter.
+/// A commit, shortened for prose. The conventional 7 characters, or the whole thing if it is
+/// shorter.
+///
+/// Counted in CHARACTERS, not bytes. A recorded revision is read back out of a stamp file this
+/// CLI's own documentation calls operator-editable, so it is untrusted text: slicing it by byte
+/// offset would turn a hand-edited stamp into a panic instead of the refusal it should get.
 fn short(revision: &str) -> &str {
-    &revision[..revision.len().min(7)]
+    match revision.char_indices().nth(7) {
+        Some((boundary, _)) => &revision[..boundary],
+        None => revision,
+    }
 }
 
 #[cfg(test)]
@@ -1022,6 +1029,37 @@ mod tests {
             assert!(!call.contains("spacetime publish"), "{call}");
             assert!(!call.contains("--pack-client"), "{call}");
         }
+    }
+
+    #[test]
+    fn a_hand_edited_revision_is_refused_rather_than_crashing_the_update() {
+        // The stamp is operator-editable input. A revision that is not a commit at all must reach
+        // the ordinary refusal path, so shortening it for the report cannot be a byte slice.
+        assert_eq!(short("1a2b3c4d5e"), "1a2b3c4");
+        assert_eq!(short("üüüüüüüüü"), "üüüüüüü");
+        assert_eq!(short("abc"), "abc");
+
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let tree = candidate(&tmp, "anything");
+        install(&project, &repository(&tree, FIRST));
+        let installed = project.packages_dir().join("greeter");
+        let mut stamp = ProvenanceStamp::read(&installed).unwrap();
+        stamp.revision = "üüüüüüüüü".to_string();
+        stamp.write(&installed).unwrap();
+
+        let stack = repository(&tree, SECOND);
+        let error = update(
+            &project,
+            &stack.runner(),
+            &Answer("no"),
+            Some("greeter"),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(installed.join("src/mod.rs").is_file(), "{error}");
     }
 
     #[test]
