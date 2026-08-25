@@ -310,8 +310,8 @@ fn add_folder(
 /// Where a Package came from: what the install records in its stamp, and what it prints.
 ///
 /// The two kinds differ only here. A cloned repository and a local folder are both a reviewed tree
-/// on this machine by the time [`install`] sees them, which is what keeps one installation contract
-/// rather than two that drift apart.
+/// on this machine by the time [`install`] sees them, so `add` has one path rather than two that
+/// drift apart.
 pub(crate) enum Origin<'a> {
     Local(&'a Path),
     Git { url: &'a str, revision: &'a str },
@@ -339,6 +339,14 @@ impl Origin<'_> {
             Origin::Git { url, revision } => {
                 format!("  source    git {url}\n  revision  {revision}\n")
             }
+        }
+    }
+
+    /// The Package Source as the operator typed it, for the one sentence they answer.
+    fn named(&self) -> String {
+        match self {
+            Origin::Local(folder) => folder.display().to_string(),
+            Origin::Git { url, .. } => (*url).to_string(),
         }
     }
 }
@@ -370,13 +378,19 @@ pub(crate) fn install(
     let review = TrustReview::scan(source)?;
     println!();
     print!("{}", review.render(source));
+    // The review header names the tree it scanned, which for a clone is a scratch directory the
+    // operator never typed. The Package Source is what they chose and what they must recognise
+    // before they answer, so it is repeated here and in the question itself.
+    println!();
+    print!("{}", origin.report());
     println!();
 
     confirm(
         prompt,
         &format!(
-            "Install '{}' into {}?",
+            "Install '{}' from {} into {}?",
             name.as_str(),
+            origin.named(),
             destination.display()
         ),
         "Nothing was copied.",
