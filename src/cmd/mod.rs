@@ -102,6 +102,17 @@ USAGE:
                                                reducers, hooks, addons and client overrides it
                                                registers, asks before copying, then runs preflight.
                                                It never publishes — it prints the steps left
+  lyracore packages enable NAME                move a disabled Package back into packages/, where
+                                               the build compiles it again. Its provenance stamp
+                                               travels with the folder
+  lyracore packages disable NAME               move an enabled Package into .lyracore/packages-
+                                               disabled/, out of the build's sight but still on
+                                               disk. Reports the Module tables it registers first,
+                                               because publishing without them is a schema change
+  lyracore packages remove NAME [--yes]        delete a DISABLED Package from this checkout. Asks
+                                               first, and refuses a folder that no longer matches
+                                               its recorded content identity, because those local
+                                               changes exist nowhere else
   lyracore packages build                      regenerate the Module schema typings into
                                                datascripts/generated/, install the pinned Bun
                                                dependencies from datascripts/bun.lock, then
@@ -175,6 +186,17 @@ pub enum Command {
         name: String,
     },
     PackagesBuild,
+    PackagesEnable {
+        name: String,
+    },
+    PackagesDisable {
+        name: String,
+    },
+    PackagesRemove {
+        name: String,
+        /// `--yes`: the deletion confirmation was answered in advance (scripted runs).
+        yes: bool,
+    },
     ProductionStatus(production::StatusOptions),
     Update,
     Help,
@@ -321,8 +343,17 @@ impl Command {
             ["packages", "build", other, ..] => Err(Error::Usage(format!(
                 "`packages build` takes no arguments (got '{other}')"
             ))),
+            ["packages", "enable", rest @ ..] => Ok(Command::PackagesEnable {
+                name: parse_packages_move("enable", rest)?,
+            }),
+            ["packages", "disable", rest @ ..] => Ok(Command::PackagesDisable {
+                name: parse_packages_move("disable", rest)?,
+            }),
+            ["packages", "remove", rest @ ..] => parse_packages_remove(rest),
             ["packages", ..] => Err(Error::Usage(
-                "`packages` supports: add FOLDER [--yes], build, list, new NAME".to_string(),
+                "`packages` supports: add FOLDER [--yes], build, disable NAME, enable NAME, list, \
+                 new NAME, remove NAME [--yes]"
+                    .to_string(),
             )),
 
             ["production", "status", rest @ ..] => parse_production_status(rest),
@@ -474,6 +505,59 @@ fn parse_packages_add(args: &[&str]) -> Result<Command> {
         Some(folder) => Ok(Command::PackagesAdd { folder, yes }),
         None => Err(Error::Usage(
             "`packages add` needs the folder to install, e.g. `packages add ~/src/my-package`"
+                .to_string(),
+        )),
+    }
+}
+
+/// `packages enable NAME` and `packages disable NAME`: one Package name, no options.
+///
+/// Neither destroys anything, and each is the other's undo, so neither has a confirmation to
+/// answer in advance. `--yes` on one of them would be a flag that did nothing.
+fn parse_packages_move(verb: &str, args: &[&str]) -> Result<String> {
+    match args {
+        [name] if !name.starts_with('-') => Ok((*name).to_string()),
+        [] => Err(Error::Usage(format!(
+            "`packages {verb}` needs a name, e.g. `packages {verb} my-package`"
+        ))),
+        [_name, other, ..] => Err(Error::Usage(format!(
+            "`packages {verb}` takes one name (got a second argument: '{other}')"
+        ))),
+        [option] => Err(Error::Usage(format!(
+            "`packages {verb}` takes a Package name, not an option ('{option}')"
+        ))),
+    }
+}
+
+/// `packages remove NAME [--yes]`, in either order.
+///
+/// `--yes` answers the deletion question in advance, like `packages add`'s. A name is a Package
+/// folder name, so it can never start with `-`; an option-looking argument is refused rather than
+/// taken as one.
+fn parse_packages_remove(args: &[&str]) -> Result<Command> {
+    let mut name: Option<String> = None;
+    let mut yes = false;
+    for arg in args {
+        match *arg {
+            "--yes" => yes = true,
+            option if option.starts_with('-') => {
+                return Err(Error::Usage(format!(
+                    "unknown `packages remove` option '{option}' — the only one is --yes"
+                )))
+            }
+            candidate if name.is_none() => name = Some(candidate.to_string()),
+            extra => {
+                return Err(Error::Usage(format!(
+                    "`packages remove` deletes one Package at a time (got a second: '{extra}')"
+                )))
+            }
+        }
+    }
+    match name {
+        Some(name) => Ok(Command::PackagesRemove { name, yes }),
+        None => Err(Error::Usage(
+            "`packages remove` needs the name of a disabled Package, e.g. `packages remove \
+             my-package`"
                 .to_string(),
         )),
     }
@@ -1213,25 +1297,82 @@ mod tests {
     }
 
     #[test]
-    fn packages_without_a_recognised_verb_names_the_four_that_exist() {
-        for line in ["packages", "packages remove greeter", "packages update"] {
-            let error = parse(line).unwrap_err().to_string();
-            assert!(
-                error.contains("add")
-                    && error.contains("build")
-                    && error.contains("list")
-                    && error.contains("new"),
-                "{line}: {error}"
+    fn packages_enable_and_disable_each_take_one_name() {
+        assert_eq!(
+            parse("packages enable greeter").unwrap(),
+            Command::PackagesEnable {
+                name: "greeter".to_string()
+            }
+        );
+        assert_eq!(
+            parse("packages disable greeter").unwrap(),
+            Command::PackagesDisable {
+                name: "greeter".to_string()
+            }
+        );
+        // Neither destroys anything, so neither has a confirmation for --yes to answer.
+        for line in [
+            "packages enable",
+            "packages enable greeter extra",
+            "packages enable --yes",
+            "packages disable",
+            "packages disable greeter extra",
+            "packages disable --all",
+        ] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn packages_remove_takes_one_name_and_the_confirmation_flag_in_either_order() {
+        assert_eq!(
+            parse("packages remove greeter").unwrap(),
+            Command::PackagesRemove {
+                name: "greeter".to_string(),
+                yes: false
+            }
+        );
+        for line in [
+            "packages remove greeter --yes",
+            "packages remove --yes greeter",
+        ] {
+            assert_eq!(
+                parse(line).unwrap(),
+                Command::PackagesRemove {
+                    name: "greeter".to_string(),
+                    yes: true
+                },
+                "{line}"
             );
+        }
+        for line in [
+            "packages remove",
+            "packages remove --yes",
+            "packages remove one two",
+            "packages remove greeter --force",
+        ] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn packages_without_a_recognised_verb_names_the_seven_that_exist() {
+        for line in ["packages", "packages install greeter", "packages update"] {
+            let error = parse(line).unwrap_err().to_string();
+            for verb in ["add", "build", "disable", "enable", "list", "new", "remove"] {
+                assert!(error.contains(verb), "{line}: {error}");
+            }
         }
     }
 
     #[test]
     fn the_help_text_documents_packages() {
-        assert!(USAGE_ALL.contains("lyracore packages add"), "{USAGE_ALL}");
-        assert!(USAGE_ALL.contains("lyracore packages build"), "{USAGE_ALL}");
-        assert!(USAGE_ALL.contains("lyracore packages list"), "{USAGE_ALL}");
-        assert!(USAGE_ALL.contains("lyracore packages new"), "{USAGE_ALL}");
+        for verb in ["add", "build", "disable", "enable", "list", "new", "remove"] {
+            assert!(
+                USAGE_ALL.contains(&format!("lyracore packages {verb}")),
+                "{USAGE_ALL}"
+            );
+        }
     }
 
     // ---- update ----
@@ -1315,8 +1456,11 @@ mod tests {
             "lyracore client sync",
             "lyracore packages add",
             "lyracore packages build",
+            "lyracore packages disable",
+            "lyracore packages enable",
             "lyracore packages list",
             "lyracore packages new",
+            "lyracore packages remove",
             "lyracore character gm",
             "lyracore update",
             "--password-stdin",

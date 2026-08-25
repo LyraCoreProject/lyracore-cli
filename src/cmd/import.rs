@@ -103,6 +103,12 @@ impl TtyPrompt {
         }
     }
 
+    pub const fn packages_remove() -> Self {
+        Self {
+            no_terminal_remedy: "pass --yes to confirm the deletion in advance",
+        }
+    }
+
     fn unavailable(&self) -> Error {
         Error::Usage(format!(
             "no terminal to ask on. Re-run attached to a terminal, or {}.",

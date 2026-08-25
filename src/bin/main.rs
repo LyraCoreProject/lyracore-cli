@@ -123,6 +123,21 @@ fn run(args: &[String]) -> Result<i32> {
         Command::PackagesBuild => {
             cmd::packages::build::run(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
         }
+        // The lifecycle verbs take no process runner: they move or delete a directory and print
+        // what is left to run, so there is nothing for them to execute.
+        Command::PackagesEnable { name } => {
+            cmd::packages::lifecycle::enable(&ProjectLayout::discover()?, &name).map(|_| EXIT_OK)
+        }
+        Command::PackagesDisable { name } => {
+            cmd::packages::lifecycle::disable(&ProjectLayout::discover()?, &name).map(|_| EXIT_OK)
+        }
+        Command::PackagesRemove { name, yes } => cmd::packages::lifecycle::remove(
+            &ProjectLayout::discover()?,
+            &cmd::import::TtyPrompt::packages_remove(),
+            &name,
+            yes,
+        )
+        .map(|_| EXIT_OK),
         Command::CharacterGm { name, enabled } => {
             let project = ProjectLayout::discover()?;
             cmd::character::gm(&project, &runner, &http, &name, enabled).map(|_| EXIT_OK)
