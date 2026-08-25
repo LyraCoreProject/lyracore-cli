@@ -53,9 +53,9 @@ pub struct ProvenanceStamp {
     pub source_kind: String,
     /// The absolute folder the Package was copied FROM, or the repository URL it was cloned from.
     pub source: String,
-    /// The exact commit a Git Package Source was installed at. Empty for every other kind: a local
-    /// folder and a scaffold have no revision, so there is nothing for `packages update` to advance
-    /// from and nothing to report.
+    /// The exact commit a Git Package Source or an Official Package Source was installed at. Empty
+    /// for a local folder and a scaffold: neither has a revision, so there is nothing for
+    /// `packages update` to advance from and nothing to report.
     pub revision: String,
     /// [`content_identity`] of the copied tree at install time.
     pub content_identity: String,

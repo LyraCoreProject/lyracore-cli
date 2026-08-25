@@ -27,7 +27,7 @@
 pub mod build;
 pub mod git;
 pub mod lifecycle;
-pub mod official;
+pub(crate) mod official;
 pub mod review;
 pub mod stamp;
 pub(crate) mod tree;
@@ -284,7 +284,9 @@ fn add_folder(
     let source = std::fs::canonicalize(source).map_err(|e| {
         Error::Usage(format!(
             "cannot read the folder to install: {source} ({e}). `packages add` takes a path to a \
-             Package folder on this machine, or the URL of a repository whose root is one Package."
+             Package folder on this machine, the URL of a repository whose root is one Package, \
+             or (a bare word only) a name to resolve against the Official Package Collection — \
+             and '{source}' is not a usable Package name."
         ))
     })?;
     if !source.is_dir() {

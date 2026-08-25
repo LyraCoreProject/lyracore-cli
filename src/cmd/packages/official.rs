@@ -73,6 +73,12 @@ fn resolve(collection: &Path, name: &PackageName) -> Result<PathBuf> {
     let mut top_level = Vec::new();
     for entry in std::fs::read_dir(collection)? {
         let entry = entry?;
+        // `.git` and a symlinked entry are both excluded here as a side effect of what they are,
+        // not by name: `.git` can never parse as a `PackageName` (it does not start with a
+        // letter), and `DirEntry::file_type` reports a symlink's own type without following it, so
+        // `is_dir()` is false for one even when it points at a directory. Neither is ever a
+        // candidate to match or to name in a near-miss refusal — the collection is a fresh clone
+        // this command deletes on its way out, so nothing here is ever followed outside it.
         if entry.file_type()?.is_dir() {
             top_level.push(entry.file_name().to_string_lossy().into_owned());
         }
@@ -92,7 +98,8 @@ fn resolve(collection: &Path, name: &PackageName) -> Result<PathBuf> {
         Some(near) => format!(
             "no Package called '{}' in the Official Package Collection ({COLLECTION_URL}). It \
              carries '{near}', which folds onto the same module `pkg_{}` — '-' and '_' are the \
-             same character to the build. Nothing was installed.",
+             same character to the build. Did you mean `lyracore packages add {near}`? Nothing \
+             was installed.",
             name.as_str(),
             name.rust_ident()
         ),
@@ -165,16 +172,18 @@ mod tests {
     }
 
     #[test]
-    fn the_collection_clone_itself_is_never_installed() {
-        // Only `greeter/` may land in the inventory; the collection's own `.git` and its sibling
-        // Package directories must not.
+    fn the_collection_clone_scratch_space_does_not_survive_the_install() {
+        // The clone (the whole collection, including `.git` at its root and every sibling
+        // directory `greeter` never named) lands under `.lyracore/package-clones/`. Nothing of it
+        // may still be on disk once the install returns — `an_unknown_name...` and
+        // `a_known_top_level_package_installs_by_bare_name` cover that only the named directory's
+        // OWN content reaches the inventory; this covers that the scratch space itself is gone.
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let stack = repository(&collection(&tmp, &["greeter", "logger"]), FIRST);
 
         super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true).unwrap();
 
-        assert!(!project.packages_dir().join("greeter/.git").exists());
         let clones = project.state_dir.join("package-clones");
         assert!(
             !clones.exists() || std::fs::read_dir(clones).unwrap().next().is_none(),
@@ -236,39 +245,21 @@ mod tests {
 
     #[test]
     fn a_collection_that_moves_on_does_not_change_what_is_already_installed() {
+        // The collection genuinely advances to SECOND with different content, and `packages
+        // update` is actually invoked against it — the strong form of "cannot silently change an
+        // installed revision": not just that nothing re-clones on its own, but that asking this
+        // checkout to advance it is refused, with the old commit and content untouched.
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let root = collection(&tmp, &["greeter"]);
         let stack = repository(&root, FIRST);
-
         super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true).unwrap();
         let installed = project.packages_dir().join("greeter");
         let before = ProvenanceStamp::read(&installed).unwrap();
         assert_eq!(before.revision, FIRST);
 
-        // The collection moves on: same directory, different content, a later commit. Nothing in
-        // this checkout re-clones it on its own.
         std::fs::write(root.join("greeter/src/mod.rs"), "pub fn greeter_v2() {}\n").unwrap();
-
-        assert_eq!(
-            ProvenanceStamp::read(&installed),
-            Some(before),
-            "an installed revision does not move on its own"
-        );
-        assert!(
-            !std::fs::read_to_string(installed.join("src/mod.rs"))
-                .unwrap()
-                .contains("greeter_v2"),
-            "the collection's later commit must not reach an already-installed Package"
-        );
-    }
-
-    #[test]
-    fn packages_update_refuses_an_official_source_package_by_name() {
-        let tmp = TempDir::new().unwrap();
-        let project = checkout(&tmp);
-        let stack = repository(&collection(&tmp, &["greeter"]), FIRST);
-        super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true).unwrap();
+        let stack = repository(&root, SECOND);
 
         let error = super::super::git::update(
             &project,
@@ -280,17 +271,24 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
-        assert!(error.to_string().contains("'official'"), "{error}");
         assert!(
-            error
-                .to_string()
-                .contains("only advances Git Package Sources"),
+            error.to_string().contains("Official Package Collection"),
             "{error}"
         );
-        let recorded = ProvenanceStamp::read(&project.packages_dir().join("greeter")).unwrap();
+        assert!(
+            error.to_string().contains("pinned at install time"),
+            "{error}"
+        );
         assert_eq!(
-            recorded.revision, FIRST,
-            "the refusal must not touch the recorded revision"
+            ProvenanceStamp::read(&installed),
+            Some(before),
+            "the refusal must not touch the recorded revision or content identity"
+        );
+        assert!(
+            !std::fs::read_to_string(installed.join("src/mod.rs"))
+                .unwrap()
+                .contains("greeter_v2"),
+            "the collection's later commit must not reach an already-installed Package"
         );
     }
 

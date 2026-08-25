@@ -18,7 +18,9 @@
 //!
 //! Neither verb publishes anything or synchronizes a client.
 
-use super::stamp::{self, ProvenanceStamp, SOURCE_GIT, SOURCE_LOCAL, SOURCE_SCAFFOLD};
+use super::stamp::{
+    self, ProvenanceStamp, SOURCE_GIT, SOURCE_LOCAL, SOURCE_OFFICIAL, SOURCE_SCAFFOLD,
+};
 use super::{
     confirm, find, install_tree, inventory, review::TrustReview, shell_quote, InstalledPackage,
     Origin, PackageName, PackageState,
@@ -437,9 +439,12 @@ fn update_one(
 
 /// The Git Package Source an installed Package records, or a refusal naming what it actually is.
 ///
-/// `update` advances a recorded commit of a recorded repository. Every other Package Source has
-/// nothing to advance, so this is where a local folder, a scaffold and a Package Source kind this
-/// version does not know are each turned away in their own words rather than silently skipped.
+/// `update` advances a recorded commit of a recorded repository. A local folder and a scaffold have
+/// no repository to advance from at all. An Official Package Source does — its collection moves on
+/// like any other — but its commit is pinned at install time by design, not by an accident of this
+/// version lacking the code; that is what a later commit to the collection cannot silently install.
+/// A Package Source kind this version does not otherwise know is turned away by name too, rather
+/// than silently skipped or cloned on the chance that it might be a repository.
 fn git_backing(package: &InstalledPackage) -> Result<&ProvenanceStamp> {
     let name = package.name.as_str();
     let Some(recorded) = package.stamp.as_ref() else {
@@ -471,6 +476,13 @@ fn git_backing(package: &InstalledPackage) -> Result<&ProvenanceStamp> {
         SOURCE_SCAFFOLD => Err(Error::Usage(format!(
             "cannot update '{name}': it was scaffolded from this checkout's reference Package and \
              has no Package Source. It is yours to edit in place. Nothing was changed."
+        ))),
+        SOURCE_OFFICIAL => Err(Error::Usage(format!(
+            "cannot update '{name}': it was installed from the Official Package Collection, and \
+             this command does not advance that kind. Its commit is pinned at install time on \
+             purpose, so a later commit to the collection cannot silently change what is \
+             installed. To pick up a newer one, disable and remove it, then `lyracore packages \
+             add {name}` again. Nothing was changed."
         ))),
         "" => Err(Error::Usage(format!(
             "cannot update '{name}': its stamp records no Package Source kind, so nothing says \
@@ -997,9 +1009,14 @@ mod tests {
         )
         .unwrap();
         stamped(&project, "scaffolded", SOURCE_SCAFFOLD, "packages/example/");
-        // The Package Source kind #302 will add. Until it exists, a stamp naming it must be turned
-        // away by name rather than cloned as if it were a repository.
-        stamped(&project, "shipped", "official", "lyracore/shipped");
+        // Installed from the Official Package Collection: has a real repository behind it, but
+        // this command still refuses it by name, because its commit is pinned at install time.
+        stamped(
+            &project,
+            "shipped",
+            SOURCE_OFFICIAL,
+            crate::cmd::packages::official::COLLECTION_URL,
+        );
         stamped(&project, "kindless", "", "");
         stamped(&project, "urlless", SOURCE_GIT, "");
         stamped(&project, "not-a-url", SOURCE_GIT, "/home/dev/greeter");
@@ -1022,7 +1039,8 @@ mod tests {
 
         assert!(refusal("keeper").contains("a folder on this machine"));
         assert!(refusal("scaffolded").contains("scaffolded"));
-        assert!(refusal("shipped").contains("'official'"));
+        assert!(refusal("shipped").contains("Official Package Collection"));
+        assert!(refusal("shipped").contains("pinned at install time"));
         assert!(refusal("handmade").contains("no readable provenance stamp"));
         assert!(refusal("kindless").contains("no Package Source kind"));
         // A stamp that claims a repository but does not name one, or names something that is not a
