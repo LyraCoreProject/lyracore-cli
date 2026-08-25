@@ -4,11 +4,12 @@
 //! and/or `client/` is the repository itself, not a directory inside it.
 //!
 //! AN INSTALLED PACKAGE IS NOT A WORKING COPY. The clone lands in this checkout's scratch space,
-//! `.git` is stripped, and what gets installed is an ordinary copied tree, exactly like a local
-//! folder install. `preflight`, `publish` and `client sync` must read a fixed tree; a working copy
-//! would give them whatever the last git operation in it left behind, and `packages list` could no
-//! longer tell an operator's own edits from a checked-out branch. That is also why `update`
-//! re-clones instead of pulling in place: there is nothing in the inventory to pull.
+//! and what gets installed is a copy of its tree without the `.git` — the exclusion `tree::collect`
+//! already applies to a local folder that happens to be a repository, so the clone needs no special
+//! case. `preflight`, `publish` and `client sync` must read a fixed tree; a working copy would give
+//! them whatever the last git operation in it left behind, and `packages list` could no longer tell
+//! an operator's own edits from a checked-out branch. That is also why `update` re-clones instead
+//! of pulling in place: there is nothing in the inventory to pull.
 //!
 //! `update` therefore advances a RECORDED commit rather than a working copy: the stamp says which
 //! repository and which commit the installed tree came from, and the update replaces the whole
@@ -98,7 +99,7 @@ fn is_scp_style(url: &str) -> bool {
 }
 
 /// A repository cloned into this checkout's scratch space, at the commit its default branch points
-/// at right now. Dropping it removes the clone; nothing outside this file ever sees a `.git`.
+/// at right now. Dropping it removes the clone.
 struct RepositoryClone {
     dir: PathBuf,
     revision: String,
@@ -162,10 +163,6 @@ impl RepositoryClone {
             )));
         }
         clone.revision = revision;
-
-        // From here the clone is an ordinary folder. The repository half is the one thing that must
-        // not reach an inventory, so it goes before anything reads, hashes or reviews the tree.
-        remove_git_dir(&clone.dir)?;
         Ok(clone)
     }
 
@@ -182,21 +179,6 @@ impl Drop for RepositoryClone {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-/// Remove a clone's `.git`. It is a directory in a fresh clone and a file in a linked worktree, and
-/// the tree is about to be hashed and installed either way.
-fn remove_git_dir(clone: &Path) -> Result<()> {
-    let path = clone.join(".git");
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-        return Ok(());
-    };
-    if metadata.is_dir() {
-        std::fs::remove_dir_all(&path)?;
-    } else {
-        std::fs::remove_file(&path)?;
-    }
-    Ok(())
 }
 
 /// Install a Package from a Git Package Source: clone it, then run the same installation contract a
@@ -718,7 +700,8 @@ mod tests {
     fn what_is_installed_is_a_tree_and_not_a_working_copy() {
         // An installed Package with a .git would give `preflight`, `publish` and `client sync`
         // whatever the last git operation in it left behind, and `packages list` could no longer
-        // tell an operator's edits from a checked-out branch.
+        // tell an operator's edits from a checked-out branch. The fake clone writes a .git for
+        // exactly this assertion to have something to catch.
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let stack = repository(&candidate(&tmp, "anything"), FIRST);
