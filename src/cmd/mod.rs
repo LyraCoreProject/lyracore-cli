@@ -148,14 +148,13 @@ USAGE:
                                                Root only: it updates the checkout to origin/main
                                                (refusing over a dirty working tree, as `update`
                                                does), checks the host prerequisites the unit
-                                               names, refuses when
-                                               another active service already owns the same data
-                                               directory or listen address, installs the unit
-                                               into /etc/systemd/system, reloads systemd,
-                                               enables and restarts the node, then verifies its
-                                               ActiveState, LimitNOFILE and stderr destination.
-                                               It never creates, moves or deletes the node's
-                                               data directory
+                                               names, refuses when another active service already
+                                               owns the same data directory or listen address,
+                                               installs the unit into /etc/systemd/system, reloads
+                                               systemd, enables and restarts the node, then
+                                               verifies its ActiveState, LimitNOFILE and stderr
+                                               destination. It never creates, moves or deletes the
+                                               node's data directory
   lyracore update                              pull the latest checkout in place and restart the
                                                local dev stack (refuses over a dirty working tree)
 
