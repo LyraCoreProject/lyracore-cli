@@ -22,6 +22,31 @@ use crate::{Error, Result};
 const LYRACORE_CLI_PIN: &str = ".lyracore-cli-rev";
 
 pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
+    if pull(project, runner)? == Checkout::AlreadyCurrent {
+        return Ok(());
+    }
+
+    println!();
+    println!("this does not restart anything for you. To rebuild the gateway and republish");
+    println!("every fixture database, run:");
+    println!("  ./lyracore dev down && ./lyracore dev up");
+    Ok(())
+}
+
+/// Whether the checkout moved. `update` prints its restart advice only when it did; `service
+/// reconcile` ignores it, because deployment drift is independent of git drift.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Checkout {
+    AlreadyCurrent,
+    Updated,
+}
+
+/// Move the checkout to `origin/main`, or report that it is already there.
+///
+/// Shared with `service reconcile`, which does exactly this git work before it touches the host:
+/// one deployment reconciliation, so the two cannot drift into two different ideas of what
+/// "updated" means. The dirty-tree refusal above blocks BOTH callers.
+pub(crate) fn pull(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<Checkout> {
     println!("· fetching origin...");
     runner.run_and_wait(&git(project).arg("fetch").arg("origin"))?;
 
@@ -34,7 +59,7 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     let upstream = upstream.trim().to_string();
     if head == upstream {
         println!("already up to date.");
-        return Ok(());
+        return Ok(Checkout::AlreadyCurrent);
     }
 
     let old_pin = read_pin(project);
@@ -50,12 +75,7 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
              release automatically."
         );
     }
-
-    println!();
-    println!("this does not restart anything for you. To rebuild the gateway and republish");
-    println!("every fixture database, run:");
-    println!("  ./lyracore dev down && ./lyracore dev up");
-    Ok(())
+    Ok(Checkout::Updated)
 }
 
 /// A commit sha, shortened for the "updated X → Y" line — the conventional 7 characters, or
@@ -96,8 +116,40 @@ fn read_pin(project: &ProjectLayout) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The two checkout states `pull` distinguishes, shared with `service reconcile`'s tests: a
+/// checkout already on `origin/main`, and one behind it.
+#[cfg(test)]
+pub(crate) mod testing {
+    use crate::proc::fake::FakeStack;
+
+    pub fn same_sha_stack() -> FakeStack {
+        FakeStack::new()
+            .with_stdout(
+                "rev-parse HEAD",
+                "aaaa1111111111111111111111111111111111111\n",
+            )
+            .with_stdout(
+                "rev-parse origin/main",
+                "aaaa1111111111111111111111111111111111111\n",
+            )
+    }
+
+    pub fn ahead_stack() -> FakeStack {
+        FakeStack::new()
+            .with_stdout(
+                "rev-parse HEAD",
+                "aaaa1111111111111111111111111111111111111\n",
+            )
+            .with_stdout(
+                "rev-parse origin/main",
+                "bbbb2222222222222222222222222222222222222\n",
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::{ahead_stack, same_sha_stack};
     use super::*;
     use crate::proc::fake::{Call, FakeStack};
     use tempfile::TempDir;
@@ -105,24 +157,6 @@ mod tests {
     fn project(tmp: &TempDir) -> ProjectLayout {
         std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         ProjectLayout::from_root(tmp.path()).unwrap()
-    }
-
-    fn same_sha_stack() -> FakeStack {
-        FakeStack::new()
-            .with_stdout("rev-parse HEAD", "aaaa1111111111111111111111111111111111111\n")
-            .with_stdout(
-                "rev-parse origin/main",
-                "aaaa1111111111111111111111111111111111111\n",
-            )
-    }
-
-    fn ahead_stack() -> FakeStack {
-        FakeStack::new()
-            .with_stdout("rev-parse HEAD", "aaaa1111111111111111111111111111111111111\n")
-            .with_stdout(
-                "rev-parse origin/main",
-                "bbbb2222222222222222222222222222222222222\n",
-            )
     }
 
     // ---- the dirty-tree refusal ----
@@ -138,7 +172,10 @@ mod tests {
         assert!(error.contains("commit or stash"), "{error}");
         assert_eq!(
             stack.rendered(),
-            vec!["git fetch origin".to_string(), "git status --porcelain".to_string()],
+            vec![
+                "git fetch origin".to_string(),
+                "git status --porcelain".to_string()
+            ],
             "no reset may run against a dirty tree"
         );
     }
@@ -233,7 +270,12 @@ mod tests {
         for call in stack.calls() {
             let Call::Wait(spec) = call else { continue };
             if spec.program() == "git" {
-                assert_eq!(spec.cwd_value(), Some(project.root.as_path()), "{}", spec.render());
+                assert_eq!(
+                    spec.cwd_value(),
+                    Some(project.root.as_path()),
+                    "{}",
+                    spec.render()
+                );
             }
         }
     }

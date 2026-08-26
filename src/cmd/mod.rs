@@ -10,6 +10,7 @@ pub mod packages;
 pub mod preflight;
 pub mod production;
 pub mod publish;
+pub mod service;
 pub mod update;
 
 use crate::project::{ClientBind, Component, Topology};
@@ -142,6 +143,17 @@ USAGE:
   lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
                                                read-only production topology, schema, connection,
                                                realm-core and listener verdicts
+  lyracore service reconcile                   make a PRODUCTION host's spacetimedb-standalone
+                                               service match the unit tracked in the checkout.
+                                               Root only: it updates the checkout, checks the
+                                               host prerequisites the unit names, refuses when
+                                               another active service already owns the same data
+                                               directory or listen address, installs the unit
+                                               into /etc/systemd/system, reloads systemd,
+                                               enables and restarts the node, then verifies its
+                                               ActiveState, LimitNOFILE and stderr destination.
+                                               It never creates, moves or deletes the node's
+                                               data directory
   lyracore update                              pull the latest checkout in place and restart the
                                                local dev stack (refuses over a dirty working tree)
 
@@ -217,6 +229,9 @@ pub enum Command {
         yes: bool,
     },
     ProductionStatus(production::StatusOptions),
+    /// The one host-mutating verb on this surface, deliberately its own: `update` stays a
+    /// contributor's git-pull replacement and owns no service.
+    ServiceReconcile,
     Update,
     Help,
     HelpAll,
@@ -382,6 +397,19 @@ impl Command {
                  DATABASE ..."
                     .to_string(),
             )),
+
+            // One subverb today. The catch-alls below name it, the way `client` and `character`
+            // do, rather than reporting "unknown command" for a group that exists.
+            ["service", "reconcile"] => Ok(Command::ServiceReconcile),
+            ["service", "reconcile", other, ..] => Err(Error::Usage(format!(
+                "`service reconcile` takes no arguments (got '{other}')"
+            ))),
+            ["service"] => Err(Error::Usage(
+                "`service` needs a subcommand: reconcile".to_string(),
+            )),
+            ["service", other, ..] => Err(Error::Usage(format!(
+                "unknown `service` subcommand '{other}' — expected reconcile"
+            ))),
 
             ["update"] => Ok(Command::Update),
             ["update", other, ..] => Err(Error::Usage(format!(
@@ -1485,6 +1513,52 @@ mod tests {
         }
     }
 
+    // ---- service ----
+
+    #[test]
+    fn service_reconcile_takes_no_arguments() {
+        assert_eq!(
+            parse("service reconcile").unwrap(),
+            Command::ServiceReconcile
+        );
+        for line in [
+            "service reconcile --force",
+            "service reconcile spacetimedb-standalone.service",
+        ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+        }
+    }
+
+    #[test]
+    fn service_without_a_recognised_verb_names_reconcile_as_the_one_that_exists() {
+        for line in [
+            "service",
+            "service install",
+            "service restart",
+            "service --bogus",
+        ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+            assert!(error.to_string().contains("reconcile"), "{line}: {error}");
+        }
+    }
+
+    /// The verb mutates a production host, so the help has to say what it does to one: which
+    /// service, that systemd is reloaded and restarted, what is verified, and that it needs root.
+    #[test]
+    fn the_help_text_documents_what_service_reconcile_changes() {
+        for phrase in [
+            "lyracore service reconcile",
+            "spacetimedb-standalone",
+            "/etc/systemd/system",
+            "LimitNOFILE",
+            "Root only",
+        ] {
+            assert!(USAGE_ALL.contains(phrase), "{phrase}: {USAGE_ALL}");
+        }
+    }
+
     // ---- update ----
 
     #[test]
@@ -1496,6 +1570,28 @@ mod tests {
     #[test]
     fn the_help_text_documents_update() {
         assert!(USAGE_ALL.contains("lyracore update"), "{USAGE_ALL}");
+    }
+
+    /// `update` is a contributor's git-pull replacement. Reconciling a host is `service
+    /// reconcile`'s job, so `update`'s whole help entry must not grow a word about services, and
+    /// must not grow at all: it is the two lines it has always been.
+    #[test]
+    fn the_update_help_entry_says_nothing_about_services_and_has_not_grown() {
+        let lines: Vec<&str> = USAGE_ALL.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.contains("lyracore update"))
+            .expect("update is in the full help");
+        let entry: Vec<&str> = lines[start..]
+            .iter()
+            .take_while(|line| !line.trim().is_empty())
+            .copied()
+            .collect();
+        assert_eq!(entry.len(), 2, "{entry:?}");
+        let entry = entry.join(" ");
+        for absent in ["service", "systemd", "reconcile", "install", "root", "sudo"] {
+            assert!(!entry.contains(absent), "{absent}: {entry}");
+        }
     }
 
     // ---- help ----
@@ -1539,6 +1635,7 @@ mod tests {
             "lyracore publish",
             "lyracore config",
             "character gm",
+            "lyracore service",
             "lyracore update",
             "dev logs",
             "dev smoke",
@@ -1572,6 +1669,7 @@ mod tests {
             "lyracore packages new",
             "lyracore packages remove",
             "lyracore character gm",
+            "lyracore service reconcile",
             "lyracore update",
             "--password-stdin",
         ] {

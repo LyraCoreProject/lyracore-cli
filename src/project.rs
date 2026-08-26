@@ -341,6 +341,12 @@ impl ProjectLayout {
     /// in the core repo; this CLI only orders its modes.
     pub const IMPORTER_BIN: &'static str = "target/debug/lyracore-importer";
 
+    /// The standalone supervisor artifact tracked in the checkout, installed by `service
+    /// reconcile`. The service contract a host must end up with — descriptor limit, stderr
+    /// destination, data directory, listen address — is read out of THIS file, so the CLI never
+    /// carries a second copy of it that can drift.
+    pub const STANDALONE_UNIT: &'static str = "deploy/systemd/spacetimedb-standalone.service";
+
     /// The ENABLED Package inventory: the drop-in folders `module/build.rs` discovers and compiles
     /// into the module wasm, and the `client/` halves `importer --pack-client` packs. A Package is
     /// enabled by being here and by nothing else — there is no manifest, so this directory listing
@@ -494,6 +500,10 @@ impl ProjectLayout {
 
     pub fn datascript_types_dir(&self) -> PathBuf {
         self.datascripts_dir().join(Self::DATASCRIPT_TYPES_DIR)
+    }
+
+    pub fn standalone_unit(&self) -> PathBuf {
+        self.root.join(Self::STANDALONE_UNIT)
     }
 
     pub fn rust_toolchain_file(&self) -> PathBuf {
