@@ -212,26 +212,26 @@ fn check_spacetime() -> Check {
 /// `lyracore packages build` runs Datascript typegen and the `tsc --noEmit` gate through it. An
 /// Operator applying a prebuilt Package Delta, and anyone running `dev up`, need no JavaScript
 /// toolchain at all — so a machine without Bun is a machine that cannot author Datascripts, not a
-/// broken one.
+/// broken one. `packages build` compares the same banner against the same pin below, through
+/// [`bun_version_check`], but treats a bad answer as a hard failure: it is the one command that
+/// actually runs Bun.
 fn check_bun() -> Check {
     let text = version_output("bun", &["--version"]);
     check_bun_banner(text.as_deref())
 }
 
 fn check_bun_banner(text: Option<&str>) -> Check {
-    let install = format!("`curl -fsSL https://bun.sh/install | bash -s \"bun-v{REQUIRED_BUN}\"`");
-    let Some(text) = text else {
-        return Check::warn(
+    let install = format!("`{}`", bun_install_hint());
+    match bun_version_check(text) {
+        BunVersionCheck::Pinned(found) => Check::pass("Bun", format!("{found} (pinned)")),
+        BunVersionCheck::Missing => Check::warn(
             "Bun",
             format!(
                 "`bun` not found — needed only by `lyracore packages build` (Datascript typegen \
                  and typecheck); install the pinned {REQUIRED_BUN} with {install}"
             ),
-        );
-    };
-    match parse_bare_version(text) {
-        Some(found) if found == REQUIRED_BUN => Check::pass("Bun", format!("{found} (pinned)")),
-        Some(found) => Check::warn(
+        ),
+        BunVersionCheck::Mismatched(found) => Check::warn(
             "Bun",
             format!(
                 "found {found}, but this checkout's Datascript toolchain is pinned to \
@@ -239,7 +239,7 @@ fn check_bun_banner(text: Option<&str>) -> Check {
                  build` is not verified with a different Bun runtime"
             ),
         ),
-        None => Check::warn(
+        BunVersionCheck::Unparsable => Check::warn(
             "Bun",
             format!(
                 "could not read a version from `bun --version`; expected exactly {REQUIRED_BUN}. \
@@ -247,6 +247,34 @@ fn check_bun_banner(text: Option<&str>) -> Check {
             ),
         ),
     }
+}
+
+/// How a `bun --version` banner (or its absence) compares against [`REQUIRED_BUN`].
+///
+/// The one place that comparison is expressed: `doctor` turns it into a warning, `packages build`
+/// turns the same answer into a hard failure. Neither call site re-derives the verdict itself.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BunVersionCheck {
+    Pinned(Version),
+    Missing,
+    Mismatched(Version),
+    Unparsable,
+}
+
+pub fn bun_version_check(text: Option<&str>) -> BunVersionCheck {
+    let Some(text) = text else {
+        return BunVersionCheck::Missing;
+    };
+    match parse_bare_version(text) {
+        Some(found) if found == REQUIRED_BUN => BunVersionCheck::Pinned(found),
+        Some(found) => BunVersionCheck::Mismatched(found),
+        None => BunVersionCheck::Unparsable,
+    }
+}
+
+/// The exact-version reinstall command every Bun check points an author at.
+pub fn bun_install_hint() -> String {
+    format!("curl -fsSL https://bun.sh/install | bash -s \"bun-v{REQUIRED_BUN}\"")
 }
 
 /// Bun's banner is exactly `x.y.z`; unlike the chatty SpacetimeDB banner, trailing components or
@@ -342,9 +370,7 @@ fn check_client_data(project: Option<&ProjectLayout>) -> Check {
         Err(e) => {
             return Check::warn(
                 "client data",
-                format!(
-                    "{e} — re-set with `lyracore config set client-data <path>`"
-                ),
+                format!("{e} — re-set with `lyracore config set client-data <path>`"),
             )
         }
     };
