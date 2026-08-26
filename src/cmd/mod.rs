@@ -145,8 +145,10 @@ USAGE:
                                                realm-core and listener verdicts
   lyracore service reconcile                   make a PRODUCTION host's spacetimedb-standalone
                                                service match the unit tracked in the checkout.
-                                               Root only: it updates the checkout, checks the
-                                               host prerequisites the unit names, refuses when
+                                               Root only: it updates the checkout to origin/main
+                                               (refusing over a dirty working tree, as `update`
+                                               does), checks the host prerequisites the unit
+                                               names, refuses when
                                                another active service already owns the same data
                                                directory or listen address, installs the unit
                                                into /etc/systemd/system, reloads systemd,
@@ -229,8 +231,8 @@ pub enum Command {
         yes: bool,
     },
     ProductionStatus(production::StatusOptions),
-    /// The one host-mutating verb on this surface, deliberately its own: `update` stays a
-    /// contributor's git-pull replacement and owns no service.
+    /// The one root-only, system-state verb on this surface, deliberately its own: `update` stays
+    /// a contributor's git-pull replacement and owns no service.
     ServiceReconcile,
     Update,
     Help,

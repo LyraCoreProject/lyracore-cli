@@ -44,8 +44,8 @@ pub(crate) enum Checkout {
 /// Move the checkout to `origin/main`, or report that it is already there.
 ///
 /// Shared with `service reconcile`, which does exactly this git work before it touches the host:
-/// one deployment reconciliation, so the two cannot drift into two different ideas of what
-/// "updated" means. The dirty-tree refusal above blocks BOTH callers.
+/// one reconciliation, so the two cannot drift into two different ideas of what "updated" means.
+/// `refuse_if_dirty` below blocks BOTH callers.
 pub(crate) fn pull(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<Checkout> {
     println!("· fetching origin...");
     runner.run_and_wait(&git(project).arg("fetch").arg("origin"))?;
@@ -116,8 +116,8 @@ fn read_pin(project: &ProjectLayout) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The two checkout states `pull` distinguishes, shared with `service reconcile`'s tests: a
-/// checkout already on `origin/main`, and one behind it.
+/// Fake stacks for the two checkout states `pull` distinguishes, shared with `service reconcile`'s
+/// tests: a checkout already on `origin/main`, and one behind it.
 #[cfg(test)]
 pub(crate) mod testing {
     use crate::proc::fake::FakeStack;

@@ -33,13 +33,19 @@ const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
 /// Update the checkout, install the tracked unit, reload systemd, enable it, restart it, and
 /// verify the result.
 ///
-/// Refuses — before touching anything — when the invocation is not root, when the checkout has
+/// Refuses — before the HOST is touched — when the invocation is not root, when the checkout has
 /// local work a reset would discard, when a host prerequisite is missing, or when another active
 /// service already owns the node's data directory or listen address.
+///
+/// "Before the host is touched" and not "before anything": the checkout reset below runs first, on
+/// purpose. The unit and the contract to check the host against are read out of the UPDATED
+/// checkout, so checking the host before the reset would check it against a contract this command
+/// is not about to install. A refusal after that point therefore leaves the checkout on
+/// `origin/main` with the host untouched, which is the state an operator can simply re-run from.
 pub fn reconcile(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
-    // Fail fast, before the network and before anything on disk moves: every later step writes to
-    // /etc or drives systemd, and a half-done privileged plan is worse than one that never
-    // started.
+    // Fail fast, before the network and before anything on disk moves: this plan resets the
+    // checkout and then writes to /etc, and a half-done privileged plan is worse than one that
+    // never started.
     require_root(runner)?;
     // Deployment drift is independent of git drift: a host can sit exactly on origin/main with the
     // wrong unit installed, or none at all. So the reconciliation below runs either way.
@@ -79,8 +85,9 @@ fn reconcile_unit(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result
     let contract = UnitContract::parse(&text)?;
     let unit = source
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| ProjectLayout::STANDALONE_UNIT.to_string());
+        .expect("STANDALONE_UNIT names a file")
+        .to_string_lossy()
+        .to_string();
     let target = format!("{SYSTEMD_UNIT_DIR}/{unit}");
 
     println!("· checking host prerequisites...");
@@ -89,7 +96,7 @@ fn reconcile_unit(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result
     println!("· looking for a service that already owns this node...");
     refuse_conflicting_service(&unit, &contract, runner)?;
 
-    println!("· installing {unit}...");
+    println!("· installing and enabling {unit}...");
     runner.run_and_wait(
         &CommandSpec::new("install")
             .arg("-o")
@@ -120,7 +127,13 @@ fn reconcile_unit(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result
         })?;
 
     verify(&unit, &contract, runner)?;
-    println!("{unit} is active and matches the tracked service contract.");
+    // Names the three properties `verify` actually read back, rather than claiming the whole
+    // contract: a drop-in under /etc/systemd/system/<unit>.d/ can still override ExecStart, and
+    // this command does not read that back today.
+    println!(
+        "{unit} is active, with the descriptor limit and stderr destination the tracked unit \
+         declares."
+    );
     Ok(())
 }
 
@@ -545,6 +558,27 @@ WantedBy=multi-user.target
         assert_eq!(stack.rendered(), expected);
     }
 
+    /// The same refusal from a checkout that was BEHIND `origin/main`, which is the case that
+    /// shows the real ordering: the reset lands first, deliberately, because the unit to install
+    /// is read out of the UPDATED checkout. The host is still untouched afterwards.
+    #[test]
+    fn the_reset_lands_before_the_unit_is_read_and_leaves_the_host_untouched() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        let stack = reconcilable_host(ahead_stack());
+
+        let error = reconcile(&project, &stack.runner())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(ProjectLayout::STANDALONE_UNIT), "{error}");
+        let mut expected = vec!["id -u".to_string()];
+        expected.extend(git_steps());
+        expected.push("git reset --hard origin/main".to_string());
+        assert_eq!(stack.rendered(), expected);
+    }
+
     // ---- the root check ----
 
     #[test]
@@ -687,18 +721,20 @@ WantedBy=multi-user.target
 
     // ---- missing host prerequisites ----
 
-    /// Each prerequisite failure must stop BEFORE the install, so a broken host is never left with
-    /// a new unit file or a restarted service.
+    /// Each prerequisite failure must stop BEFORE the host changes, so a broken host is never left
+    /// with a new unit file, a boot-time symlink, or a restarted service.
+    ///
+    /// `enable` and `daemon-reload` count: `enable` writes a `multi-user.target.wants` symlink that
+    /// outlives the run.
     fn assert_refused_before_mutation(stack: &FakeStack, error: &str, needle: &str) {
         assert!(error.contains(needle), "{error}");
-        assert!(
-            !stack
-                .rendered()
-                .iter()
-                .any(|r| r.starts_with("install ") || r.contains("restart")),
-            "{:?}",
-            stack.rendered()
-        );
+        for forbidden in ["install ", "daemon-reload", "enable ", "restart"] {
+            assert!(
+                !stack.rendered().iter().any(|r| r.contains(forbidden)),
+                "{forbidden}: {:?}",
+                stack.rendered()
+            );
+        }
     }
 
     #[test]

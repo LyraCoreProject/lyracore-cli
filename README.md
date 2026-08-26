@@ -7,8 +7,8 @@ publish the module, claim the operator identity, run the gateway, and provision 
 
 It deliberately does **not** manage production realms, backups, or the installation of Rust and
 SpacetimeDB. The one system service it can touch is the standalone supervisor unit tracked in the
-checkout, and only when [`service reconcile`](#service-reconcile--make-the-host-match-the-tracked-unit)
-asks it to.
+checkout, and only when you run
+[`service reconcile`](#service-reconcile--make-the-host-match-the-tracked-unit).
 
 ## Commands
 
@@ -327,9 +327,9 @@ For a **production host** only. It makes the host's `spacetimedb-standalone` sup
 unit tracked in the checkout at `deploy/systemd/spacetimedb-standalone.service`. Deployment
 reconciliation is one job, so the verb owns the git steps too. In order:
 
-1. **Root, up front.** `id -u` runs before the fetch. Everything after step 2 writes to
-   `/etc/systemd/system` or drives `systemctl`, and a plan that stops halfway for a password is
-   worse than one that never started.
+1. **Root, up front.** `id -u` runs before the fetch. The plan resets the checkout and then writes
+   to `/etc/systemd/system`, and a plan that stops halfway for a password is worse than one that
+   never started.
 2. **The same checkout update `update` does.** Fetch `origin`, refuse over tracked local edits, and
    move to `origin/main` with `git reset --hard`. Tracked local edits refuse *everything*, the
    service change included.
@@ -348,9 +348,14 @@ reconciliation is one job, so the verb owns the git steps too. In order:
 
 Every expected value is read out of the tracked unit rather than duplicated in this CLI, so it
 cannot certify a host against a contract the checkout no longer ships. The node's persistent data
-directory is only ever checked for existence: never created, moved or deleted. It is idempotent and
-runs even when the checkout is already at `origin/main`, because deployment drift is independent of
-git drift. It restarts the node every time, which is a short outage.
+directory is only ever checked for existence: never created, moved or deleted. Two runs converge on
+the same end state, and it runs even when the checkout is already at `origin/main`, because
+deployment drift is independent of git drift. It restarts the node every time, so every run costs a
+short outage.
+
+Steps 3 to 6 read the host before they change it, so a refusal there leaves the checkout on
+`origin/main` and the host as it was. The reset in step 2 comes first on purpose: the unit to
+install, and the contract to check the host against, are read out of the updated checkout.
 
 No gateway, module publish or schema migration is touched. Those stay operator decisions. Plain
 `update` is the contributor command and reconciles nothing.
