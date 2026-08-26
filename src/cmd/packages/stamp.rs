@@ -34,6 +34,13 @@ pub const SOURCE_GIT: &str = "git";
 /// than a `local()` stamp pointed at the reference Package, which would wrongly claim the operator
 /// picked and reviewed a source folder.
 pub const SOURCE_SCAFFOLD: &str = "scaffold";
+/// The kind an install from the Official Package Collection records. Its
+/// [`source`](ProvenanceStamp::source) is the collection repository's URL (see
+/// `official::COLLECTION_URL`) and its [`revision`](ProvenanceStamp::revision) is the exact commit
+/// the named top-level directory was resolved at. `packages update` does not advance this kind —
+/// pinning the commit at install time, rather than re-resolving the name later, is what stops the
+/// collection's later commits from silently changing an installed revision.
+pub const SOURCE_OFFICIAL: &str = "official";
 
 /// What `packages add` recorded about an install.
 ///
@@ -42,14 +49,13 @@ pub const SOURCE_SCAFFOLD: &str = "scaffold";
 /// still has.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProvenanceStamp {
-    /// [`SOURCE_LOCAL`], [`SOURCE_GIT`] or [`SOURCE_SCAFFOLD`]. The vocabulary this field may still
-    /// grow: `official`.
+    /// [`SOURCE_LOCAL`], [`SOURCE_GIT`], [`SOURCE_SCAFFOLD`] or [`SOURCE_OFFICIAL`].
     pub source_kind: String,
     /// The absolute folder the Package was copied FROM, or the repository URL it was cloned from.
     pub source: String,
-    /// The exact commit a Git Package Source was installed at. Empty for every other kind: a local
-    /// folder and a scaffold have no revision, so there is nothing for `packages update` to advance
-    /// from and nothing to report.
+    /// The exact commit a Git Package Source or an Official Package Source was installed at. Empty
+    /// for a local folder and a scaffold: neither has a revision, so there is nothing for
+    /// `packages update` to advance from and nothing to report.
     pub revision: String,
     /// [`content_identity`] of the copied tree at install time.
     pub content_identity: String,
@@ -76,6 +82,24 @@ impl ProvenanceStamp {
         Self {
             source_kind: SOURCE_GIT.to_string(),
             source: url.to_string(),
+            revision,
+            content_identity,
+            installed_at: utc_rfc3339(now),
+        }
+    }
+
+    /// The stamp an install from the Official Package Collection writes. `collection` is the
+    /// collection repository's URL and `revision` is the exact commit the named top-level
+    /// directory was resolved at when it was cloned.
+    pub fn official(
+        collection: &str,
+        revision: String,
+        content_identity: String,
+        now: u64,
+    ) -> Self {
+        Self {
+            source_kind: SOURCE_OFFICIAL.to_string(),
+            source: collection.to_string(),
             revision,
             content_identity,
             installed_at: utc_rfc3339(now),
@@ -121,6 +145,7 @@ impl ProvenanceStamp {
             SOURCE_LOCAL => "`lyracore packages add`",
             SOURCE_GIT => "`lyracore packages add` or `lyracore packages update`",
             SOURCE_SCAFFOLD => "`lyracore packages new`",
+            SOURCE_OFFICIAL => "`lyracore packages add`",
             _ => "LyraCore Package tooling (unrecognised source kind)",
         };
         let mut text = format!(
@@ -338,6 +363,24 @@ mod tests {
         assert_eq!(ProvenanceStamp::read(tmp.path()), Some(stamp.clone()));
         assert_eq!(stamp.source_kind, SOURCE_GIT);
         assert_eq!(stamp.source, "https://example.invalid/greeter.git");
+        assert_eq!(stamp.revision, "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b");
+    }
+
+    #[test]
+    fn an_official_stamp_records_the_collection_and_the_exact_commit() {
+        let tmp = TempDir::new().unwrap();
+        let stamp = ProvenanceStamp::official(
+            "https://github.com/LyraCoreProject/packages",
+            "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_string(),
+            "fnv1a64-tree-v1:0123456789abcdef".to_string(),
+            1_756_000_000,
+        );
+
+        stamp.write(tmp.path()).unwrap();
+
+        assert_eq!(ProvenanceStamp::read(tmp.path()), Some(stamp.clone()));
+        assert_eq!(stamp.source_kind, SOURCE_OFFICIAL);
+        assert_eq!(stamp.source, "https://github.com/LyraCoreProject/packages");
         assert_eq!(stamp.revision, "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b");
     }
 
