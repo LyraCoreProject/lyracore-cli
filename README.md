@@ -5,8 +5,10 @@
 Source-first developer CLI for LyraCore. It drives the local developer fixture: start SpacetimeDB,
 publish the module, claim the operator identity, run the gateway, and provision accounts.
 
-It deliberately does **not** manage production realms, backups, system services, or the installation
-of Rust and SpacetimeDB.
+It deliberately does **not** manage production realms, backups, or the installation of Rust and
+SpacetimeDB. The one system service it can touch is the standalone supervisor unit tracked in the
+checkout, and only when you run
+[`service reconcile`](#service-reconcile--make-the-host-match-the-tracked-unit).
 
 ## Commands
 
@@ -21,6 +23,8 @@ lyracore dev smoke
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
 lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
+lyracore service reconcile
+lyracore update
 ```
 
 Runtime state lives in the git-ignored `.lyracore/` of the target checkout — `state.json` for the
@@ -312,6 +316,49 @@ running rather than the one today's default would build.
 `dev down` compares that identity before signalling anything. If the PID now belongs to something
 else it **refuses and kills nothing**, directing you to `dev down --forget`, which drops the record
 without signalling.
+
+## `service reconcile` — make the host match the tracked unit
+
+```bash
+sudo ./lyracore service reconcile
+```
+
+For a **production host** only. It makes the host's `spacetimedb-standalone` supervisor match the
+unit tracked in the checkout at `deploy/systemd/spacetimedb-standalone.service`. Deployment
+reconciliation is one job, so the verb owns the git steps too. In order:
+
+1. **Root, up front.** `id -u` runs before the fetch. The plan resets the checkout and then writes
+   to `/etc/systemd/system`, and a plan that stops halfway for a password is worse than one that
+   never started.
+2. **The same checkout update `update` does.** Fetch `origin`, refuse over tracked local edits, and
+   move to `origin/main` with `git reset --hard`. Tracked local edits refuse *everything*, the
+   service change included.
+3. **Host prerequisites.** The unit's `User=` account, its `ExecStart` binary, its `--data-dir`, and
+   the directory holding its `StandardError=append:` log. Each missing one is a refusal naming the
+   command that fixes it. None of them is created for you.
+4. **A conflicting service.** Every active unit whose `ExecStart` or `WorkingDirectory` claims the
+   same data directory or listen address. A hand-rolled legacy `spacetimedb.service` is named and
+   refused, never migrated and never stopped on your behalf, so two nodes cannot race for one port
+   and one data directory.
+5. **The install.** `install -o root -g root -m 0644` into `/etc/systemd/system/`, then
+   `systemctl daemon-reload`, `enable`, `restart`.
+6. **The verification.** `systemctl show` must report `ActiveState=active` plus the `LimitNOFILE`
+   and `StandardError` the tracked unit declares. A node that came back with the inherited
+   1024-descriptor ceiling fails here instead of passing as reconciled.
+
+Every expected value is read out of the tracked unit rather than duplicated in this CLI, so it
+cannot certify a host against a contract the checkout no longer ships. The node's persistent data
+directory is only ever checked for existence: never created, moved or deleted. Two runs converge on
+the same end state, and it runs even when the checkout is already at `origin/main`, because
+deployment drift is independent of git drift. It restarts the node every time, so every run costs a
+short outage.
+
+Steps 3 to 6 read the host before they change it, so a refusal there leaves the checkout on
+`origin/main` and the host as it was. The reset in step 2 comes first on purpose: the unit to
+install, and the contract to check the host against, are read out of the updated checkout.
+
+No gateway, module publish or schema migration is touched. Those stay operator decisions. Plain
+`update` is the contributor command and reconciles nothing.
 
 ## Passwords
 

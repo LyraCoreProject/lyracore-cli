@@ -159,6 +159,9 @@ fn run(args: &[String]) -> Result<i32> {
                 EXIT_OK
             })
         }
+        Command::ServiceReconcile => {
+            cmd::service::reconcile(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
+        }
         Command::Update => cmd::update::run(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK),
     }
 }
