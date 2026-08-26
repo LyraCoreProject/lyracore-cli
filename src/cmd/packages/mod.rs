@@ -1,5 +1,5 @@
-//! `lyracore packages add <local-folder>`, `lyracore packages new <name>`, and
-//! `lyracore packages list`.
+//! `lyracore packages add <local-folder>`, `lyracore packages new <name>`, `lyracore packages
+//! list`, and the lifecycle verbs in [`lifecycle`]: `enable`, `disable` and `remove`.
 //!
 //! A Package is a drop-in folder under `packages/<name>/` that the server build compiles into the
 //! module with no core-file edits: `module/build.rs` discovers it, generates `pub mod pkg_<name>`
@@ -15,13 +15,15 @@
 //! `packages list` reports the two drifting apart.
 //!
 //! WHERE PACKAGES LIVE: enabled ones in `packages/` (what the build reads), disabled ones in
-//! `.lyracore/packages-disabled/` (git-ignored local state the build cannot see). Enabling and
-//! disabling are separate issues; `add`, `new` and `list` only have to know that BOTH are
-//! inventories a new name must not collide with — an installed name that reappears when a Package
-//! is re-enabled is a collision the operator would meet much later, holding two folders and no way
-//! to tell which one the build compiled.
+//! `.lyracore/packages-disabled/` (git-ignored local state the build cannot see). The location IS
+//! the enabled state, which is why [`lifecycle`] can implement `enable` and `disable` as one
+//! rename. `add`, `new` and `list` only have to know that BOTH are inventories a new name must not
+//! collide with — an installed name that reappears when a Package is re-enabled is a collision the
+//! operator would meet much later, holding two folders and no way to tell which one the build
+//! compiled.
 
 pub mod build;
+pub mod lifecycle;
 pub mod review;
 pub mod stamp;
 pub(crate) mod tree;
@@ -151,36 +153,53 @@ pub fn inventory(project: &ProjectLayout) -> Result<Vec<InstalledPackage>> {
     Ok(installed)
 }
 
+/// The Package either inventory already holds under `name`'s generated module identifier, if any.
+///
+/// `ignoring` is the directory of a Package that is only being MOVED between the inventories: it is
+/// still in the one it is leaving, so without this it would collide with itself.
+pub(crate) fn collision(
+    project: &ProjectLayout,
+    name: &PackageName,
+    ignoring: Option<&Path>,
+) -> Result<Option<InstalledPackage>> {
+    let ident = name.rust_ident();
+    Ok(inventory(project)?.into_iter().find(|existing| {
+        existing.name.rust_ident() == ident && Some(existing.dir.as_path()) != ignoring
+    }))
+}
+
+/// Why `existing` blocks `name`: the same folder name, or a different spelling of it that the build
+/// folds onto the same generated module.
+pub(crate) fn collision_reason(existing: &InstalledPackage, name: &PackageName) -> String {
+    if existing.name == *name {
+        format!(
+            "a {} Package is already called '{}'",
+            existing.state.as_str(),
+            existing.name.as_str()
+        )
+    } else {
+        format!(
+            "the {} Package '{}' already folds onto the same module `pkg_{}` ('-' and '_' are the \
+             same character to the build)",
+            existing.state.as_str(),
+            existing.name.as_str(),
+            name.rust_ident()
+        )
+    }
+}
+
 /// Refuse a name either inventory already holds, comparing the Rust identifiers the build derives
 /// rather than the folder names.
 pub fn check_collision(project: &ProjectLayout, name: &PackageName) -> Result<()> {
-    let ident = name.rust_ident();
-    for existing in inventory(project)? {
-        if existing.name.rust_ident() != ident {
-            continue;
-        }
-        let same_spelling = existing.name == *name;
-        let why = if same_spelling {
-            format!(
-                "a {} Package is already called '{}'",
-                existing.state.as_str(),
-                existing.name.as_str()
-            )
-        } else {
-            format!(
-                "the {} Package '{}' already folds onto the same module `pkg_{ident}` ('-' and \
-                 '_' are the same character to the build)",
-                existing.state.as_str(),
-                existing.name.as_str()
-            )
-        };
-        return Err(Error::Usage(format!(
-            "cannot install '{}': {why}. It is at {}. Nothing was copied.",
+    match collision(project, name, None)? {
+        Some(existing) => Err(Error::Usage(format!(
+            "cannot install '{}': {}. It is at {}. Nothing was copied.",
             name.as_str(),
+            collision_reason(&existing, name),
             existing.dir.display()
-        )));
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// The shapes `module/build.rs` accepts.
@@ -274,7 +293,16 @@ pub fn add(
     print!("{}", review.render(&source));
     println!();
 
-    confirm(prompt, &name, &destination, yes)?;
+    confirm(
+        prompt,
+        &format!(
+            "Install '{}' into {}?",
+            name.as_str(),
+            destination.display()
+        ),
+        "Nothing was copied.",
+        yes,
+    )?;
 
     let mut staged = StagedPackage::new(project, &name)?;
     copy_tree(&source, staged.path())?;
@@ -325,20 +353,26 @@ pub fn add(
     Ok(())
 }
 
-fn confirm(prompt: &dyn Prompt, name: &PackageName, destination: &Path, yes: bool) -> Result<()> {
+/// The operator gate. Only the literal word 'yes' is consent; `--yes` answers it in advance.
+///
+/// `question` states the whole action and the path it happens to, because the sentence the operator
+/// answers is their last chance to see what is about to change. `unchanged` is what the refusal
+/// reports as still intact, which differs per command and is the half the operator cares about when
+/// they say no.
+pub(crate) fn confirm(
+    prompt: &dyn Prompt,
+    question: &str,
+    unchanged: &str,
+    yes: bool,
+) -> Result<()> {
     if yes {
-        println!("Install confirmed on the command line (--yes).");
+        println!("Confirmed on the command line (--yes).");
         return Ok(());
     }
-    let answer = prompt.ask(&format!(
-        "Install '{}' into {}? Type 'yes' to continue: ",
-        name.as_str(),
-        destination.display()
-    ))?;
+    let answer = prompt.ask(&format!("{question} Type 'yes' to continue: "))?;
     if !answer.eq_ignore_ascii_case("yes") {
         return Err(Error::Usage(format!(
-            "not installing: the answer was {answer:?}, and only 'yes' is consent. Nothing was \
-             copied."
+            "stopping: the answer was {answer:?}, and only 'yes' is consent. {unchanged}"
         )));
     }
     Ok(())
@@ -368,8 +402,12 @@ impl PackageClaim {
         let root = project.state_dir.join("package-locks");
         std::fs::create_dir_all(&root)?;
         let path = root.join(format!("{}.lock", name.rust_ident()));
+        // `truncate(false)`: the lock is the file's EXISTENCE and its flock, never its content, so
+        // an already-held lock file must be opened as it is. Stated rather than left to the
+        // default, which `clippy::suspicious_open_options` is right to ask about.
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -414,14 +452,7 @@ impl StagedPackage {
             ))
         })?;
         std::fs::create_dir_all(parent)?;
-        rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            &self.path,
-            rustix::fs::CWD,
-            destination,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(|error| {
+        rename_no_replace(&self.path, destination).map_err(|error| {
             if error == rustix::io::Errno::EXIST {
                 Error::Usage(format!(
                     "cannot install: {} appeared while the Package was being reviewed and copied. \
@@ -449,6 +480,22 @@ impl Drop for StagedPackage {
     }
 }
 
+/// Move `from` onto `to`, never replacing whatever is already at `to`.
+///
+/// The guarantee both the staged install and the enable/disable moves need: an occupied destination
+/// must fail the whole operation rather than merge two Packages or overwrite one. Callers report
+/// `EEXIST` in their own words, because "the destination appeared while I was copying" and "the
+/// other inventory already holds this name" are different things to fix.
+fn rename_no_replace(from: &Path, to: &Path) -> std::result::Result<(), rustix::io::Errno> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        from,
+        rustix::fs::CWD,
+        to,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+}
+
 /// Copy a validated Package tree file by file into a fresh staging directory.
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     for entry in tree::collect(source)? {
@@ -463,7 +510,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn shell_quote(path: &Path) -> String {
+pub(crate) fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
@@ -607,25 +654,12 @@ pub fn list(project: &ProjectLayout) -> Result<()> {
         let identity = stamp::content_identity(&package.dir)?;
         println!();
         println!("{}  {}", package.name.as_str(), package.state.as_str());
+        print!("{}", provenance_report(package.stamp.as_ref()));
         match &package.stamp {
-            Some(recorded) => {
-                println!(
-                    "  source    {} {}",
-                    blank_as_unrecorded(&recorded.source_kind),
-                    blank_as_unrecorded(&recorded.source)
-                );
-                println!(
-                    "  installed {}",
-                    blank_as_unrecorded(&recorded.installed_at)
-                );
-                print!("{}", identity_report(recorded, &identity));
-            }
-            None => {
-                // Created by hand or installed before `packages add` existed. It is a real
-                // Package the build compiles; only its provenance is unknown.
-                println!("  source    (unrecorded — no provenance stamp: created by hand, or predates `packages add`)");
-                println!("  identity  {identity}  (nothing recorded to compare against)");
-            }
+            Some(recorded) => print!("{}", identity_report(recorded, &identity)),
+            // Created by hand or installed before `packages add` existed. It is a real Package the
+            // build compiles; only its provenance is unknown.
+            None => println!("  identity  {identity}  (nothing recorded to compare against)"),
         }
         println!(
             "  content   {}",
@@ -633,6 +667,22 @@ pub fn list(project: &ProjectLayout) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Where a Package came from and when, as `packages list` and the lifecycle verbs both print it. A
+/// Package with no stamp says so rather than printing blank fields.
+pub(crate) fn provenance_report(stamp: Option<&ProvenanceStamp>) -> String {
+    match stamp {
+        Some(recorded) => format!(
+            "  source    {} {}\n  installed {}\n",
+            blank_as_unrecorded(&recorded.source_kind),
+            blank_as_unrecorded(&recorded.source),
+            blank_as_unrecorded(&recorded.installed_at)
+        ),
+        None => "  source    (unrecorded — no provenance stamp: created by hand, or predates \
+                 `packages add`)\n"
+            .to_string(),
+    }
 }
 
 fn drift(recorded: &ProvenanceStamp, current: &str) -> &'static str {
@@ -670,15 +720,17 @@ fn blank_as_unrecorded(value: &str) -> &str {
     }
 }
 
+/// Fixtures shared with [`lifecycle`]'s tests, which start from a really installed Package rather
+/// than a hand-built directory.
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::proc::fake::{FakeStack, FAKE_RUST_VERSION, FAKE_SPACETIME_VERSION};
     use tempfile::TempDir;
 
     /// A checkout `preflight` passes in: the same fixture its own tests use, so an `add` test
     /// exercises the real post-install gate rather than a stubbed one.
-    fn checkout(tmp: &TempDir) -> ProjectLayout {
+    pub(super) fn checkout(tmp: &TempDir) -> ProjectLayout {
         let root = tmp.path().join("checkout");
         std::fs::create_dir_all(root.join("module/src")).unwrap();
         std::fs::create_dir_all(root.join("scripts")).unwrap();
@@ -705,7 +757,7 @@ mod tests {
     }
 
     /// A valid Rust Package folder outside the checkout.
-    fn candidate(tmp: &TempDir, name: &str) -> PathBuf {
+    pub(super) fn candidate(tmp: &TempDir, name: &str) -> PathBuf {
         let dir = tmp.path().join("sources").join(name);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(
@@ -717,7 +769,8 @@ mod tests {
         dir
     }
 
-    struct Answer(&'static str);
+    /// A prompt that always gives one answer, so a test can drive the consent gate either way.
+    pub(super) struct Answer(pub(super) &'static str);
     impl Prompt for Answer {
         fn ask(&self, _question: &str) -> Result<String> {
             Ok(self.0.to_string())
