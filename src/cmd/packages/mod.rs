@@ -1,5 +1,6 @@
-//! `lyracore packages add <local-folder>`, `lyracore packages new <name>`, `lyracore packages
-//! list`, and the lifecycle verbs in [`lifecycle`]: `enable`, `disable` and `remove`.
+//! `lyracore packages add <folder|git-url>`, `lyracore packages new <name>`, `lyracore packages
+//! list`, the lifecycle verbs in [`lifecycle`] (`enable`, `disable`, `remove`), and the Git
+//! Package Source verbs in [`git`] (the URL form of `add`, and `update`).
 //!
 //! A Package is a drop-in folder under `packages/<name>/` that the server build compiles into the
 //! module with no core-file edits: `module/build.rs` discovers it, generates `pub mod pkg_<name>`
@@ -23,6 +24,7 @@
 //! compiled.
 
 pub mod build;
+pub mod git;
 pub mod lifecycle;
 pub mod review;
 pub mod stamp;
@@ -232,14 +234,27 @@ pub fn validate_shape(source: &Path) -> Result<()> {
 //  `packages add`
 // =============================================================================================
 
-/// Install a local folder as an enabled Package.
+/// Install a Package from a folder on this machine or from a Git Package Source.
 ///
-/// Order matters and is the whole design: everything that can refuse the install does so BEFORE
-/// anything is copied, the operator sees the trust review before they are asked, and preflight runs
-/// after the copy because it is the first check that can see the Package compiled in. Publishing is
-/// never part of this command — the module on the node is unchanged until the operator runs
-/// `lyracore publish` themselves.
+/// The argument decides which: a Git URL is cloned first, and everything after that is the same
+/// contract a local folder goes through. Anything that is not a URL is a path — including a bare
+/// name, which resolves against the filesystem exactly as it always has. Looking a bare name up as
+/// an Official Package is a Package Source kind this CLI does not have yet.
 pub fn add(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    prompt: &dyn Prompt,
+    source: &str,
+    yes: bool,
+) -> Result<()> {
+    match git::GitSource::parse(source) {
+        Some(repository) => git::add(project, runner, prompt, &repository, yes),
+        None => add_folder(project, runner, prompt, source, yes),
+    }
+}
+
+/// Install a local folder as an enabled Package.
+fn add_folder(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     prompt: &dyn Prompt,
@@ -249,7 +264,7 @@ pub fn add(
     let source = std::fs::canonicalize(source).map_err(|e| {
         Error::Usage(format!(
             "cannot read the folder to install: {source} ({e}). `packages add` takes a path to a \
-             Package folder on this machine."
+             Package folder on this machine, or the URL of a repository whose root is one Package."
         ))
     })?;
     if !source.is_dir() {
@@ -262,7 +277,6 @@ pub fn add(
 
     let name = PackageName::parse(&source.file_name().unwrap_or_default().to_string_lossy())?;
 
-    let destination = project.packages_dir().join(name.as_str());
     if source.starts_with(project.packages_dir())
         || source.starts_with(project.packages_disabled_dir())
     {
@@ -272,6 +286,7 @@ pub fn add(
             source.display()
         )));
     }
+    let destination = project.packages_dir().join(name.as_str());
     if destination.starts_with(&source) {
         return Err(Error::Usage(format!(
             "cannot install {} into {} because the destination is inside the folder being copied. \
@@ -281,48 +296,118 @@ pub fn add(
             destination.display()
         )));
     }
-    check_collision(project, &name)?;
+    install(
+        project,
+        runner,
+        prompt,
+        &source,
+        &name,
+        &Origin::Local(&source),
+        yes,
+    )
+}
+
+/// Where a Package came from: what the install records in its stamp, and what it prints.
+///
+/// The two kinds differ only here. A cloned repository and a local folder are both a reviewed tree
+/// on this machine by the time [`install`] sees them, so `add` has one path rather than two that
+/// drift apart.
+pub(crate) enum Origin<'a> {
+    Local(&'a Path),
+    Git { url: &'a str, revision: &'a str },
+}
+
+impl Origin<'_> {
+    fn stamp(&self, content_identity: String) -> ProvenanceStamp {
+        match self {
+            Origin::Local(folder) => {
+                ProvenanceStamp::local(folder, content_identity, stamp::now_unix())
+            }
+            Origin::Git { url, revision } => ProvenanceStamp::git(
+                url,
+                (*revision).to_string(),
+                content_identity,
+                stamp::now_unix(),
+            ),
+        }
+    }
+
+    /// The source lines of the install report, in the same shape `packages list` prints.
+    fn report(&self) -> String {
+        match self {
+            Origin::Local(folder) => format!("  source    local {}\n", folder.display()),
+            Origin::Git { url, revision } => {
+                format!("  source    git {url}\n  revision  {revision}\n")
+            }
+        }
+    }
+
+    /// The Package Source as the operator typed it, for the one sentence they answer.
+    fn named(&self) -> String {
+        match self {
+            Origin::Local(folder) => folder.display().to_string(),
+            Origin::Git { url, .. } => (*url).to_string(),
+        }
+    }
+}
+
+/// The installation contract, from the first refusal to the printed next steps.
+///
+/// Order matters and is the whole design: everything that can refuse the install does so BEFORE
+/// anything is copied, the operator sees the trust review before they are asked, and preflight runs
+/// after the copy because it is the first check that can see the Package compiled in. Publishing is
+/// never part of this command — the module on the node is unchanged until the operator runs
+/// `lyracore publish` themselves.
+pub(crate) fn install(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    prompt: &dyn Prompt,
+    source: &Path,
+    name: &PackageName,
+    origin: &Origin,
+    yes: bool,
+) -> Result<()> {
+    let destination = project.packages_dir().join(name.as_str());
+    check_collision(project, name)?;
     // Computing the identity validates the WHOLE tree (including client content) before the
     // narrower shape and trust-review passes. The same identity must describe the staged copy
     // after the operator answers, binding consent to the bytes that are actually installed.
-    let reviewed_identity = stamp::content_identity(&source)?;
-    validate_shape(&source)?;
+    let reviewed_identity = stamp::content_identity(source)?;
+    validate_shape(source)?;
 
-    let review = TrustReview::scan(&source)?;
+    let review = TrustReview::scan(source)?;
     println!();
-    print!("{}", review.render(&source));
+    print!("{}", review.render(source));
+    // The review header names the tree it scanned, which for a clone is a scratch directory the
+    // operator never typed. The Package Source is what they chose and what they must recognise
+    // before they answer, so it is repeated here and in the question itself.
+    println!();
+    print!("{}", origin.report());
     println!();
 
     confirm(
         prompt,
         &format!(
-            "Install '{}' into {}?",
+            "Install '{}' from {} into {}?",
             name.as_str(),
+            origin.named(),
             destination.display()
         ),
         "Nothing was copied.",
         yes,
     )?;
 
-    let mut staged = StagedPackage::new(project, &name)?;
-    copy_tree(&source, staged.path())?;
-    let identity = stamp::content_identity(staged.path())?;
-    if identity != reviewed_identity {
-        return Err(Error::Process(format!(
-            "the Package Source changed after its trust review (reviewed {reviewed_identity}, \
-             copied {identity}). Nothing was installed; review the current source and run \
-             `lyracore packages add` again."
-        )));
-    }
-    ProvenanceStamp::local(&source, identity.clone(), stamp::now_unix()).write(staged.path())?;
-    // Recheck after the prompt and potentially long copy. A concurrent install must not be merged
-    // with or overwritten by this one.
-    let _claim = PackageClaim::acquire(project, &name)?;
-    check_collision(project, &name)?;
-    staged.install(&destination)?;
+    let identity = install_tree(
+        project,
+        name,
+        source,
+        &reviewed_identity,
+        origin,
+        &destination,
+    )?;
     println!();
     println!("installed {} -> {}", name.as_str(), destination.display());
-    println!("  source    local {}", source.display());
+    print!("{}", origin.report());
     println!("  identity  {identity}");
 
     println!();
@@ -351,6 +436,73 @@ pub fn add(
         );
     }
     Ok(())
+}
+
+/// Copy a reviewed tree into `destination` as a stamped Package, or leave nothing behind. Returns
+/// the content identity that was recorded.
+///
+/// `reviewed` is the identity the operator was shown. A tree that no longer hashes to it is refused
+/// rather than installed, which is what binds consent to the bytes that land in the inventory. The
+/// copy is staged outside both inventories and moved in with a no-replace rename, so a destination
+/// that appeared meanwhile is never merged into or overwritten.
+pub(crate) fn install_tree(
+    project: &ProjectLayout,
+    name: &PackageName,
+    source: &Path,
+    reviewed: &str,
+    origin: &Origin,
+    destination: &Path,
+) -> Result<String> {
+    let mut staged = StagedPackage::new(project, name)?;
+    copy_tree(source, staged.path())?;
+    let identity = stamp::content_identity(staged.path())?;
+    if identity != reviewed {
+        return Err(Error::Process(format!(
+            "the Package Source changed after its trust review (reviewed {reviewed}, copied \
+             {identity}). Nothing was installed; review the current source and run the command \
+             again."
+        )));
+    }
+    origin.stamp(identity.clone()).write(staged.path())?;
+    // Recheck after the prompt and potentially long copy. A concurrent install must not be merged
+    // with or overwritten by this one.
+    let _claim = PackageClaim::acquire(project, name)?;
+    check_collision(project, name)?;
+    staged.install(destination)?;
+    Ok(identity)
+}
+
+/// The one installed Package with this exact folder name, from either inventory.
+///
+/// Exact, not folded: these commands act on a FOLDER, and picking a near-miss for the operator
+/// would change a directory they did not name. A fold-equal Package is named in the error instead,
+/// because it is almost always the one they meant.
+pub(crate) fn find(project: &ProjectLayout, name: &PackageName) -> Result<InstalledPackage> {
+    let mut folded = None;
+    for installed in inventory(project)? {
+        if installed.name == *name {
+            return Ok(installed);
+        }
+        if installed.name.rust_ident() == name.rust_ident() {
+            folded = Some(installed);
+        }
+    }
+    Err(Error::Usage(match folded {
+        Some(near) => format!(
+            "no Package called '{}'. The {} Package '{}' folds onto the same module `pkg_{}`, but \
+             these commands act on a folder, so its name has to be typed exactly. Nothing was \
+             changed.",
+            name.as_str(),
+            near.state.as_str(),
+            near.name.as_str(),
+            name.rust_ident()
+        ),
+        None => format!(
+            "no Package called '{}'. `lyracore packages list` shows every installed Package in \
+             both inventories. Nothing was changed.",
+            name.as_str()
+        ),
+    }))
 }
 
 /// The operator gate. Only the literal word 'yes' is consent; `--yes` answers it in advance.
@@ -670,13 +822,19 @@ pub fn list(project: &ProjectLayout) -> Result<()> {
 }
 
 /// Where a Package came from and when, as `packages list` and the lifecycle verbs both print it. A
-/// Package with no stamp says so rather than printing blank fields.
+/// Package with no stamp says so rather than printing blank fields, and one with no revision (a
+/// local folder, a scaffold) leaves that line out rather than printing an empty one.
 pub(crate) fn provenance_report(stamp: Option<&ProvenanceStamp>) -> String {
     match stamp {
         Some(recorded) => format!(
-            "  source    {} {}\n  installed {}\n",
+            "  source    {} {}\n{}  installed {}\n",
             blank_as_unrecorded(&recorded.source_kind),
             blank_as_unrecorded(&recorded.source),
+            if recorded.revision.is_empty() {
+                String::new()
+            } else {
+                format!("  revision  {}\n", recorded.revision)
+            },
             blank_as_unrecorded(&recorded.installed_at)
         ),
         None => "  source    (unrecorded — no provenance stamp: created by hand, or predates \
