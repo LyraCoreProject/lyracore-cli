@@ -1,7 +1,7 @@
 //! `lyracore packages build` — regenerate the Datascript typings, typecheck against them, then run
 //! and validate every enabled Package's Datascripts.
 //!
-//! A version gate, then up to six steps, in this order, and the order is the contract:
+//! A version gate, then up to seven steps, in this order, and the order is the contract:
 //!
 //! 0. `bun --version` must match the checkout's exact pin. A hard failure, unlike `doctor`'s Bun
 //!    check: `doctor` only reports drift on a machine that may never run Bun at all, but this
@@ -32,6 +32,10 @@
 //!    This is the authoritative Rust-side check — the same trace `packages replay` runs before it
 //!    writes to a Shard — so a Package Delta a Datascript just emitted is validated by the code that
 //!    also decides whether it may apply, not by a second, looser implementation of the same rules.
+//! 7. A Build Identity sidecar (`packages::identity`) is written next to each artifact that just
+//!    validated: every input the artifact was built from, so `packages check`, `preflight` and CI
+//!    can tell later whether it is still current. Writing it only after step 6 succeeds means a
+//!    sidecar never describes an artifact this build itself would have refused.
 //!
 //! Steps 1-3, 5 and 6 STREAM to the terminal rather than being captured. `tsc` writes its
 //! diagnostics to stdout, so a captured run surfaced an empty error and lost the file and line this
@@ -60,7 +64,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cmd::doctor::{self, BunVersionCheck};
-use crate::cmd::packages::artifact;
+use crate::cmd::packages::{artifact, identity};
 use crate::cmd::preflight;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::ProjectLayout;
@@ -225,10 +229,16 @@ fn run_datascripts(
 /// in one `lyracore-delta-check` invocation. Discovered the same way `packages replay` discovers
 /// them — a folder listing, not a re-parse by this command — so build-time validation and
 /// replay-time preflight can never disagree about which files are in play.
-fn validate_generated_deltas(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
+///
+/// Returns what it discovered and validated, so step 7 can write each artifact's Build Identity
+/// without re-reading a tree this step just finished checking.
+fn validate_generated_deltas(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+) -> Result<Vec<artifact::Artifact>> {
     let artifacts = artifact::read_enabled(&project.packages_dir())?;
     if artifacts.is_empty() {
-        return Ok(());
+        return Ok(artifacts);
     }
 
     println!();
@@ -253,7 +263,8 @@ fn validate_generated_deltas(project: &ProjectLayout, runner: &dyn ProcessRunner
             "the generated Package Delta artifacts do not check out. The validator's own report is \
              above, naming the file and the exact claim to fix.\n  ({e})"
         ))
-    })
+    })?;
+    Ok(artifacts)
 }
 
 pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
@@ -328,7 +339,8 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     );
     run_datascripts(project, runner, &datascript_packages)?;
 
-    validate_generated_deltas(project, runner)?;
+    let artifacts = validate_generated_deltas(project, runner)?;
+    identity::write_all(project, &artifacts)?;
 
     println!();
     println!("Package Deltas emitted and validated.");
@@ -644,6 +656,57 @@ mod tests {
         assert!(
             calls[5].contains("fire_nova/data/.generated/spell.json"),
             "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_successful_build_writes_a_build_identity_sidecar_next_to_each_validated_artifact() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_datascript(&project, "fire_nova", "spells");
+        with_base_snapshot(&project);
+        with_generated_artifact(&project, "fire_nova");
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner()).unwrap();
+
+        let sidecar = project
+            .packages_dir()
+            .join("fire_nova/data/.generated")
+            .join(crate::cmd::packages::identity::IDENTITY_FILE);
+        assert!(sidecar.is_file(), "no sidecar written next to the artifact");
+        let artifacts = artifact::read_enabled(&project.packages_dir()).unwrap();
+        let identity = crate::cmd::packages::identity::Identity::parse(
+            &std::fs::read_to_string(&sidecar).unwrap(),
+            &sidecar,
+        )
+        .unwrap();
+        assert_eq!(identity.artifact_hash, artifacts[0].artifact_hash);
+    }
+
+    #[test]
+    fn a_validator_failure_writes_no_identity_sidecar() {
+        // The invariant the ordering exists for: a sidecar must never describe an artifact this
+        // build itself would have refused.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_datascript(&project, "fire_nova", "spells");
+        with_base_snapshot(&project);
+        with_generated_artifact(&project, "fire_nova");
+        let stack = FakeStack::new().fail_on(
+            "lyracore-delta-check",
+            "1 claim conflict(s) between the named Packages",
+        );
+
+        assert!(run(&project, &stack.runner()).is_err());
+
+        let sidecar = project
+            .packages_dir()
+            .join("fire_nova/data/.generated")
+            .join(crate::cmd::packages::identity::IDENTITY_FILE);
+        assert!(
+            !sidecar.exists(),
+            "a failed validation must write no sidecar"
         );
     }
 

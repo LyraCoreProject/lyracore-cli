@@ -526,6 +526,41 @@ mod tests {
     }
 
     #[test]
+    fn publish_refuses_a_stale_package_delta_artifact() {
+        // LyraCore#316: preflight's identity gate refuses a generated artifact with no Build
+        // Identity sidecar (it predates identity tracking, so it is stale by definition) — and
+        // `publish` runs preflight first, so nothing reaches a Shard.
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        let generated = project.packages_dir().join("fire_nova/data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(
+            generated.join("spell.json"),
+            format!(
+                r#"{{"version":1,"package":"fire_nova","source_hash":"{}","claims":[{{"table":"game_spell","key":{{"spell_id":133}},"operation":"update","fields":{{"gcd_ms":{{"type":"u32","value":1500}}}}}}]}}"#,
+                "a".repeat(64)
+            ),
+        )
+        .unwrap();
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner(), &names(&["lyracore"]), false).unwrap_err();
+
+        assert!(
+            error.to_string().contains("Nothing was published"),
+            "{error}"
+        );
+        assert!(
+            !stack
+                .rendered()
+                .iter()
+                .any(|r| r.contains("spacetime publish")),
+            "a stale artifact must publish nothing: {:?}",
+            stack.rendered()
+        );
+    }
+
+    #[test]
     fn preflight_precedes_the_publish_rather_than_following_it() {
         let tmp = TempDir::new().unwrap();
         let stack = FakeStack::new();

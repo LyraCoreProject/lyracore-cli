@@ -131,6 +131,9 @@ fn run(args: &[String]) -> Result<i32> {
         Command::PackagesBuild => {
             cmd::packages::build::run(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
         }
+        Command::PackagesCheck => {
+            cmd::packages::check::run(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
+        }
         // The lifecycle verbs take no process runner: they move or delete a directory and print
         // what is left to run, so there is nothing for them to execute.
         Command::PackagesEnable { name } => {

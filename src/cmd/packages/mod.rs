@@ -26,7 +26,9 @@
 
 pub mod artifact;
 pub mod build;
+pub mod check;
 pub mod git;
+pub mod identity;
 pub mod lifecycle;
 pub(crate) mod official;
 pub mod replay;
