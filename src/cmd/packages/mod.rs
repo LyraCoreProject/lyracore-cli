@@ -24,10 +24,12 @@
 //! operator would meet much later, holding two folders and no way to tell which one the build
 //! compiled.
 
+pub mod artifact;
 pub mod build;
 pub mod git;
 pub mod lifecycle;
 pub(crate) mod official;
+pub mod replay;
 pub mod review;
 pub mod stamp;
 pub(crate) mod tree;

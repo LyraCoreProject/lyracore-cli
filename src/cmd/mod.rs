@@ -125,6 +125,17 @@ USAGE:
                                                first, and refuses a folder that no longer matches
                                                its recorded content identity, because those local
                                                changes exist nowhere else
+  lyracore packages replay [DATABASE ...] [--check] [--yes] [--force-all]
+                                               reapply every enabled Package's Delta to each named
+                                               Shard: reimport Spell.dbc, then replay the claims
+                                               over it. Preflights every artifact and every target
+                                               before the first write, applies Shard by Shard, and
+                                               stops at the first failure naming what completed,
+                                               what failed and what was never touched. A Shard
+                                               whose recorded provenance already matches this
+                                               checkout is skipped, so re-running resumes. --check
+                                               prints the plan and writes nothing; --force-all
+                                               replays even the Shards that match
   lyracore packages build                      regenerate the Module schema typings into
                                                datascripts/generated/, install the pinned Bun
                                                dependencies from datascripts/bun.lock, then
@@ -229,6 +240,7 @@ pub enum Command {
         /// `--yes`: the deletion confirmation was answered in advance (scripted runs).
         yes: bool,
     },
+    PackagesReplay(packages::replay::ReplayOptions),
     ProductionStatus(production::StatusOptions),
     /// The one root-only, system-state verb on this surface, deliberately its own: `update` stays
     /// a contributor's git-pull replacement and owns no service.
@@ -375,6 +387,7 @@ impl Command {
             ["packages", "new", _name, other, ..] => Err(Error::Usage(format!(
                 "`packages new` takes one name (got a second argument: '{other}')"
             ))),
+            ["packages", "replay", rest @ ..] => parse_packages_replay(rest),
             ["packages", "build"] => Ok(Command::PackagesBuild),
             ["packages", "build", other, ..] => Err(Error::Usage(format!(
                 "`packages build` takes no arguments (got '{other}')"
@@ -388,7 +401,8 @@ impl Command {
             ["packages", "remove", rest @ ..] => parse_packages_remove(rest),
             ["packages", ..] => Err(Error::Usage(
                 "`packages` supports: add FOLDER|GIT-URL [--yes], build, disable NAME, enable \
-                 NAME, list, new NAME, remove NAME [--yes], update [NAME] [--yes]"
+                 NAME, list, new NAME, remove NAME [--yes], replay [DATABASE ...] [--check] \
+                 [--yes] [--force-all], update [NAME] [--yes]"
                     .to_string(),
             )),
 
@@ -586,6 +600,46 @@ fn parse_packages_update(args: &[&str]) -> Result<Command> {
         }
     }
     Ok(Command::PackagesUpdate { name, yes })
+}
+
+/// `packages replay [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]`.
+///
+/// Flags and Shard names interleave freely, but a Shard name is validated the moment it is taken:
+/// anything flag-shaped that is not one of this verb's own options is REFUSED rather than passed on
+/// to a subprocess, exactly as `publish` refuses it. An empty list is not a default target list — it
+/// means "none named", which `replay` resolves against the recorded development topology once it can
+/// read one.
+fn parse_packages_replay(args: &[&str]) -> Result<Command> {
+    let mut options = packages::replay::ReplayOptions::default();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match *arg {
+            "--check" => options.check = true,
+            "--yes" => options.yes = true,
+            "--force-all" => options.force_all = true,
+            "--client-data" => {
+                options.client_data =
+                    Some(rest.next().map(|path| (*path).to_string()).ok_or_else(|| {
+                        Error::Usage(
+                            "`--client-data` needs a path, e.g. `--client-data \
+                                 /games/WoW-1.12.1/Data`"
+                                .to_string(),
+                        )
+                    })?);
+            }
+            option if option.starts_with("--") => {
+                return Err(Error::Usage(format!(
+                    "unknown `packages replay` option '{option}' — the options are --check, --yes, \
+                     --force-all and --client-data PATH"
+                )))
+            }
+            name => {
+                publish::validate_database(packages::replay::VERB, name)?;
+                options.databases.push(name.to_string());
+            }
+        }
+    }
+    Ok(Command::PackagesReplay(options))
 }
 
 /// `packages enable NAME` and `packages disable NAME`: one Package name, no options.
@@ -1427,6 +1481,46 @@ mod tests {
     fn packages_build_takes_no_arguments() {
         assert_eq!(parse("packages build").unwrap(), Command::PackagesBuild);
         for line in ["packages build --watch", "packages build my-package"] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn packages_replay_takes_shard_names_and_its_own_options_in_any_order() {
+        assert_eq!(
+            parse("packages replay").unwrap(),
+            Command::PackagesReplay(packages::replay::ReplayOptions::default())
+        );
+        assert_eq!(
+            parse("packages replay lyracore --check lyracore-kalimdor --force-all --yes").unwrap(),
+            Command::PackagesReplay(packages::replay::ReplayOptions {
+                databases: vec!["lyracore".to_string(), "lyracore-kalimdor".to_string()],
+                client_data: None,
+                check: true,
+                yes: true,
+                force_all: true,
+            })
+        );
+        assert_eq!(
+            parse("packages replay --client-data /games/Data lyracore").unwrap(),
+            Command::PackagesReplay(packages::replay::ReplayOptions {
+                databases: vec!["lyracore".to_string()],
+                client_data: Some("/games/Data".to_string()),
+                ..Default::default()
+            })
+        );
+    }
+
+    /// The same guard `publish` has: a Shard list is names only, and a flag hidden among them is
+    /// refused at parse time rather than forwarded to the importer.
+    #[test]
+    fn packages_replay_refuses_a_flag_shaped_shard_name() {
+        for line in [
+            "packages replay -c",
+            "packages replay lyracore --delete-data",
+            "packages replay --unknown",
+            "packages replay --client-data",
+        ] {
             assert!(parse(line).is_err(), "{line}");
         }
     }

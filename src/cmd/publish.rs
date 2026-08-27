@@ -33,28 +33,32 @@ use crate::{Error, Result};
 /// buys a message that says WHY rather than "that is not a database name".
 const DESTRUCTIVE: [&str; 4] = ["-c", "--clear-database", "--delete-data", "--clear"];
 
-/// Reject anything that is not a plain database name.
+/// The verb name this module's refusals quote back at the operator.
+const VERB: &str = "publish";
+
+/// Reject anything that is not a plain database name, on behalf of `verb`.
 ///
-/// This is the whole safety contract of the command, so it lives in one function that both argument
-/// parsing and command rendering go through — a database name cannot reach a rendered
-/// `spacetime publish` without passing here.
-pub fn validate_database(name: &str) -> Result<()> {
+/// This is the whole safety contract of the commands that take a Shard list, so it lives in one
+/// function that both argument parsing and command rendering go through — a database name cannot
+/// reach a rendered subprocess without passing here. `verb` is the command doing the refusing, so
+/// the operator is sent to the surface they actually typed.
+pub fn validate_database(verb: &str, name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err(Error::Usage(
-            "`lyracore publish` takes database NAMES; got an empty one. Refusing.".to_string(),
-        ));
+        return Err(Error::Usage(format!(
+            "`lyracore {verb}` takes database NAMES; got an empty one. Refusing."
+        )));
     }
     if DESTRUCTIVE.contains(&name) {
         return Err(Error::Usage(format!(
-            "`lyracore publish` takes database NAMES, not flags (got '{name}'). Refusing.\n  \
+            "`lyracore {verb}` takes database NAMES, not flags (got '{name}'). Refusing.\n  \
              That flag is the DESTRUCTIVE wipe: it deletes every row and breaks login until the \
              realm is re-provisioned. This CLI has no path to it, by design."
         )));
     }
     if name.starts_with('-') {
         return Err(Error::Usage(format!(
-            "`lyracore publish` takes database NAMES, not flags (got '{name}'). Refusing.\n  \
-             Forwarding an unexamined flag to `spacetime publish` is the one unrecoverable mistake \
+            "`lyracore {verb}` takes database NAMES, not flags (got '{name}'). Refusing.\n  \
+             Forwarding an unexamined flag to a subprocess is the one unrecoverable mistake \
              available here, so no flag is forwarded at all."
         )));
     }
@@ -74,7 +78,7 @@ pub fn validate_database(name: &str) -> Result<()> {
 /// happens before the project is discovered, so it cannot make that call itself.
 pub fn databases(args: &[String]) -> Result<Vec<String>> {
     for name in args {
-        validate_database(name)?;
+        validate_database(VERB, name)?;
     }
     Ok(args.to_vec())
 }
@@ -114,7 +118,7 @@ fn database_list(databases: &[String]) -> String {
 
 /// The ONE correct publish invocation.
 pub fn publish_command(project: &ProjectLayout, database: &str) -> Result<CommandSpec> {
-    validate_database(database)?;
+    validate_database(VERB, database)?;
     Ok(CommandSpec::new("spacetime")
         .arg("publish")
         .arg("-s")
