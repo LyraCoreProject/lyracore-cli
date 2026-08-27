@@ -367,6 +367,14 @@ impl ProjectLayout {
     /// header, so nothing hand-authored may live here. Datascripts import from it; they sit in
     /// `datascripts/src/`.
     pub const DATASCRIPT_TYPES_DIR: &'static str = "generated";
+    /// Where a Datascript's Rust half sits, one folder per Package. `packages build` runs every
+    /// `.ts` file directly under a Package's folder here as a subprocess.
+    pub const DATASCRIPTS_SRC_DIR: &'static str = "src";
+    /// The Base Snapshot `lyracore-importer --spell-snapshot` writes and every Datascript reads: the
+    /// derived base `game_spell` / `game_spell_effect` rows, and the only base data a Datascript can
+    /// see. It rides `generated/`'s own git-ignore rule for a second reason — it is the OPERATOR's
+    /// own client-derived data, not something to commit.
+    pub const BASE_SNAPSHOT_FILE: &'static str = "base-snapshot.json";
 
     /// The pinned wire-harness release this checkout consumes (#246).
     pub const WIRE_HARNESS_PIN: &'static str = ".wire-harness-rev";
@@ -500,6 +508,17 @@ impl ProjectLayout {
 
     pub fn datascript_types_dir(&self) -> PathBuf {
         self.datascripts_dir().join(Self::DATASCRIPT_TYPES_DIR)
+    }
+
+    /// One folder per Package that has a Datascript, e.g. `datascripts/src/fire_nova/`.
+    pub fn datascripts_src_dir(&self) -> PathBuf {
+        self.datascripts_dir().join(Self::DATASCRIPTS_SRC_DIR)
+    }
+
+    /// The Base Snapshot a Datascript reads. Git-ignored, and not written by this CLI — an author
+    /// builds it once with `lyracore-importer --spell-snapshot`.
+    pub fn base_snapshot_file(&self) -> PathBuf {
+        self.datascript_types_dir().join(Self::BASE_SNAPSHOT_FILE)
     }
 
     pub fn standalone_unit(&self) -> PathBuf {
