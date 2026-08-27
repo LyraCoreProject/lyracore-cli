@@ -139,6 +139,13 @@ fn run(args: &[String]) -> Result<i32> {
         Command::PackagesDisable { name } => {
             cmd::packages::lifecycle::disable(&ProjectLayout::discover()?, &name).map(|_| EXIT_OK)
         }
+        Command::PackagesReplay(options) => cmd::packages::replay::run(
+            &ProjectLayout::discover()?,
+            &runner,
+            &cmd::import::TtyPrompt::packages_replay(),
+            &options,
+        )
+        .map(|_| EXIT_OK),
         Command::PackagesRemove { name, yes } => cmd::packages::lifecycle::remove(
             &ProjectLayout::discover()?,
             &cmd::import::TtyPrompt::packages_remove(),

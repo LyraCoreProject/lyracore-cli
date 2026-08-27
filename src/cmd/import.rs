@@ -109,6 +109,13 @@ impl TtyPrompt {
         }
     }
 
+    pub const fn packages_replay() -> Self {
+        Self {
+            no_terminal_remedy: "pass --yes to confirm the replay in advance, or --check to see \
+                                 the plan without writing",
+        }
+    }
+
     pub const fn packages_update() -> Self {
         Self {
             no_terminal_remedy: "pass --yes to confirm the Package update in advance",
@@ -640,7 +647,7 @@ pub fn run_vmaps(
 /// validates, and reported-then-abandoned if it does not (a stale config must not turn into a
 /// silent prompt-less failure); the interactive prompt is the fallback of last resort, and its
 /// answer is written back to `config.json` once it validates.
-fn resolve_client_data(
+pub(crate) fn resolve_client_data(
     project: &ProjectLayout,
     prompt: &dyn Prompt,
     flag: Option<&str>,
@@ -811,7 +818,7 @@ pub(crate) fn build_importer_command(project: &ProjectLayout) -> CommandSpec {
 
 /// A base importer invocation: the pinned binary, destination Shard and loopback endpoint named
 /// explicitly. Neither may fall through to ambient CLI state.
-fn importer_command(project: &ProjectLayout, database: &str) -> CommandSpec {
+pub(crate) fn importer_command(project: &ProjectLayout, database: &str) -> CommandSpec {
     CommandSpec::new(project.importer_bin().to_string_lossy().to_string())
         .arg("--db")
         .arg(database)
@@ -948,7 +955,7 @@ fn call_command(project: &ProjectLayout, database: &str, reducer: &str) -> Comma
 }
 
 /// `spacetime sql`, pinned to the loopback node for the same #440 reason as [`call_command`].
-fn sql_command(project: &ProjectLayout, database: &str, query: &str) -> CommandSpec {
+pub(crate) fn sql_command(project: &ProjectLayout, database: &str, query: &str) -> CommandSpec {
     CommandSpec::new("spacetime")
         .arg("sql")
         .arg("--server")
@@ -1204,7 +1211,7 @@ fn numeric_values(output: &str) -> Vec<i64> {
 
 /// A `spacetime sql` answer as rows of cells — data lines start with a space; cells split on `|`.
 /// The port of the coverage audit's python `rows()` helper.
-fn table_cells(output: &str) -> Vec<Vec<String>> {
+pub(crate) fn table_cells(output: &str) -> Vec<Vec<String>> {
     output
         .lines()
         .filter(|line| line.starts_with(' '))
@@ -2007,26 +2014,26 @@ fn assert_floors(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::proc::fake::{Call, FakeStack};
     use std::cell::RefCell;
     use tempfile::TempDir;
 
     /// A prompt with pre-recorded answers, which also records what it was asked.
-    struct ScriptedPrompt {
+    pub(crate) struct ScriptedPrompt {
         answers: RefCell<Vec<String>>,
         asked: RefCell<Vec<String>>,
     }
 
     impl ScriptedPrompt {
-        fn new(answers: &[&str]) -> Self {
+        pub(crate) fn new(answers: &[&str]) -> Self {
             Self {
                 answers: RefCell::new(answers.iter().rev().map(|a| a.to_string()).collect()),
                 asked: RefCell::new(Vec::new()),
             }
         }
-        fn asked(&self) -> Vec<String> {
+        pub(crate) fn asked(&self) -> Vec<String> {
             self.asked.borrow().clone()
         }
     }
