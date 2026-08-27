@@ -292,6 +292,7 @@ pub const FAKE_TOKEN: &str = "eyJmYWtl.TOKEN-must-never-be-rendered.SIG";
 /// `lyracore preflight`'s check 0 exists to catch.
 pub const FAKE_RUST_VERSION: &str = "1.93.0";
 pub const FAKE_SPACETIME_VERSION: &str = "2.7.1";
+pub const FAKE_BUN_VERSION: &str = "1.3.7";
 
 /// Canned stdout for the commands this CLI actually reads output from.
 ///
@@ -308,6 +309,8 @@ fn canned_stdout(render: &str) -> String {
             "spacetimedb tool version {FAKE_SPACETIME_VERSION}; spacetime-lib version \
              {FAKE_SPACETIME_VERSION}\n"
         )
+    } else if render.starts_with("bun --version") {
+        format!("{FAKE_BUN_VERSION}\n")
     } else {
         String::new()
     }

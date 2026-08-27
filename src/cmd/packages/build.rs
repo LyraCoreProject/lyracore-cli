@@ -1,7 +1,12 @@
 //! `lyracore packages build` — regenerate the Datascript typings, then typecheck against them.
 //!
-//! Three steps, in this order, and the order is the contract:
+//! A version gate, then three steps, in this order, and the order is the contract:
 //!
+//! 0. `bun --version` must match the checkout's exact pin. A hard failure, unlike `doctor`'s Bun
+//!    check: `doctor` only reports drift on a machine that may never run Bun at all, but this
+//!    command is about to run `bun install` and the locked `tsc` for real, against whatever `bun`
+//!    is on PATH. Verifying first means a stale or missing Bun fails with the exact reinstall
+//!    command instead of a confusing `bun install` or `tsc` error two steps later.
 //! 1. `spacetime generate --lang typescript` extracts the Module schema THROUGH the wasm and writes
 //!    it to `datascripts/generated/`. Offline: it builds the module and reads it, and touches no
 //!    database.
@@ -11,14 +16,15 @@
 //! 3. Bun runs the locked, project-local TypeScript compiler with `--noEmit`. Nothing is emitted —
 //!    the answer is the exit code.
 //!
-//! All three STREAM to the terminal rather than being captured. `tsc` writes its diagnostics to
+//! Steps 1-3 STREAM to the terminal rather than being captured. `tsc` writes its diagnostics to
 //! stdout, so a captured run surfaced an empty error and lost the file and line this command
 //! promises; the other two are chatty enough (a cargo build, a dependency install) that live
-//! progress beats a held-back transcript.
+//! progress beats a held-back transcript. Step 0 captures instead: a `--version` banner is one
+//! line, and the gate needs to read it, not relay it.
 //!
-//! Generating FIRST is what gives the gate teeth. The typings are derived from the Module every
-//! run, so a Datascript naming a column the Module renamed fails here, at author time, rather than
-//! surviving into a Package Delta.
+//! Generating FIRST among the streamed steps is what gives the gate teeth. The typings are derived
+//! from the Module every run, so a Datascript naming a column the Module renamed fails here, at
+//! author time, rather than surviving into a Package Delta.
 //!
 //! WHY THE TYPINGS ARE NOT COMMITTED: they are a 400-file, 2 MB projection of the Module wasm. A
 //! committed copy would put a large mechanical diff in every schema change and, worse, would be a
@@ -28,6 +34,7 @@
 //! Bun is needed HERE and nowhere else. An Operator applying a prebuilt Package Delta runs no part
 //! of this, which is why `doctor`'s Bun check is a warning rather than a launch blocker.
 
+use crate::cmd::doctor::{self, BunVersionCheck};
 use crate::cmd::preflight;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::ProjectLayout;
@@ -61,6 +68,35 @@ pub fn typecheck_command(project: &ProjectLayout) -> CommandSpec {
         .cwd(project.datascripts_dir())
 }
 
+/// Verify Bun before anything is installed or typechecked with it. Missing, mismatched, and
+/// unparsable banners all take the exact wording `doctor`'s Bun check reports as a warning — this
+/// caller's own wording is only "hard failure" versus "warning", not a second explanation.
+fn verify_bun(runner: &dyn ProcessRunner) -> Result<()> {
+    let banner = runner
+        .run_capturing_stderr(&CommandSpec::new("bun").arg("--version"))
+        .ok();
+    let install = doctor::bun_install_hint();
+    match doctor::bun_version_check(banner.as_deref()) {
+        BunVersionCheck::Pinned(_) => Ok(()),
+        BunVersionCheck::Missing => Err(Error::PrerequisiteMissing(format!(
+            "`bun` not found. `packages build` needs the pinned {} to install and typecheck \
+             Datascripts; install it with `{install}`",
+            doctor::REQUIRED_BUN
+        ))),
+        BunVersionCheck::Mismatched(found) => Err(Error::PrerequisiteMissing(format!(
+            "bun reports {found}, but this checkout's Datascript toolchain is pinned to {}. \
+             `packages build` is not verified against a different Bun runtime; install the pinned \
+             version with `{install}`",
+            doctor::REQUIRED_BUN
+        ))),
+        BunVersionCheck::Unparsable => Err(Error::PrerequisiteMissing(format!(
+            "could not read a version from `bun --version`; expected exactly {}. Reinstall it \
+             with `{install}`",
+            doctor::REQUIRED_BUN
+        ))),
+    }
+}
+
 pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     let datascripts = project.datascripts_dir();
     let missing = ["package.json", "bun.lock", "tsconfig.json"]
@@ -76,6 +112,8 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
             missing.join(", ")
         )));
     }
+
+    verify_bun(runner)?;
 
     println!(
         "regenerating Module schema typings -> {}",
@@ -136,7 +174,8 @@ mod tests {
     }
 
     #[test]
-    fn a_build_generates_typings_installs_the_lockfile_then_typechecks_in_that_order() {
+    fn a_build_verifies_bun_generates_typings_installs_the_lockfile_then_typechecks_in_that_order()
+    {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let stack = FakeStack::new();
@@ -144,15 +183,16 @@ mod tests {
         run(&project, &stack.runner()).unwrap();
 
         let calls = stack.rendered();
-        assert_eq!(calls.len(), 3, "{calls:?}");
-        assert!(calls[0].contains("spacetime generate"), "{calls:?}");
-        assert!(calls[0].contains("--lang typescript"), "{calls:?}");
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert!(calls[0].starts_with("bun --version"), "{calls:?}");
+        assert!(calls[1].contains("spacetime generate"), "{calls:?}");
+        assert!(calls[1].contains("--lang typescript"), "{calls:?}");
         assert!(
-            calls[1].contains("bun install --frozen-lockfile"),
+            calls[2].contains("bun install --frozen-lockfile"),
             "{calls:?}"
         );
         assert_eq!(
-            calls[2], "bun ./node_modules/typescript/bin/tsc --noEmit",
+            calls[3], "bun ./node_modules/typescript/bin/tsc --noEmit",
             "{calls:?}"
         );
     }
@@ -265,6 +305,71 @@ mod tests {
 
         assert!(error.to_string().contains("tsconfig.json"), "{error}");
         assert!(stack.rendered().is_empty(), "{error}");
+    }
+
+    // ---- the Bun version gate ----
+
+    #[test]
+    fn a_missing_bun_fails_before_anything_is_generated_or_installed() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new().fail_on("bun --version", "command not found");
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE, "{error}");
+        assert!(error.to_string().contains("bun-v1.3.7"), "{error}");
+        assert!(stack.rendered().iter().all(|call| call == "bun --version"));
+    }
+
+    #[test]
+    fn a_bun_older_than_the_pin_fails_the_build() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new().with_stdout("bun --version", "1.3.6");
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("1.3.7"), "{error}");
+        for call in stack.rendered() {
+            assert!(!call.contains("spacetime generate"), "{call}");
+        }
+    }
+
+    #[test]
+    fn a_bun_newer_than_the_pin_also_fails_the_build() {
+        // The pin is exact, not a floor: a Datascript's typecheck is only verified against 1.3.7.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new().with_stdout("bun --version", "1.4.0");
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("bun-v1.3.7"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_bun_banner_fails_the_build_rather_than_guessing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new().with_stdout("bun --version", "bun 1.3.7");
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(
+            error.to_string().contains("could not read a version"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("bun-v1.3.7"), "{error}");
+    }
+
+    #[test]
+    fn the_pinned_bun_lets_the_build_proceed() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new().with_stdout("bun --version", "1.3.7");
+
+        run(&project, &stack.runner()).unwrap();
     }
 
     #[test]
