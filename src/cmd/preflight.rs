@@ -16,6 +16,9 @@
 //!      as raw text and then rejects a gateway subscription at LOGIN time.
 //!   4. a script with a configurable `DB` target that reaches the assertions but not the tools it
 //!      drives — an ETL writing to one database and asserting against another.
+//!   5. a generated Package Delta artifact that no longer matches the Datascript source, generated
+//!      typings, Base Snapshot, authoring library or toolchain pins it was built from — `publish`
+//!      would ship a Package's stale claims to every Shard with nothing catching the drift.
 //!
 //! NOTHING HERE TOUCHES A NODE. No publish, no call, no sql, no database. It is safe to run against
 //! a live stack, and `publish` runs it first for exactly that reason.
@@ -498,6 +501,28 @@ fn shell_scripts_in(dir: &Path) -> Vec<PathBuf> {
     scripts
 }
 
+// ---------------------------------------------------------------------------------------------
+// check 5 — every generated Package Delta artifact still matches its Build Identity
+// ---------------------------------------------------------------------------------------------
+
+/// The same verification `lyracore packages check` runs standalone, folded into the gate `publish`
+/// already calls — see `packages::check` for what "stale" means and how a missing Base Snapshot is
+/// reported without failing the gate over it.
+fn check_datascript_identity(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    failures: &mut Failures,
+) {
+    step("generated Package Delta artifacts match their recorded Build Identity");
+    if let Err(e) = crate::cmd::packages::check::run(project, runner) {
+        println!("{e}");
+        failures.bad(
+            "one or more Package Delta artifacts are stale — `lyracore packages build` \
+             regenerates them",
+        );
+    }
+}
+
 fn check_db_threading(project: &ProjectLayout, failures: &mut Failures) {
     step("scripts thread their configurable DB target into every tool invocation");
     // BOTH script roots. The world-import ETL — the scripts that actually take a `DB` override and
@@ -568,6 +593,7 @@ fn run_with_schema_skip(
     );
     check_rls(project, generated.then(|| scratch.path()), &mut failures);
     check_db_threading(project, &mut failures);
+    check_datascript_identity(project, runner, &mut failures);
 
     println!();
     if failures.0.is_empty() {
@@ -956,6 +982,44 @@ mod tests {
         let project = fixture(&tmp);
         let stack = FakeStack::new().fail_on("cargo check", "private path");
         assert!(run(&project, &stack.runner()).is_err());
+    }
+
+    // ---- check 5: the Datascript Build Identity gate ----
+
+    #[test]
+    fn the_identity_gate_is_a_no_op_when_no_package_carries_a_generated_artifact() {
+        // `fixture()` has no `packages/` at all. `preflight` must still pass — this check exists
+        // to catch stale Package Deltas, not to demand that every checkout have one.
+        let tmp = TempDir::new().unwrap();
+        let project = fixture(&tmp);
+        let stack = FakeStack::new();
+        run(&project, &stack.runner()).unwrap();
+    }
+
+    #[test]
+    fn a_stale_package_delta_fails_the_whole_gate() {
+        // A generated artifact with no Build Identity sidecar predates identity tracking — stale by
+        // definition (LyraCore#316). `publish` must never ship it to a Shard.
+        let tmp = TempDir::new().unwrap();
+        let project = fixture(&tmp);
+        let generated = project.packages_dir().join("fire_nova/data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(
+            generated.join("spell.json"),
+            format!(
+                r#"{{"version":1,"package":"fire_nova","source_hash":"{}","claims":[{{"table":"game_spell","key":{{"spell_id":133}},"operation":"update","fields":{{"gcd_ms":{{"type":"u32","value":1500}}}}}}]}}"#,
+                "a".repeat(64)
+            ),
+        )
+        .unwrap();
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(
+            error.to_string().contains("Nothing was published"),
+            "{error}"
+        );
     }
 
     #[test]

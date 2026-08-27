@@ -141,6 +141,16 @@ USAGE:
                                                dependencies from datascripts/bun.lock, then
                                                typecheck every Datascript against them. Author-side
                                                only: applying a prebuilt Package needs no Bun
+  lyracore packages check                      verify every enabled Package's generated artifact
+                                               against its recorded Build Identity: the Datascript
+                                               source, generated typings, Base Snapshot, authoring
+                                               library and toolchain pins it was built from.
+                                               Regenerates the typings fresh, so a Module schema
+                                               change is caught even on a clean checkout. Refuses
+                                               naming the specific input that changed and the
+                                               rebuild command; a missing Base Snapshot is reported
+                                               unverifiable rather than failing. `preflight` (and so
+                                               `publish`) runs the same check
   lyracore packages list                       every installed Package: enabled or disabled, its
                                                Package Source, its recorded content identity,
                                                whether the installed copy has drifted from it,
@@ -229,6 +239,7 @@ pub enum Command {
         name: String,
     },
     PackagesBuild,
+    PackagesCheck,
     PackagesEnable {
         name: String,
     },
@@ -392,6 +403,10 @@ impl Command {
             ["packages", "build", other, ..] => Err(Error::Usage(format!(
                 "`packages build` takes no arguments (got '{other}')"
             ))),
+            ["packages", "check"] => Ok(Command::PackagesCheck),
+            ["packages", "check", other, ..] => Err(Error::Usage(format!(
+                "`packages check` takes no arguments (got '{other}')"
+            ))),
             ["packages", "enable", rest @ ..] => Ok(Command::PackagesEnable {
                 name: parse_packages_move("enable", rest)?,
             }),
@@ -400,9 +415,9 @@ impl Command {
             }),
             ["packages", "remove", rest @ ..] => parse_packages_remove(rest),
             ["packages", ..] => Err(Error::Usage(
-                "`packages` supports: add FOLDER|GIT-URL [--yes], build, disable NAME, enable \
-                 NAME, list, new NAME, remove NAME [--yes], replay [DATABASE ...] [--check] \
-                 [--yes] [--force-all], update [NAME] [--yes]"
+                "`packages` supports: add FOLDER|GIT-URL [--yes], build, check, disable NAME, \
+                 enable NAME, list, new NAME, remove NAME [--yes], replay [DATABASE ...] \
+                 [--check] [--yes] [--force-all], update [NAME] [--yes]"
                     .to_string(),
             )),
 
@@ -1486,6 +1501,14 @@ mod tests {
     }
 
     #[test]
+    fn packages_check_takes_no_arguments() {
+        assert_eq!(parse("packages check").unwrap(), Command::PackagesCheck);
+        for line in ["packages check --watch", "packages check my-package"] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
     fn packages_replay_takes_shard_names_and_its_own_options_in_any_order() {
         assert_eq!(
             parse("packages replay").unwrap(),
@@ -1585,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn packages_without_a_recognised_verb_names_the_eight_that_exist() {
+    fn packages_without_a_recognised_verb_names_the_nine_that_exist() {
         for line in ["packages", "packages install greeter", "packages upgrade"] {
             let error = parse(line).unwrap_err().to_string();
             for verb in PACKAGES_VERBS {
@@ -1594,8 +1617,8 @@ mod tests {
         }
     }
 
-    const PACKAGES_VERBS: [&str; 8] = [
-        "add", "build", "disable", "enable", "list", "new", "remove", "update",
+    const PACKAGES_VERBS: [&str; 9] = [
+        "add", "build", "check", "disable", "enable", "list", "new", "remove", "update",
     ];
 
     #[test]
@@ -1758,6 +1781,7 @@ mod tests {
             "lyracore client sync",
             "lyracore packages add",
             "lyracore packages build",
+            "lyracore packages check",
             "lyracore packages disable",
             "lyracore packages enable",
             "lyracore packages list",

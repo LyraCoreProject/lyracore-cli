@@ -370,6 +370,10 @@ impl ProjectLayout {
     /// Where a Datascript's Rust half sits, one folder per Package. `packages build` runs every
     /// `.ts` file directly under a Package's folder here as a subprocess.
     pub const DATASCRIPTS_SRC_DIR: &'static str = "src";
+    /// The shared authoring library every Datascript imports (`lib/index.ts`): the Base Snapshot
+    /// and Package-root readers, and the helpers a Datascript uses to build a Package Delta. A
+    /// checkout of this library is one of the Build Identity's recorded inputs (LyraCore#316).
+    pub const DATASCRIPTS_LIB_DIR: &'static str = "lib";
     /// The Base Snapshot `lyracore-importer --spell-snapshot` writes and every Datascript reads: the
     /// derived base `game_spell` / `game_spell_effect` rows, and the only base data a Datascript can
     /// see. It rides `generated/`'s own git-ignore rule for a second reason — it is the OPERATOR's
@@ -513,6 +517,11 @@ impl ProjectLayout {
     /// One folder per Package that has a Datascript, e.g. `datascripts/src/fire_nova/`.
     pub fn datascripts_src_dir(&self) -> PathBuf {
         self.datascripts_dir().join(Self::DATASCRIPTS_SRC_DIR)
+    }
+
+    /// The shared authoring library, e.g. `datascripts/lib/index.ts`.
+    pub fn datascripts_lib_dir(&self) -> PathBuf {
+        self.datascripts_dir().join(Self::DATASCRIPTS_LIB_DIR)
     }
 
     /// The Base Snapshot a Datascript reads. Git-ignored, and not written by this CLI — an author

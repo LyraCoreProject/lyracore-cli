@@ -27,6 +27,9 @@ rustix = { version = "1", features = ["fs"] }
 # Same pin as the gateway: the provisioning password is held in a wiped buffer end to end.
 zeroize = "=1.8.1"
 blake3 = "1"
+# Build Identity hashing (LyraCore#316): the recorded inputs are specified as SHA-256, distinct
+# from `artifact.rs`'s BLAKE3 canonical-form digest, which this crate also carries.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
