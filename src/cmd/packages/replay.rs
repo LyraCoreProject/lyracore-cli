@@ -25,10 +25,10 @@ use std::path::Path;
 
 use crate::cmd::import::{self, Prompt};
 use crate::cmd::packages::artifact::{self, Artifact, SPELL_FAMILY};
+use crate::cmd::packages::{recorded_databases, shard_list};
 use crate::cmd::publish::validate_database;
 use crate::proc::{CommandSpec, ProcessRunner};
-use crate::project::{Component, ProjectLayout, Topology};
-use crate::state::RuntimeState;
+use crate::project::ProjectLayout;
 use crate::{Error, Result};
 
 /// What `packages replay` was asked to do.
@@ -78,30 +78,6 @@ pub fn databases(args: &[String]) -> Result<Vec<String>> {
         validate_database(VERB, name)?;
     }
     Ok(args.to_vec())
-}
-
-/// What a bare `lyracore packages replay` means: every database of the recorded development
-/// topology, exactly as `publish` resolves it.
-fn recorded_databases(project: &ProjectLayout) -> Result<Vec<String>> {
-    let state = RuntimeState::load(&project.state_file())?;
-    let topology = if state.record(Component::Gateway).is_some() {
-        state.topology()
-    } else {
-        Topology::Sharded
-    };
-    Ok(topology
-        .databases()
-        .into_iter()
-        .map(str::to_string)
-        .collect())
-}
-
-fn shard_list(shards: &[String]) -> String {
-    if shards.is_empty() {
-        "(none)".to_string()
-    } else {
-        shards.join(" ")
-    }
 }
 
 /// The single-Shard contract this verb orchestrates: reimport the spell family from the client's

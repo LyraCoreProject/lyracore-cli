@@ -949,6 +949,37 @@ pub(crate) fn reducer_url(database: &str, reducer: &str) -> String {
     )
 }
 
+/// What to do about a failed call to an operator-gated reducer, keeping the node's own message.
+///
+/// The two refusals worth distinguishing are the ones a contributor cannot diagnose from the node's
+/// wording alone: an unclaimed operator (nothing has run `dev up` here) and a claim held by another
+/// identity (the credential on disk is not the one that claimed it). Anything else keeps its own
+/// message and gets pointed at `dev status`, because the usual cause is a node that is not up.
+pub(crate) fn operator_call_failure(
+    project: &ProjectLayout,
+    database: &str,
+    error: Error,
+) -> Error {
+    let message = error.to_string();
+    if message.contains("operator not claimed") {
+        Error::Process(format!(
+            "{error}\n  the operator identity is not claimed on {database} — run `lyracore dev \
+             up` first (it mints and claims one automatically)."
+        ))
+    } else if message.contains("operator only") {
+        Error::Process(format!(
+            "{error}\n  {database} is claimed by a DIFFERENT identity than the one in {} — delete \
+             that file and re-run `lyracore dev up` to fall back to the identity that IS the \
+             operator there.",
+            project.token_file().display()
+        ))
+    } else {
+        Error::Process(format!(
+            "{error}\n  — is the stack up? check `lyracore dev status`"
+        ))
+    }
+}
+
 /// The database-health probe: schema only, no rows, no writes.
 fn describe_command(database: &str) -> CommandSpec {
     CommandSpec::new("spacetime")

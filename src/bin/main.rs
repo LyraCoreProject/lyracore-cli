@@ -149,6 +149,10 @@ fn run(args: &[String]) -> Result<i32> {
             &options,
         )
         .map(|_| EXIT_OK),
+        Command::PackagesConfig(options) => {
+            cmd::packages::config::run(&ProjectLayout::discover()?, &runner, &http, &options)
+                .map(|_| EXIT_OK)
+        }
         Command::PackagesRemove { name, yes } => cmd::packages::lifecycle::remove(
             &ProjectLayout::discover()?,
             &cmd::import::TtyPrompt::packages_remove(),
