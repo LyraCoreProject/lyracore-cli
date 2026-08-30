@@ -136,6 +136,17 @@ USAGE:
                                                checkout is skipped, so re-running resumes. --check
                                                prints the plan and writes nothing; --force-all
                                                replays even the Shards that match
+  lyracore packages config NAME [KEY [VALUE]] [--new]
+                                               read and write an installed Package's Package Config
+                                               — the durable key-values it reads at runtime. With no
+                                               KEY it lists every key; with a KEY it prints that
+                                               value; with a VALUE it writes the key to EVERY Shard
+                                               of the fixture topology, because the rows are
+                                               per-Shard state. A read reports a key the Shards
+                                               disagree about rather than picking one answer. --new
+                                               creates a key the Package never seeded; without it
+                                               the Module refuses an unknown key and names the ones
+                                               it does have
   lyracore packages build                      regenerate the Module schema typings into
                                                datascripts/generated/, install the pinned Bun
                                                dependencies from datascripts/bun.lock, then
@@ -252,6 +263,7 @@ pub enum Command {
         yes: bool,
     },
     PackagesReplay(packages::replay::ReplayOptions),
+    PackagesConfig(packages::config::ConfigOptions),
     ProductionStatus(production::StatusOptions),
     /// The one root-only, system-state verb on this surface, deliberately its own: `update` stays
     /// a contributor's git-pull replacement and owns no service.
@@ -399,6 +411,7 @@ impl Command {
                 "`packages new` takes one name (got a second argument: '{other}')"
             ))),
             ["packages", "replay", rest @ ..] => parse_packages_replay(rest),
+            ["packages", "config", rest @ ..] => parse_packages_config(rest),
             ["packages", "build"] => Ok(Command::PackagesBuild),
             ["packages", "build", other, ..] => Err(Error::Usage(format!(
                 "`packages build` takes no arguments (got '{other}')"
@@ -415,9 +428,9 @@ impl Command {
             }),
             ["packages", "remove", rest @ ..] => parse_packages_remove(rest),
             ["packages", ..] => Err(Error::Usage(
-                "`packages` supports: add FOLDER|GIT-URL [--yes], build, check, disable NAME, \
-                 enable NAME, list, new NAME, remove NAME [--yes], replay [DATABASE ...] \
-                 [--check] [--yes] [--force-all], update [NAME] [--yes]"
+                "`packages` supports: add FOLDER|GIT-URL [--yes], build, check, config NAME [KEY \
+                 [VALUE]] [--new], disable NAME, enable NAME, list, new NAME, remove NAME [--yes], \
+                 replay [DATABASE ...] [--check] [--yes] [--force-all], update [NAME] [--yes]"
                     .to_string(),
             )),
 
@@ -655,6 +668,65 @@ fn parse_packages_replay(args: &[&str]) -> Result<Command> {
         }
     }
     Ok(Command::PackagesReplay(options))
+}
+
+/// `packages config NAME [KEY [VALUE]] [--new]`.
+///
+/// How many positional arguments there are IS the action: a name lists, a name and a key gets, a
+/// name, a key and a value sets. `--new` is consent for the set, so it is refused on the read forms
+/// rather than accepted and ignored.
+///
+/// A VALUE is taken verbatim, dashes and all. An argument that starts with `-` is only read as an
+/// option while the value slot is still empty — a config value of `-5` is an ordinary thing to
+/// write, and refusing it as an unknown option would be a rule nobody could work around.
+fn parse_packages_config(args: &[&str]) -> Result<Command> {
+    let mut allow_new = false;
+    let mut positional: Vec<String> = Vec::new();
+    for arg in args {
+        match *arg {
+            "--new" => allow_new = true,
+            option if option.starts_with('-') && positional.len() < 2 => {
+                return Err(Error::Usage(format!(
+                    "unknown `packages config` option '{option}' — the only one is --new"
+                )))
+            }
+            other => positional.push((*other).to_string()),
+        }
+    }
+
+    let (package, rest) = positional.split_first().ok_or_else(|| {
+        Error::Usage(
+            "`packages config` needs a Package name, e.g. `packages config my-package` to list \
+             its keys"
+                .to_string(),
+        )
+    })?;
+    let action = match rest {
+        [] => packages::config::ConfigAction::List,
+        [key] => packages::config::ConfigAction::Get { key: key.clone() },
+        [key, value] => packages::config::ConfigAction::Set {
+            key: key.clone(),
+            value: value.clone(),
+            allow_new,
+        },
+        [_, _, extra, ..] => {
+            return Err(Error::Usage(format!(
+                "`packages config` sets one key at a time (got a fourth argument: '{extra}'). A \
+                 value with spaces has to be quoted."
+            )))
+        }
+    };
+    if allow_new && !matches!(action, packages::config::ConfigAction::Set { .. }) {
+        return Err(Error::Usage(
+            "`--new` is the consent to create a key the Package never seeded, so it only applies \
+             to a write: `packages config NAME KEY VALUE --new`."
+                .to_string(),
+        ));
+    }
+    Ok(Command::PackagesConfig(packages::config::ConfigOptions {
+        package: package.clone(),
+        action,
+    }))
 }
 
 /// `packages enable NAME` and `packages disable NAME`: one Package name, no options.
@@ -1543,6 +1615,110 @@ mod tests {
             "packages replay lyracore --delete-data",
             "packages replay --unknown",
             "packages replay --client-data",
+        ] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+
+    /// How many positional arguments there are IS the action.
+    #[test]
+    fn packages_config_reads_its_action_from_the_number_of_arguments() {
+        use packages::config::{ConfigAction, ConfigOptions};
+
+        assert_eq!(
+            parse("packages config greeter").unwrap(),
+            Command::PackagesConfig(ConfigOptions {
+                package: "greeter".to_string(),
+                action: ConfigAction::List,
+            })
+        );
+        assert_eq!(
+            parse("packages config greeter greeting").unwrap(),
+            Command::PackagesConfig(ConfigOptions {
+                package: "greeter".to_string(),
+                action: ConfigAction::Get {
+                    key: "greeting".to_string()
+                },
+            })
+        );
+        assert_eq!(
+            parse("packages config greeter greeting Hello").unwrap(),
+            Command::PackagesConfig(ConfigOptions {
+                package: "greeter".to_string(),
+                action: ConfigAction::Set {
+                    key: "greeting".to_string(),
+                    value: "Hello".to_string(),
+                    allow_new: false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn packages_config_takes_the_new_consent_in_any_position_of_a_write() {
+        use packages::config::{ConfigAction, ConfigOptions};
+
+        let expected = Command::PackagesConfig(ConfigOptions {
+            package: "greeter".to_string(),
+            action: ConfigAction::Set {
+                key: "greeting".to_string(),
+                value: "Hello".to_string(),
+                allow_new: true,
+            },
+        });
+        for line in [
+            "packages config greeter greeting Hello --new",
+            "packages config --new greeter greeting Hello",
+            "packages config greeter --new greeting Hello",
+        ] {
+            assert_eq!(parse(line).unwrap(), expected, "{line}");
+        }
+    }
+
+    /// `--new` is consent for a write. On a read it would be a flag that did nothing, so it is
+    /// refused rather than accepted and dropped.
+    #[test]
+    fn packages_config_refuses_the_new_consent_on_a_read() {
+        for line in [
+            "packages config greeter --new",
+            "packages config greeter greeting --new",
+        ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+            assert!(
+                error.to_string().contains("only applies to a write"),
+                "{line}: {error}"
+            );
+        }
+    }
+
+    /// A config value is arbitrary Operator text. `-5` is an ordinary thing to write, and reading it
+    /// as an unknown option would be a rule with no way around it.
+    #[test]
+    fn packages_config_takes_a_dash_leading_value_verbatim() {
+        use packages::config::{ConfigAction, ConfigOptions};
+
+        assert_eq!(
+            parse("packages config greeter offset -5").unwrap(),
+            Command::PackagesConfig(ConfigOptions {
+                package: "greeter".to_string(),
+                action: ConfigAction::Set {
+                    key: "offset".to_string(),
+                    value: "-5".to_string(),
+                    allow_new: false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn packages_config_refuses_no_name_a_fourth_argument_and_invented_options() {
+        for line in [
+            "packages config",
+            "packages config --new",
+            "packages config greeter greeting Hello there",
+            "packages config greeter --force",
+            "packages config --force greeter",
         ] {
             assert!(parse(line).is_err(), "{line}");
         }

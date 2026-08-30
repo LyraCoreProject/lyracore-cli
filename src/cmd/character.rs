@@ -13,7 +13,7 @@
 //! `spacetime call`: the credential that claimed the operator may not be the `spacetime` CLI's own
 //! identity.
 
-use crate::cmd::dev::reducer_url;
+use crate::cmd::dev::{operator_call_failure, reducer_url};
 use crate::http::HttpClient;
 use crate::proc::ProcessRunner;
 use crate::project::ProjectLayout;
@@ -29,8 +29,12 @@ pub fn gm(
 ) -> Result<()> {
     let level = if enabled { 3 } else { 0 };
     let credential = crate::token::resolve_existing(runner, &project.token_file())?;
-    let shards = RuntimeState::load(&project.state_file())?.topology().world_shards();
-    let arguments = format!("[{},{level}]", json_string(name));
+    let shards = RuntimeState::load(&project.state_file())?
+        .topology()
+        .world_shards();
+    // Serialized rather than concatenated: hand-escaping a character name would be one more place
+    // to forget an edge case.
+    let arguments = serde_json::to_string(&(name, level))?;
 
     for shard in &shards {
         match http.post_json(
@@ -42,38 +46,15 @@ pub fn gm(
                 println!("✓ set gm_level {level} for '{name}' on {shard}");
                 return Ok(());
             }
+            // The only refusal that continues the walk: this shard does not hold the character, so
+            // the next one might. Everything else stops here with what to do about it.
             Err(e) if e.to_string().contains("no player named") => continue,
-            Err(e) if e.to_string().contains("operator not claimed") => {
-                return Err(Error::Process(format!(
-                    "{e}\n  the operator identity is not claimed on {shard} — run `lyracore dev \
-                     up` first (it mints and claims one automatically)."
-                )));
-            }
-            Err(e) if e.to_string().contains("operator only") => {
-                return Err(Error::Process(format!(
-                    "{e}\n  {shard} is claimed by a DIFFERENT identity than the one in {} — \
-                     delete that file and re-run `lyracore dev up` to fall back to the identity \
-                     that IS the operator there.",
-                    project.token_file().display()
-                )));
-            }
-            Err(e) => {
-                return Err(Error::Process(format!(
-                    "{e}\n  — is the stack up? check `lyracore dev status`"
-                )))
-            }
+            Err(e) => return Err(operator_call_failure(project, shard, e)),
         }
     }
     Err(Error::Process(format!(
         "no player named '{name}' on any world shard"
     )))
-}
-
-/// A Rust string as a JSON string literal — the same reasoning as `project::json_string`: one
-/// argument goes through this, and hand-escaping a character name would be the second place to
-/// forget an edge case.
-fn json_string(value: &str) -> String {
-    serde_json::to_string(value).expect("a string always serializes")
 }
 
 #[cfg(test)]
@@ -94,7 +75,9 @@ mod tests {
     /// touching the `spacetime` CLI.
     fn with_credential(project: &ProjectLayout) {
         crate::token::resolve_or_mint(
-            &FakeStack::new().fail_on("login show", "not logged in").runner(),
+            &FakeStack::new()
+                .fail_on("login show", "not logged in")
+                .runner(),
             &FakeHttp::new(),
             &project.token_file(),
             "http://127.0.0.1:3000",
@@ -207,8 +190,14 @@ mod tests {
         let error = gm(&project, &FakeStack::new().runner(), &http, "Nobody", true)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("no player named 'Nobody' on any world shard"), "{error}");
-        assert_eq!(http.requests().len(), Topology::Sharded.world_shards().len());
+        assert!(
+            error.contains("no player named 'Nobody' on any world shard"),
+            "{error}"
+        );
+        assert_eq!(
+            http.requests().len(),
+            Topology::Sharded.world_shards().len()
+        );
     }
 
     #[test]

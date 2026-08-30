@@ -1,7 +1,8 @@
 //! `lyracore packages add <folder|git-url|name>`, `lyracore packages new <name>`, `lyracore
 //! packages list`, the lifecycle verbs in [`lifecycle`] (`enable`, `disable`, `remove`), the Git
-//! Package Source verbs in [`git`] (the URL form of `add`, and `update`), and the Official Package
-//! Collection form of `add` in [`official`] (the bare-name form).
+//! Package Source verbs in [`git`] (the URL form of `add`, and `update`), the Official Package
+//! Collection form of `add` in [`official`] (the bare-name form), and the two verbs that reach a
+//! running Realm: [`replay`] (a Package's Delta) and [`config`] (a Package's key-values).
 //!
 //! A Package is a drop-in folder under `packages/<name>/` that the server build compiles into the
 //! module with no core-file edits: `module/build.rs` discovers it, generates `pub mod pkg_<name>`
@@ -27,6 +28,7 @@
 pub mod artifact;
 pub mod build;
 pub mod check;
+pub mod config;
 pub mod git;
 pub mod identity;
 pub mod lifecycle;
@@ -39,11 +41,41 @@ pub(crate) mod tree;
 use crate::cmd::import::Prompt;
 use crate::cmd::preflight;
 use crate::proc::ProcessRunner;
-use crate::project::ProjectLayout;
+use crate::project::{Component, ProjectLayout, Topology};
+use crate::state::RuntimeState;
 use crate::{Error, Result};
 use review::TrustReview;
 use stamp::ProvenanceStamp;
 use std::path::{Path, PathBuf};
+
+/// Every database of the recorded development topology — what a `packages` verb means when no Shard
+/// is named, and exactly how `publish` resolves the same absence.
+///
+/// A checkout that has never run `dev up` has recorded nothing, and the default fixture is sharded.
+/// This is deliberately the only topology source these verbs have: there is no path here that
+/// infers a production Realm's Shard list.
+pub(crate) fn recorded_databases(project: &ProjectLayout) -> Result<Vec<String>> {
+    let state = RuntimeState::load(&project.state_file())?;
+    let topology = if state.record(Component::Gateway).is_some() {
+        state.topology()
+    } else {
+        Topology::Sharded
+    };
+    Ok(topology
+        .databases()
+        .into_iter()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Shard names for a report line, with an explicit word for none of them.
+pub(crate) fn shard_list(shards: &[String]) -> String {
+    if shards.is_empty() {
+        "(none)".to_string()
+    } else {
+        shards.join(" ")
+    }
+}
 
 /// The folder name of the maintained reference Package, checked into every LyraCore checkout
 /// (including the public mirror) at `packages/example/`. `packages new` copies and renames it; see
