@@ -681,13 +681,26 @@ fn parse_packages_replay(args: &[&str]) -> Result<Command> {
 /// write, and refusing it as an unknown option would be a rule nobody could work around.
 fn parse_packages_config(args: &[&str]) -> Result<Command> {
     let mut allow_new = false;
+    let mut databases: Vec<String> = Vec::new();
     let mut positional: Vec<String> = Vec::new();
-    for arg in args {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         match *arg {
             "--new" => allow_new = true,
+            "--database" => match args.next() {
+                Some(name) if !name.starts_with('-') => databases.push((*name).to_string()),
+                _ => {
+                    return Err(Error::Usage(
+                        "`--database` needs a Shard name, e.g. `--database lyracore-world-1`; \
+                         repeat it for every Shard"
+                            .to_string(),
+                    ))
+                }
+            },
             option if option.starts_with('-') && positional.len() < 2 => {
                 return Err(Error::Usage(format!(
-                    "unknown `packages config` option '{option}' — the only one is --new"
+                    "unknown `packages config` option '{option}' — the options are --new and \
+                     --database NAME"
                 )))
             }
             other => positional.push((*other).to_string()),
@@ -726,6 +739,7 @@ fn parse_packages_config(args: &[&str]) -> Result<Command> {
     Ok(Command::PackagesConfig(packages::config::ConfigOptions {
         package: package.clone(),
         action,
+        databases,
     }))
 }
 
@@ -1630,6 +1644,7 @@ mod tests {
             Command::PackagesConfig(ConfigOptions {
                 package: "greeter".to_string(),
                 action: ConfigAction::List,
+                databases: vec![],
             })
         );
         assert_eq!(
@@ -1639,6 +1654,7 @@ mod tests {
                 action: ConfigAction::Get {
                     key: "greeting".to_string()
                 },
+                databases: vec![],
             })
         );
         assert_eq!(
@@ -1650,6 +1666,7 @@ mod tests {
                     value: "Hello".to_string(),
                     allow_new: false,
                 },
+                databases: vec![],
             })
         );
     }
@@ -1665,6 +1682,7 @@ mod tests {
                 value: "Hello".to_string(),
                 allow_new: true,
             },
+                databases: vec![],
         });
         for line in [
             "packages config greeter greeting Hello --new",
@@ -1672,6 +1690,31 @@ mod tests {
             "packages config greeter --new greeting Hello",
         ] {
             assert_eq!(parse(line).unwrap(), expected, "{line}");
+        }
+    }
+
+    /// A production topology has its own Shard names; `--database` names them explicitly, once
+    /// per Shard, instead of the recorded fixture topology.
+    #[test]
+    fn packages_config_takes_explicit_shard_names() {
+        use packages::config::{ConfigAction, ConfigOptions};
+
+        assert_eq!(
+            parse("packages config greeter --database lyracore --database lyracore-world-1")
+                .unwrap(),
+            Command::PackagesConfig(ConfigOptions {
+                package: "greeter".to_string(),
+                action: ConfigAction::List,
+                databases: vec!["lyracore".to_string(), "lyracore-world-1".to_string()],
+            })
+        );
+        for line in [
+            "packages config greeter --database",
+            "packages config greeter --database --new",
+        ] {
+            let error = parse(line).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
+            assert!(error.to_string().contains("needs a Shard name"), "{line}: {error}");
         }
     }
 
@@ -1707,6 +1750,7 @@ mod tests {
                     value: "-5".to_string(),
                     allow_new: false,
                 },
+                databases: vec![],
             })
         );
     }

@@ -53,6 +53,9 @@ pub enum ConfigAction {
 pub struct ConfigOptions {
     pub package: String,
     pub action: ConfigAction,
+    /// Shards named on the command line. Empty means the recorded fixture topology, which is
+    /// the wrong answer on a production host whose Shards have their own names.
+    pub databases: Vec<String>,
 }
 
 /// One key-value write, as `set_package_config` takes it.
@@ -108,7 +111,11 @@ pub fn run(
     // build's own name rule is narrow enough that nothing which passes it can carry a quote.
     let package = PackageName::parse(&options.package)?;
     refuse_uninstalled(project, &package)?;
-    let shards = packages::recorded_databases(project)?;
+    let shards = if options.databases.is_empty() {
+        packages::recorded_databases(project)?
+    } else {
+        options.databases.clone()
+    };
 
     match &options.action {
         ConfigAction::List => {
@@ -223,7 +230,12 @@ fn config_rows(shard: &str, output: &str) -> Result<BTreeMap<String, String>> {
     Ok(cells
         .into_iter()
         .filter(|row| row.len() > key.max(value))
-        .map(|row| (row[key].clone(), row[value].clone()))
+        .map(|row| {
+            (
+                packages::stamp::unquote(&row[key]),
+                packages::stamp::unquote(&row[value]),
+            )
+        })
         .collect())
 }
 
@@ -458,6 +470,7 @@ mod tests {
         ConfigOptions {
             package: package.to_string(),
             action: ConfigAction::List,
+            databases: Vec::new(),
         }
     }
 
@@ -467,6 +480,7 @@ mod tests {
             action: ConfigAction::Get {
                 key: key.to_string(),
             },
+            databases: Vec::new(),
         }
     }
 
@@ -478,6 +492,7 @@ mod tests {
                 value: value.to_string(),
                 allow_new,
             },
+            databases: Vec::new(),
         }
     }
 
@@ -615,6 +630,53 @@ mod tests {
             assert!(!rendered.contains("ORDER BY"), "{rendered}");
             assert!(!rendered.contains(" IN ("), "{rendered}");
         }
+    }
+
+    /// Named Shards replace the recorded topology outright: a production host records nothing
+    /// and its Shards are not the fixture's.
+    #[test]
+    fn named_shards_replace_the_recorded_topology() {
+        let checkout = Checkout::new();
+        checkout
+            .with_package("greeter")
+            .with_topology(Topology::Sharded);
+        let named = ["lyracore", "lyracore-world-1"];
+        let mut stack = FakeStack::new();
+        for database in named {
+            stack = shard(stack, database, &[("greeting", "Hello")]);
+        }
+        let mut options = list_options("greeter");
+        options.databases = named.iter().map(|s| s.to_string()).collect();
+
+        run(&checkout.project, &stack.runner(), &FakeHttp::new(), &options).unwrap();
+
+        let asked = queries(&stack);
+        assert_eq!(asked.len(), named.len());
+        for (rendered, database) in asked.iter().zip(named) {
+            assert!(rendered.contains(database), "{rendered}");
+        }
+    }
+
+    /// `spacetime sql` prints string cells in quotes. The key the Operator types has none, so the
+    /// quotes must come off before a GET can find it.
+    #[test]
+    fn a_get_finds_a_key_the_node_printed_in_quotes() {
+        let checkout = Checkout::new();
+        checkout
+            .with_package("greeter")
+            .with_topology(Topology::Single);
+        let quoted = [("\"greeting\"", "\"Hello\"")];
+        let stack = shard(FakeStack::new(), "lyracore", &quoted);
+
+        let rows = config_rows("lyracore", &sql_rows(&quoted)).unwrap();
+        assert_eq!(rows.get("greeting").map(String::as_str), Some("Hello"));
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &FakeHttp::new(),
+            &get_options("greeter", "greeting"),
+        )
+        .unwrap();
     }
 
     #[test]
