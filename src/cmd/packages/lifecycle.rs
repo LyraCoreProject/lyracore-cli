@@ -20,7 +20,7 @@
 //! whatever was last published until the operator publishes again, and each command ends by naming
 //! the steps it did not run.
 
-use super::stamp::{self, SOURCE_LOCAL};
+use super::stamp::{self, SOURCE_GIT, SOURCE_LOCAL, SOURCE_OFFICIAL};
 use super::{
     collision, collision_reason, confirm, find, review::TrustReview, shell_quote, InstalledPackage,
     PackageName, PackageState,
@@ -139,7 +139,7 @@ pub fn remove(project: &ProjectLayout, prompt: &dyn Prompt, name: &str, yes: boo
         TrustReview::scan(&package.dir)?.kinds_summary()
     );
     println!();
-    print!("{}", recovery_note(package.stamp.as_ref()));
+    print!("{}", recovery_note(&package.name, package.stamp.as_ref()));
 
     confirm(
         prompt,
@@ -291,13 +291,35 @@ fn table_warning(name: &PackageName, tables: &[String]) -> String {
 ///
 /// The stamp is the only record of that, and it is the difference between a deletion the operator
 /// can undo with one `packages add` and one they cannot undo at all.
-fn recovery_note(stamp: Option<&stamp::ProvenanceStamp>) -> String {
+fn recovery_note(name: &PackageName, stamp: Option<&stamp::ProvenanceStamp>) -> String {
     match stamp {
         Some(recorded) if recorded.source_kind == SOURCE_LOCAL && !recorded.source.is_empty() => {
             format!(
                 "This command does not touch the Package Source it was installed from, so it can \
                  be\ninstalled again with:\n      lyracore packages add {}\n",
                 shell_quote(Path::new(&recorded.source))
+            )
+        }
+        Some(recorded) if recorded.source_kind == SOURCE_GIT && !recorded.source.is_empty() => {
+            format!(
+                "This command does not touch the Git Package Source it was installed from \
+                 ({}, revision {}), so it can be\ninstalled again with:\n      lyracore packages \
+                 add {}\n",
+                recorded.source,
+                recorded.revision,
+                shell_quote(Path::new(&recorded.source))
+            )
+        }
+        Some(recorded)
+            if recorded.source_kind == SOURCE_OFFICIAL && !recorded.source.is_empty() =>
+        {
+            format!(
+                "This command does not touch the Official Package Source it was installed from \
+                 ({}, revision {}), so it can be\ninstalled again with:\n      lyracore packages \
+                 add {}\n",
+                recorded.source,
+                recorded.revision,
+                name.as_str()
             )
         }
         // A scaffold, or a stamp that records no usable source: nothing outside this checkout is
@@ -558,17 +580,73 @@ mod tests {
     }
 
     #[test]
-    fn the_recovery_note_offers_reinstalling_only_when_a_package_source_holds_a_copy() {
+    fn recovery_note_names_the_local_folder_unchanged() {
         let local = ProvenanceStamp::local(Path::new("/home/dev/src/greeter"), String::new(), 0);
-        let note = recovery_note(Some(&local));
-        assert!(note.contains("/home/dev/src/greeter"), "{note}");
-        assert!(note.contains("packages add"), "{note}");
+        assert_eq!(
+            recovery_note(&PackageName::parse("greeter").unwrap(), Some(&local)),
+            "This command does not touch the Package Source it was installed from, so it can \
+             be\ninstalled again with:\n      lyracore packages add '/home/dev/src/greeter'\n"
+        );
+    }
+
+    #[test]
+    fn recovery_note_names_the_git_package_source_and_recorded_revision() {
+        let git = ProvenanceStamp::git(
+            "https://example.test/greeter.git",
+            "1a2b3c4d5e6f".to_string(),
+            String::new(),
+            0,
+        );
+        let note = recovery_note(&PackageName::parse("greeter").unwrap(), Some(&git));
+
+        assert!(note.contains("Git Package Source"), "{note}");
+        assert!(note.contains("https://example.test/greeter.git"), "{note}");
+        assert!(note.contains("revision 1a2b3c4d5e6f"), "{note}");
+        assert!(
+            note.contains("lyracore packages add 'https://example.test/greeter.git'"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn recovery_note_names_the_official_package_source_and_bare_package_name() {
+        let official = ProvenanceStamp::official(
+            "https://github.com/LyraCoreProject/packages",
+            "1a2b3c4d5e6f".to_string(),
+            String::new(),
+            0,
+        );
+        let note = recovery_note(&PackageName::parse("greeter").unwrap(), Some(&official));
+
+        assert!(note.contains("Official Package Source"), "{note}");
+        assert!(
+            note.contains("https://github.com/LyraCoreProject/packages"),
+            "{note}"
+        );
+        assert!(note.contains("revision 1a2b3c4d5e6f"), "{note}");
+        assert!(note.contains("lyracore packages add greeter"), "{note}");
+    }
+
+    #[test]
+    fn recovery_note_is_final_for_missing_or_unknown_package_sources() {
+        let missing_kind = ProvenanceStamp {
+            source: "somewhere".to_string(),
+            ..Default::default()
+        };
+        let unknown = ProvenanceStamp {
+            source_kind: "unknown".to_string(),
+            source: "somewhere".to_string(),
+            ..Default::default()
+        };
 
         // A scaffold was copied out of this checkout and renamed. Re-adding it would not bring
         // back the Package that is being deleted.
         let scaffold = ProvenanceStamp::scaffolded("packages/example/", String::new(), 0);
-        assert!(recovery_note(Some(&scaffold)).contains("final"));
-        assert!(recovery_note(None).contains("final"));
+        let name = PackageName::parse("greeter").unwrap();
+        assert!(recovery_note(&name, Some(&scaffold)).contains("final"));
+        assert!(recovery_note(&name, Some(&missing_kind)).contains("final"));
+        assert!(recovery_note(&name, Some(&unknown)).contains("final"));
+        assert!(recovery_note(&name, None).contains("final"));
     }
 
     #[test]
