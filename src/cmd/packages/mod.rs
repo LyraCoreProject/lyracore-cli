@@ -1,8 +1,8 @@
 //! `lyracore packages add <folder|git-url|name>`, `lyracore packages new <name>`, `lyracore
 //! packages list`, the lifecycle verbs in [`lifecycle`] (`enable`, `disable`, `remove`), the Git
-//! Package Source verbs in [`git`] (the URL form of `add`, and `update`), the Official Package
-//! Collection form of `add` in [`official`] (the bare-name form), and the two verbs that reach a
-//! running Realm: [`replay`] (a Package's Delta) and [`config`] (a Package's key-values).
+//! Package Source verbs in [`git`] (the URL form of `add` and all `update` forms), the Official
+//! Package Collection form of `add` in [`official`] (the bare-name form), and the two verbs that
+//! reach a running Realm: [`replay`] (a Package's Delta) and [`config`] (a Package's key-values).
 //!
 //! A Package is a drop-in folder under `packages/<name>/` that the server build compiles into the
 //! module with no core-file edits: `module/build.rs` discovers it, generates `pub mod pkg_<name>`

@@ -37,9 +37,9 @@ pub const SOURCE_SCAFFOLD: &str = "scaffold";
 /// The kind an install from the Official Package Collection records. Its
 /// [`source`](ProvenanceStamp::source) is the collection repository's URL (see
 /// `official::COLLECTION_URL`) and its [`revision`](ProvenanceStamp::revision) is the exact commit
-/// the named top-level directory was resolved at. `packages update` does not advance this kind —
-/// pinning the commit at install time, rather than re-resolving the name later, is what stops the
-/// collection's later commits from silently changing an installed revision.
+/// the named top-level directory was resolved at. `packages update` re-resolves that directory from
+/// a fresh collection clone and records its current commit after the ordinary update contract
+/// passes; the collection never changes an installed Package without that update.
 pub const SOURCE_OFFICIAL: &str = "official";
 
 /// What `packages add` recorded about an install.

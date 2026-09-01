@@ -8,11 +8,11 @@
 //! Source's — see [`RepositoryClone`] — so this module reuses that machinery rather than a second
 //! copy of it.
 //!
-//! THE COMMIT IS PINNED AT INSTALL TIME, NOT THE NAME. The stamp records the exact commit the named
-//! directory was resolved at, and nothing re-resolves it later: `packages update` refuses an
-//! Official Package Source by name (`git_backing`'s catch-all), the same way it refuses a local
-//! folder or a scaffold. A later commit to the collection — even one that renames or removes the
-//! directory this Package came from — cannot change what is already installed.
+//! THE COMMIT IS RECORDED AT INSTALL AND UPDATE TIME. The stamp records the exact commit the named
+//! directory was resolved at. `packages update` re-clones the Official Package Collection and
+//! resolves that same name in the candidate tree before it asks to replace the installed Package.
+//! A later collection commit never changes an installed Package until the Operator consents to an
+//! update that has passed the ordinary Package gates.
 //!
 //! Out of scope, by design: a general Package registry, and more than this one repository. Adding
 //! either later is a new resolution rule here, not a change to how a local folder or a Git Package
@@ -31,6 +31,11 @@ use std::path::{Path, PathBuf};
 /// scope for this resolution rule.
 pub(crate) const COLLECTION_URL: &str = "https://github.com/LyraCoreProject/packages";
 
+/// The one cloneable source behind the Official Package Collection.
+pub(crate) fn collection_source() -> GitSource {
+    GitSource::parse(COLLECTION_URL).expect("COLLECTION_URL is a hardcoded https:// URL")
+}
+
 /// Install the top-level directory `name` names in the collection, the same way `packages add`
 /// installs a local folder or a Git Package Source: clone, resolve the one directory, then hand it
 /// to [`install`](super::install).
@@ -44,8 +49,7 @@ pub(crate) fn add(
     // Before the network: an install the inventory would refuse anyway is not worth a clone.
     super::check_collision(project, name)?;
 
-    let collection =
-        GitSource::parse(COLLECTION_URL).expect("COLLECTION_URL is a hardcoded https:// URL");
+    let collection = collection_source();
     let clone = RepositoryClone::fetch(project, runner, &collection)?;
     let source = resolve(clone.path(), name)?;
 
@@ -69,7 +73,7 @@ pub(crate) fn add(
 /// almost always the one the operator meant — but never installed in the requested name's place:
 /// these verbs act on the name the operator typed, exactly, the same rule [`find`](super::find)
 /// applies to an already-installed Package.
-fn resolve(collection: &Path, name: &PackageName) -> Result<PathBuf> {
+pub(crate) fn resolve(collection: &Path, name: &PackageName) -> Result<PathBuf> {
     let mut top_level = Vec::new();
     for entry in std::fs::read_dir(collection)? {
         let entry = entry?;
@@ -244,23 +248,85 @@ mod tests {
     }
 
     #[test]
-    fn a_collection_that_moves_on_does_not_change_what_is_already_installed() {
-        // The collection genuinely advances to SECOND with different content, and `packages
-        // update` is actually invoked against it — the strong form of "cannot silently change an
-        // installed revision": not just that nothing re-clones on its own, but that asking this
-        // checkout to advance it is refused, with the old commit and content untouched.
+    fn a_named_update_advances_an_official_package_to_the_collection_tip() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let root = collection(&tmp, &["greeter"]);
         let stack = repository(&root, FIRST);
         super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true).unwrap();
         let installed = project.packages_dir().join("greeter");
-        let before = ProvenanceStamp::read(&installed).unwrap();
-        assert_eq!(before.revision, FIRST);
-
         std::fs::write(root.join("greeter/src/mod.rs"), "pub fn greeter_v2() {}\n").unwrap();
         let stack = repository(&root, SECOND);
 
+        super::super::git::update(
+            &project,
+            &stack.runner(),
+            &Answer("yes"),
+            Some("greeter"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(installed.join("src/mod.rs")).unwrap(),
+            "pub fn greeter_v2() {}\n"
+        );
+        let recorded = ProvenanceStamp::read(&installed).unwrap();
+        assert_eq!(recorded.source_kind, SOURCE_OFFICIAL);
+        assert_eq!(recorded.revision, SECOND);
+        assert_eq!(
+            recorded.content_identity,
+            stamp::content_identity(&installed).unwrap(),
+            "the updated Package must not read as locally drifted"
+        );
+        for call in stack.rendered() {
+            assert!(!call.contains("spacetime publish"), "{call}");
+            assert!(!call.contains("--pack-client"), "{call}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_update_advances_every_official_package() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let root = collection(&tmp, &["greeter", "logger"]);
+        let stack = repository(&root, FIRST);
+        super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true).unwrap();
+        super::super::add(&project, &stack.runner(), &Answer("yes"), "logger", true).unwrap();
+
+        std::fs::write(root.join("greeter/src/mod.rs"), "pub fn greeter_v2() {}\n").unwrap();
+        std::fs::write(root.join("logger/src/mod.rs"), "pub fn logger_v2() {}\n").unwrap();
+        let stack = repository(&root, SECOND);
+
+        super::super::git::update(&project, &stack.runner(), &Answer("yes"), None, true).unwrap();
+
+        for name in ["greeter", "logger"] {
+            assert_eq!(
+                ProvenanceStamp::read(&project.packages_dir().join(name))
+                    .unwrap()
+                    .revision,
+                SECOND,
+                "{name} must update in an unnamed sweep"
+            );
+        }
+    }
+
+    #[test]
+    fn an_official_package_with_local_drift_is_refused_without_a_clone() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let root = collection(&tmp, &["greeter"]);
+        super::super::add(
+            &project,
+            &repository(&root, FIRST).runner(),
+            &Answer("yes"),
+            "greeter",
+            true,
+        )
+        .unwrap();
+        let installed = project.packages_dir().join("greeter");
+        std::fs::write(installed.join("src/mod.rs"), "// local work\n").unwrap();
+
+        let stack = repository(&root, SECOND);
         let error = super::super::git::update(
             &project,
             &stack.runner(),
@@ -270,26 +336,51 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
-        assert!(
-            error.to_string().contains("Official Package Collection"),
-            "{error}"
-        );
-        assert!(
-            error.to_string().contains("pinned at install time"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("no longer matches"), "{error}");
         assert_eq!(
-            ProvenanceStamp::read(&installed),
-            Some(before),
-            "the refusal must not touch the recorded revision or content identity"
+            std::fs::read_to_string(installed.join("src/mod.rs")).unwrap(),
+            "// local work\n"
         );
         assert!(
-            !std::fs::read_to_string(installed.join("src/mod.rs"))
-                .unwrap()
-                .contains("greeter_v2"),
-            "the collection's later commit must not reach an already-installed Package"
+            stack
+                .rendered()
+                .iter()
+                .all(|call| !call.contains("git clone")),
+            "the drift check must run before the collection clone"
         );
+    }
+
+    #[test]
+    fn a_failed_official_update_restores_the_previous_revision_and_names_both_commits() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let root = collection(&tmp, &["greeter"]);
+        super::super::add(
+            &project,
+            &repository(&root, FIRST).runner(),
+            &Answer("yes"),
+            "greeter",
+            true,
+        )
+        .unwrap();
+        let installed = project.packages_dir().join("greeter");
+        let before = stamp::content_identity(&installed).unwrap();
+        std::fs::write(root.join("greeter/src/mod.rs"), "pub fn greeter_v2() {}\n").unwrap();
+
+        let stack = repository(&root, SECOND).fail_on("cargo check", "the new revision is broken");
+        let error = super::super::git::update(
+            &project,
+            &stack.runner(),
+            &Answer("yes"),
+            Some("greeter"),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(&FIRST[..7]), "{error}");
+        assert!(error.to_string().contains(&SECOND[..7]), "{error}");
+        assert_eq!(stamp::content_identity(&installed).unwrap(), before);
+        assert_eq!(ProvenanceStamp::read(&installed).unwrap().revision, FIRST);
     }
 
     #[test]
