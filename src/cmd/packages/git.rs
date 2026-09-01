@@ -1,4 +1,5 @@
-//! Git Package Sources: `lyracore packages add <git-url>` and `lyracore packages update [NAME]`.
+//! Git and Official Package Sources: `lyracore packages add <git-url>` and
+//! `lyracore packages update [NAME]`.
 //!
 //! A Git Package Source is a repository whose ROOT is one Package — the folder holding `src/`
 //! and/or `client/` is the repository itself, not a directory inside it.
@@ -216,7 +217,8 @@ pub(crate) fn add(
     )
 }
 
-/// Advance one named Git-backed Package, or every one of them, to the repository's current commit.
+/// Advance one named Package with a Git Package Source or Official Package Source, or every one of
+/// them, to its Package Source's current commit.
 ///
 /// With no name this walks BOTH inventories: a disabled Package is still installed and still came
 /// from somewhere, and leaving it behind would mean re-enabling it later brought back a revision
@@ -233,18 +235,18 @@ pub fn update(
         None => inventory(project)?
             .into_iter()
             .filter(|package| {
-                package
-                    .stamp
-                    .as_ref()
-                    .is_some_and(|recorded| recorded.source_kind == SOURCE_GIT)
+                package.stamp.as_ref().is_some_and(|recorded| {
+                    matches!(recorded.source_kind.as_str(), SOURCE_GIT | SOURCE_OFFICIAL)
+                })
             })
             .collect(),
     };
     if targets.is_empty() {
-        println!("no Git-backed Packages are installed, so there is nothing to update.");
+        println!("no Packages from a Git Package Source or Official Package Source are installed, so there is nothing to update.");
         println!(
             "`lyracore packages add <git-url>` installs one from a repository whose root is a \
-             Package; `lyracore packages list` shows where each installed Package came from."
+             Package, and `lyracore packages add <name>` installs one from the Official Package \
+             Collection. `lyracore packages list` shows where each installed Package came from."
         );
         return Ok(());
     }
@@ -277,10 +279,7 @@ pub fn update(
 
     if targets.len() > 1 {
         println!();
-        println!(
-            "{advanced} of {} Git-backed Package(s) advanced.",
-            targets.len()
-        );
+        println!("{advanced} of {} Package(s) advanced.", targets.len());
     }
     Ok(())
 }
@@ -300,17 +299,10 @@ fn update_one(
     yes: bool,
 ) -> Result<bool> {
     let name = package.name.as_str();
-    let recorded = git_backing(package)?;
+    let (recorded, source) = update_source(package)?;
     refuse_dirty(package, recorded)?;
-    let source = GitSource::parse(&recorded.source).ok_or_else(|| {
-        Error::Usage(format!(
-            "cannot update '{name}': its stamp records the Package Source '{}', which is not a \
-             repository URL this command can clone. Nothing was changed.",
-            recorded.source
-        ))
-    })?;
 
-    let clone = RepositoryClone::fetch(project, runner, &source)?;
+    let clone = source.fetch(project, runner)?;
     if clone.revision() == recorded.revision {
         println!(
             "'{name}' is already at {} — the repository has nothing newer.",
@@ -333,15 +325,18 @@ fn update_one(
             short(&recorded.revision)
         ))
     };
-    super::validate_shape(clone.path()).map_err(&candidate)?;
-    let review = TrustReview::scan(clone.path()).map_err(&candidate)?;
+    let candidate_path = source
+        .candidate_path(&clone, &package.name)
+        .map_err(&candidate)?;
+    super::validate_shape(&candidate_path).map_err(&candidate)?;
+    let review = TrustReview::scan(&candidate_path).map_err(&candidate)?;
     // Computed before the question, so the tree the operator was shown is the tree that is
     // installed if they say yes.
-    let reviewed_identity = stamp::content_identity(clone.path()).map_err(&candidate)?;
+    let reviewed_identity = stamp::content_identity(&candidate_path).map_err(&candidate)?;
     println!();
-    print!("{}", review.render(clone.path()));
+    print!("{}", review.render(&candidate_path));
     println!();
-    println!("  source    git {}", source.url());
+    println!("  source    {} {}", source.kind(), source.url());
     println!("  from      {}", recorded.revision);
     println!("  to        {}", clone.revision());
     println!();
@@ -365,16 +360,13 @@ fn update_one(
     // promises it never does.
     refuse_dirty(package, recorded)?;
 
-    let origin = Origin::Git {
-        url: source.url(),
-        revision: clone.revision(),
-    };
+    let origin = source.origin(clone.revision());
     let compiled_in = package.state == PackageState::Enabled;
     let preserved = PreservedPackage::move_aside(project, package)?;
     let installed = install_tree(
         project,
         &package.name,
-        clone.path(),
+        &candidate_path,
         &reviewed_identity,
         &origin,
         &package.dir,
@@ -437,15 +429,68 @@ fn update_one(
     Ok(true)
 }
 
-/// The Git Package Source an installed Package records, or a refusal naming what it actually is.
+/// The candidate source an installed Package records.
 ///
-/// `update` advances a recorded commit of a recorded repository. A local folder and a scaffold have
-/// no repository to advance from at all. An Official Package Source does — its collection moves on
-/// like any other — but its commit is pinned at install time by design, not by an accident of this
-/// version lacking the code; that is what a later commit to the collection cannot silently install.
-/// A Package Source kind this version does not otherwise know is turned away by name too, rather
-/// than silently skipped or cloned on the chance that it might be a repository.
-fn git_backing(package: &InstalledPackage) -> Result<&ProvenanceStamp> {
+/// A Git Package Source uses the clone root. An Official Package Source resolves the installed
+/// Package name under the cloned collection. Both then enter the same update contract below.
+enum UpdateSource {
+    Git(GitSource),
+    Official,
+}
+
+impl UpdateSource {
+    fn fetch(
+        &self,
+        project: &ProjectLayout,
+        runner: &dyn ProcessRunner,
+    ) -> Result<RepositoryClone> {
+        match self {
+            Self::Git(source) => RepositoryClone::fetch(project, runner, source),
+            Self::Official => {
+                let collection = super::official::collection_source();
+                RepositoryClone::fetch(project, runner, &collection)
+            }
+        }
+    }
+
+    fn candidate_path(&self, clone: &RepositoryClone, name: &PackageName) -> Result<PathBuf> {
+        match self {
+            Self::Git(_) => Ok(clone.path().to_path_buf()),
+            Self::Official => super::official::resolve(clone.path(), name),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Git(_) => SOURCE_GIT,
+            Self::Official => SOURCE_OFFICIAL,
+        }
+    }
+
+    fn url(&self) -> &str {
+        match self {
+            Self::Git(source) => source.url(),
+            Self::Official => super::official::COLLECTION_URL,
+        }
+    }
+
+    fn origin<'a>(&'a self, revision: &'a str) -> Origin<'a> {
+        match self {
+            Self::Git(source) => Origin::Git {
+                url: source.url(),
+                revision,
+            },
+            Self::Official => Origin::Official { revision },
+        }
+    }
+}
+
+/// The recorded update source, or a refusal naming what the Package actually is.
+///
+/// A local folder and a scaffold have no remote tree to advance from. The Official Package
+/// Collection is one fixed collection, so an edited collection URL does not turn an official stamp
+/// into a general registry entry.
+fn update_source(package: &InstalledPackage) -> Result<(&ProvenanceStamp, UpdateSource)> {
     let name = package.name.as_str();
     let Some(recorded) = package.stamp.as_ref() else {
         return Err(Error::Usage(format!(
@@ -466,7 +511,16 @@ fn git_backing(package: &InstalledPackage) -> Result<&ProvenanceStamp> {
                 }
             )))
         }
-        SOURCE_GIT => Ok(recorded),
+        SOURCE_GIT => {
+            let source = GitSource::parse(&recorded.source).ok_or_else(|| {
+                Error::Usage(format!(
+                    "cannot update '{name}': its stamp records the Package Source '{}', which is \
+                     not a repository URL this command can clone. Nothing was changed.",
+                    recorded.source
+                ))
+            })?;
+            Ok((recorded, UpdateSource::Git(source)))
+        }
         SOURCE_LOCAL => Err(Error::Usage(format!(
             "cannot update '{name}': it was installed from a folder on this machine ({}), not from \
              a repository, so there is no newer revision to fetch. Copy a newer version in by hand, \
@@ -477,20 +531,27 @@ fn git_backing(package: &InstalledPackage) -> Result<&ProvenanceStamp> {
             "cannot update '{name}': it was scaffolded from this checkout's reference Package and \
              has no Package Source. It is yours to edit in place. Nothing was changed."
         ))),
-        SOURCE_OFFICIAL => Err(Error::Usage(format!(
-            "cannot update '{name}': it was installed from the Official Package Collection, and \
-             this command does not advance that kind. Its commit is pinned at install time on \
-             purpose, so a later commit to the collection cannot silently change what is \
-             installed. To pick up a newer one, disable and remove it, then `lyracore packages \
-             add {name}` again. Nothing was changed."
+        SOURCE_OFFICIAL if recorded.source != super::official::COLLECTION_URL => {
+            Err(Error::Usage(format!(
+                "cannot update '{name}': its Official Package Source is '{}', not the Official \
+                 Package Collection ({}). Nothing was changed.",
+                recorded.source,
+                super::official::COLLECTION_URL
+            )))
+        }
+        SOURCE_OFFICIAL if recorded.revision.is_empty() => Err(Error::Usage(format!(
+            "cannot update '{name}': its stamp says it came from the Official Package Collection \
+             but records no commit to advance from. Nothing was changed."
         ))),
+        SOURCE_OFFICIAL => Ok((recorded, UpdateSource::Official)),
         "" => Err(Error::Usage(format!(
             "cannot update '{name}': its stamp records no Package Source kind, so nothing says \
              where it came from. Nothing was changed."
         ))),
         other => Err(Error::Usage(format!(
             "cannot update '{name}': its Package Source kind is '{other}', and this command only \
-             advances Git Package Sources ('{SOURCE_GIT}'). Nothing was changed."
+             advances Git or Official Package Sources ('{SOURCE_GIT}' or '{SOURCE_OFFICIAL}'). \
+             Nothing was changed."
         ))),
     }
 }
@@ -995,7 +1056,7 @@ mod tests {
     // ---- which Packages `update` will act on ----
 
     #[test]
-    fn a_package_that_did_not_come_from_a_repository_is_refused_by_name() {
+    fn a_package_without_an_update_source_is_refused_by_name() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let stack = FakeStack::new();
@@ -1009,14 +1070,6 @@ mod tests {
         )
         .unwrap();
         stamped(&project, "scaffolded", SOURCE_SCAFFOLD, "packages/example/");
-        // Installed from the Official Package Collection: has a real repository behind it, but
-        // this command still refuses it by name, because its commit is pinned at install time.
-        stamped(
-            &project,
-            "shipped",
-            SOURCE_OFFICIAL,
-            crate::cmd::packages::official::COLLECTION_URL,
-        );
         stamped(&project, "kindless", "", "");
         stamped(&project, "urlless", SOURCE_GIT, "");
         stamped(&project, "not-a-url", SOURCE_GIT, "/home/dev/greeter");
@@ -1039,8 +1092,6 @@ mod tests {
 
         assert!(refusal("keeper").contains("a folder on this machine"));
         assert!(refusal("scaffolded").contains("scaffolded"));
-        assert!(refusal("shipped").contains("Official Package Collection"));
-        assert!(refusal("shipped").contains("pinned at install time"));
         assert!(refusal("handmade").contains("no readable provenance stamp"));
         assert!(refusal("kindless").contains("no Package Source kind"));
         // A stamp that claims a repository but does not name one, or names something that is not a
@@ -1055,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn updating_everything_advances_the_git_backed_packages_and_leaves_the_rest_alone() {
+    fn updating_everything_advances_git_backed_packages_and_leaves_local_packages_alone() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let tree = candidate(&tmp, "anything");
@@ -1089,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn a_checkout_with_no_git_backed_packages_has_nothing_to_update() {
+    fn a_checkout_with_no_updateable_packages_has_nothing_to_update() {
         // Not an error: "there is nothing to do" is the honest answer, and an exit code would make
         // `packages update` unusable in a script that does not know what is installed.
         let tmp = TempDir::new().unwrap();
