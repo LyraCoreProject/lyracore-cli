@@ -274,7 +274,10 @@ pub fn now_unix() -> u64 {
 ///
 /// The civil-date conversion is the standard days-from-epoch algorithm with the year shifted to
 /// start in March, so the leap day lands at the end of the shifted year and needs no special case.
-fn utc_rfc3339(secs: u64) -> String {
+///
+/// `pub(crate)`: `client pack`'s manifest (`cmd/client.rs`) stamps `packed_at` with this same
+/// conversion, so a pack and a Package install report time the same way.
+pub(crate) fn utc_rfc3339(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let time = secs % 86_400;
     let (year, month, day) = civil_from_days(days);
