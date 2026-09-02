@@ -40,7 +40,7 @@ pub(crate) mod tree;
 
 use crate::cmd::import::Prompt;
 use crate::cmd::preflight;
-use crate::proc::ProcessRunner;
+use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::{Component, ProjectLayout, Topology};
 use crate::state::RuntimeState;
 use crate::{Error, Result};
@@ -240,6 +240,39 @@ pub fn check_collision(project: &ProjectLayout, name: &PackageName) -> Result<()
         ))),
         None => Ok(()),
     }
+}
+
+/// Refuse a destination `packages/<name>` that Git already tracks in the core checkout — a
+/// first-party Package like the Reference Package (`example`) or an in-tree instance Package
+/// (`fire_nova`). Installing over one would overwrite tracked content outside any Package
+/// Inventory move, dirtying the checkout; `lyracore update` and `service reconcile` then refuse to
+/// run against a dirty tree. This is a name collision `check_collision` cannot see, because a
+/// tracked Package is not itself installed through this CLI.
+fn check_not_tracked(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    name: &PackageName,
+    origin: &Origin,
+) -> Result<()> {
+    let relative = format!("{}/{}", ProjectLayout::PACKAGES_DIR, name.as_str());
+    let tracked = runner.run_and_wait(
+        &CommandSpec::new("git")
+            .cwd(project.root.clone())
+            .arg("ls-files")
+            .arg("--")
+            .arg(&relative),
+    )?;
+    if tracked.trim().is_empty() {
+        return Ok(());
+    }
+    Err(Error::Usage(format!(
+        "cannot install '{}' from {}: {} is already tracked by Git in this checkout. Installing \
+         over a tracked Package would dirty the checkout, and `lyracore update` and `service \
+         reconcile` then refuse to run. Nothing was copied.",
+        name.as_str(),
+        origin.named(),
+        project.root.join(&relative).display()
+    )))
 }
 
 /// The shapes `module/build.rs` accepts.
@@ -447,6 +480,7 @@ pub(crate) fn install(
 ) -> Result<()> {
     let destination = project.packages_dir().join(name.as_str());
     check_collision(project, name)?;
+    check_not_tracked(project, runner, name, origin)?;
     // Computing the identity validates the WHOLE tree (including client content) before the
     // narrower shape and trust-review passes. The same identity must describe the staged copy
     // after the operator answers, binding consent to the bytes that are actually installed.
@@ -1293,6 +1327,39 @@ pub(super) mod tests {
             check_collision(&project, &PackageName::parse("my_package").unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("pkg_my_package"), "{error}");
+    }
+
+    #[test]
+    fn an_install_over_a_git_tracked_destination_is_refused_before_anything_is_written() {
+        // `example` is core's tracked Reference Package; a same-named local folder must not
+        // silently overwrite it and dirty the checkout the way this bug did twice in production.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "example");
+        let stack = FakeStack::new().with_stdout("ls-files", "packages/example\n");
+
+        let error = add(
+            &project,
+            &stack.runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        // Both paths named: the candidate being installed, and the tracked path it collides with.
+        assert!(
+            error.to_string().contains(&source.display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&project.packages_dir().join("example").display().to_string()),
+            "{error}"
+        );
+        assert!(!project.packages_dir().join("example").exists(), "{error}");
     }
 
     #[test]

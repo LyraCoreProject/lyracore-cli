@@ -176,6 +176,30 @@ mod tests {
     }
 
     #[test]
+    fn an_install_over_a_git_tracked_destination_is_refused_before_anything_is_written() {
+        // `example` is core's tracked Reference Package; a future collection Package that shadows
+        // it (or any other tracked `packages/` directory, e.g. `fire_nova`) must be refused too.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = repository(&collection(&tmp, &["example"]), FIRST)
+            .with_stdout("ls-files", "packages/example\n");
+
+        let error = super::super::add(&project, &stack.runner(), &Answer("yes"), "example", true)
+            .unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        // Both paths named: the Official Package Collection, and the tracked path it collides with.
+        assert!(error.to_string().contains(COLLECTION_URL), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&project.packages_dir().join("example").display().to_string()),
+            "{error}"
+        );
+        assert!(!project.packages_dir().join("example").exists(), "{error}");
+    }
+
+    #[test]
     fn the_collection_clone_scratch_space_does_not_survive_the_install() {
         // The clone (the whole collection, including `.git` at its root and every sibling
         // directory `greeter` never named) lands under `.lyracore/package-clones/`. Nothing of it

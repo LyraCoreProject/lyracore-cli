@@ -835,6 +835,31 @@ mod tests {
     }
 
     #[test]
+    fn an_install_over_a_git_tracked_destination_is_refused_before_anything_is_written() {
+        // A Git Package Source whose repository name happens to be `example` must not overwrite
+        // core's tracked Reference Package either — the guard is generic, not name-specific.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let url = "https://example.invalid/example.git";
+        let stack = repository(&candidate(&tmp, "anything"), FIRST)
+            .with_stdout("ls-files", "packages/example\n");
+
+        let error =
+            super::super::add(&project, &stack.runner(), &Answer("yes"), url, true).unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        // Both paths named: the Git Package Source, and the tracked path it collides with.
+        assert!(error.to_string().contains(url), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&project.packages_dir().join("example").display().to_string()),
+            "{error}"
+        );
+        assert!(!project.packages_dir().join("example").exists(), "{error}");
+    }
+
+    #[test]
     fn the_recorded_commit_is_what_list_and_the_lifecycle_verbs_report() {
         // The commit is the one thing a Git-backed Package has that a local one does not. A report
         // that left it out would leave an operator no way to see which revision is installed.
