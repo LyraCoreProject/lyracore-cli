@@ -729,7 +729,9 @@ mod tests {
             .join("data/.generated");
         std::fs::create_dir_all(&generated_dir).unwrap();
         std::fs::write(generated_dir.join("spell.json"), artifact_json("fire_nova")).unwrap();
-        let artifacts = super::super::artifact::read_enabled(&project.packages_dir()).unwrap();
+        let artifacts = super::super::artifact::read_enabled(&project.packages_dir())
+            .unwrap()
+            .deltas;
 
         write_all(&project, &artifacts).unwrap();
 
@@ -751,7 +753,9 @@ mod tests {
             .join("data/.generated");
         std::fs::create_dir_all(&generated_dir).unwrap();
         std::fs::write(generated_dir.join("spell.json"), artifact_json("fire_nova")).unwrap();
-        let artifacts = super::super::artifact::read_enabled(&project.packages_dir()).unwrap();
+        let artifacts = super::super::artifact::read_enabled(&project.packages_dir())
+            .unwrap()
+            .deltas;
 
         let error = write_all(&project, &artifacts).unwrap_err();
 

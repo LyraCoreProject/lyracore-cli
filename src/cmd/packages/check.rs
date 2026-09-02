@@ -72,7 +72,11 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
         );
         return Ok(());
     }
-    let artifacts = artifact::read_enabled(&project.packages_dir())?;
+    let enabled = artifact::read_enabled(&project.packages_dir())?;
+    if let Some(note) = enabled.skipped_note() {
+        println!("{note}");
+    }
+    let artifacts = enabled.deltas;
     if artifacts.is_empty() {
         println!("no Package claims a Datascript-generated artifact; nothing to check.");
         return Ok(());
@@ -178,7 +182,9 @@ mod tests {
         std::fs::create_dir_all(&generated).unwrap();
         std::fs::write(generated.join("spell.json"), artifact_json("fire_nova")).unwrap();
 
-        let artifacts = artifact::read_enabled(&project.packages_dir()).unwrap();
+        let artifacts = artifact::read_enabled(&project.packages_dir())
+            .unwrap()
+            .deltas;
         identity::write_all(&project, &artifacts).unwrap();
         project
     }
@@ -197,6 +203,29 @@ mod tests {
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert!(calls[0].contains("spacetime generate"), "{calls:?}");
         assert!(calls[0].contains("--lang typescript"), "{calls:?}");
+    }
+
+    /// The seam this verb sits on globs every `*.json` beside the Delta, so a Package that also
+    /// ships Runtime Scripts must not make `packages check` refuse the Package Deltas it can check.
+    #[test]
+    fn a_script_artifact_beside_the_delta_is_skipped_rather_than_failing_the_check() {
+        let tmp = TempDir::new().unwrap();
+        let project = checked_out(&tmp);
+        std::fs::write(
+            project
+                .packages_dir()
+                .join("fire_nova/data/.generated/script.json"),
+            concat!(
+                r#"{"kind":"script","version":1,"package":"fire_nova","#,
+                r#""source_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","#,
+                r#""scripts":[{"script_id":100001,"name":"fire_nova.greet","event":"on_login","#,
+                r#""priority":0,"enabled":true,"source":"grant_xp(event.actor, 10)"}]}"#,
+            ),
+        )
+        .unwrap();
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner()).unwrap();
     }
 
     // ---- no-op checkouts ----

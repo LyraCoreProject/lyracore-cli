@@ -235,8 +235,9 @@ pub fn run(
 
     // ---- preflight: the artifacts, once, before any target is touched ----
     let root = project.packages_dir();
-    let artifacts = artifact::read_enabled(&root)?;
-    let conflicts = artifact::conflicts(&artifacts);
+    let enabled = artifact::read_enabled(&root)?;
+    let artifacts = &enabled.deltas;
+    let conflicts = artifact::conflicts(artifacts);
     if !conflicts.is_empty() {
         return Err(Error::Usage(format!(
             "{} claim conflict(s) between enabled Packages — nothing was replayed:\n{}\nResolve \
@@ -256,7 +257,10 @@ pub fn run(
     if artifacts.is_empty() {
         println!("  no enabled Package claims the {SPELL_FAMILY} import family");
     }
-    for artifact in &artifacts {
+    if let Some(note) = enabled.skipped_note() {
+        println!("  {note}");
+    }
+    for artifact in artifacts {
         println!(
             "  {:<32} {:>3} updated  {:>3} invented   {}",
             artifact.package,
@@ -277,7 +281,7 @@ pub fn run(
         let complete = if options.force_all {
             None
         } else {
-            already_complete(&artifacts, &provenance)
+            already_complete(artifacts, &provenance)
         };
         match &complete {
             Some(reason) => println!("  {database:<24} already complete — {reason}"),
@@ -449,6 +453,7 @@ mod tests {
         fn artifact_hash(&self, package: &str) -> String {
             artifact::read_enabled(&self.project.packages_dir())
                 .unwrap()
+                .deltas
                 .into_iter()
                 .find(|a| a.package == package)
                 .expect("the package is enabled")
