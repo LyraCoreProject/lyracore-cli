@@ -236,7 +236,7 @@ fn validate_generated_deltas(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
 ) -> Result<Vec<artifact::Artifact>> {
-    let artifacts = artifact::read_enabled(&project.packages_dir())?;
+    let artifacts = artifact::read_enabled(&project.packages_dir())?.deltas;
     if artifacts.is_empty() {
         return Ok(artifacts);
     }
@@ -675,7 +675,9 @@ mod tests {
             .join("fire_nova/data/.generated")
             .join(crate::cmd::packages::identity::IDENTITY_FILE);
         assert!(sidecar.is_file(), "no sidecar written next to the artifact");
-        let artifacts = artifact::read_enabled(&project.packages_dir()).unwrap();
+        let artifacts = artifact::read_enabled(&project.packages_dir())
+            .unwrap()
+            .deltas;
         let identity = crate::cmd::packages::identity::Identity::parse(
             &std::fs::read_to_string(&sidecar).unwrap(),
             &sidecar,
