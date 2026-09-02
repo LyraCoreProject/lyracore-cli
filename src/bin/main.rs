@@ -108,6 +108,9 @@ fn run(args: &[String]) -> Result<i32> {
         Command::ClientSync => {
             cmd::client::sync(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
         }
+        Command::ClientPack { out, zip } => {
+            cmd::client::pack(&ProjectLayout::discover()?, &runner, &out, zip).map(|_| EXIT_OK)
+        }
         Command::PackagesAdd { source, yes } => cmd::packages::add(
             &ProjectLayout::discover()?,
             &runner,

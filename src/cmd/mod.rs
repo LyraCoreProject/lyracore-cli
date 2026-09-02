@@ -95,6 +95,10 @@ USAGE:
                                                addons, then install them into the configured
                                                client-data path. Warns (best-effort) about an
                                                addon a disabled or removed Package left behind
+  lyracore client pack --out DIR [--zip]       build the Client Artifact: package-authored
+                                               content only, as DIR/Data/patch-3.MPQ and
+                                               DIR/Interface/AddOns/. Never touches the configured
+                                               client. --zip also writes DIR.zip
   lyracore character gm NAME true|false        grant (true) or revoke (false) GM level for a
                                                character — tries every world shard in turn
   lyracore packages add FOLDER|GIT-URL|NAME [--yes]
@@ -226,6 +230,10 @@ pub enum Command {
         path: String,
     },
     ClientSync,
+    ClientPack {
+        out: String,
+        zip: bool,
+    },
     CharacterGm {
         name: String,
         enabled: bool,
@@ -368,11 +376,12 @@ impl Command {
             ["client", "sync", other, ..] => Err(Error::Usage(format!(
                 "`client sync` takes no arguments (got '{other}')"
             ))),
+            ["client", "pack", rest @ ..] => parse_client_pack(rest),
             ["client"] => Err(Error::Usage(
-                "`client` needs a subcommand: sync".to_string(),
+                "`client` needs a subcommand: sync or pack".to_string(),
             )),
             ["client", other, ..] => Err(Error::Usage(format!(
-                "unknown `client` subcommand '{other}' — expected sync"
+                "unknown `client` subcommand '{other}' — expected sync or pack"
             ))),
 
             // Only `gm` today, but the catch-all below names it as ONE arm among future
@@ -668,6 +677,46 @@ fn parse_packages_replay(args: &[&str]) -> Result<Command> {
         }
     }
     Ok(Command::PackagesReplay(options))
+}
+
+/// `client pack --out DIR [--zip]`.
+///
+/// `--out` and `--zip` interleave freely, the same as `packages replay`'s options — but this verb
+/// has no bare positional of its own, so anything that is not one of the two options is refused as
+/// an extra argument rather than folded into a Shard-name-shaped list.
+fn parse_client_pack(args: &[&str]) -> Result<Command> {
+    let mut out: Option<String> = None;
+    let mut zip = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match *arg {
+            "--out" => {
+                out = Some(rest.next().map(|path| (*path).to_string()).ok_or_else(|| {
+                    Error::Usage(
+                        "`--out` needs a directory, e.g. `--out ./client-pack`".to_string(),
+                    )
+                })?);
+            }
+            "--zip" => zip = true,
+            option if option.starts_with("--") => {
+                return Err(Error::Usage(format!(
+                    "unknown `client pack` option '{option}' — the options are --out DIR and --zip"
+                )))
+            }
+            other => {
+                return Err(Error::Usage(format!(
+                    "`client pack` takes no arguments other than --out DIR and --zip (got \
+                     '{other}')"
+                )))
+            }
+        }
+    }
+    let out = out.ok_or_else(|| {
+        Error::Usage(
+            "`client pack` needs --out DIR, e.g. `client pack --out ./client-pack`".to_string(),
+        )
+    })?;
+    Ok(Command::ClientPack { out, zip })
 }
 
 /// `packages config NAME [KEY [VALUE]] [--new]`.
@@ -1400,16 +1449,82 @@ mod tests {
     }
 
     #[test]
-    fn client_without_a_recognised_verb_names_sync_as_the_one_that_exists() {
-        for line in ["client", "client pack", "client install"] {
+    fn client_without_a_recognised_verb_names_the_ones_that_exist() {
+        for line in ["client", "client install"] {
             let error = parse(line).unwrap_err().to_string();
             assert!(error.contains("sync"), "{line}: {error}");
+            assert!(error.contains("pack"), "{line}: {error}");
         }
     }
 
     #[test]
     fn the_help_text_documents_client_sync() {
         assert!(USAGE_ALL.contains("lyracore client sync"), "{USAGE_ALL}");
+    }
+
+    // ---- client pack ----
+
+    #[test]
+    fn client_pack_takes_out_and_an_optional_zip_in_either_order() {
+        assert_eq!(
+            parse("client pack --out ./client-pack").unwrap(),
+            Command::ClientPack {
+                out: "./client-pack".to_string(),
+                zip: false,
+            }
+        );
+        assert_eq!(
+            parse("client pack --out ./client-pack --zip").unwrap(),
+            Command::ClientPack {
+                out: "./client-pack".to_string(),
+                zip: true,
+            }
+        );
+        assert_eq!(
+            parse("client pack --zip --out ./client-pack").unwrap(),
+            Command::ClientPack {
+                out: "./client-pack".to_string(),
+                zip: true,
+            }
+        );
+    }
+
+    #[test]
+    fn client_pack_without_out_is_a_usage_error_naming_out() {
+        let error = parse("client pack").unwrap_err();
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
+        assert!(error.to_string().contains("--out"), "{error}");
+
+        let error = parse("client pack --zip").unwrap_err();
+        assert!(error.to_string().contains("--out"), "{error}");
+    }
+
+    #[test]
+    fn client_pack_rejects_an_unknown_flag_distinctly_from_a_missing_out() {
+        let error = parse("client pack --out ./client-pack --bogus").unwrap_err();
+        assert!(error.to_string().contains("--bogus"), "{error}");
+        assert!(error.to_string().contains("unknown"), "{error}");
+    }
+
+    #[test]
+    fn client_pack_rejects_an_extra_positional_distinctly_from_an_unknown_flag() {
+        let error = parse("client pack --out ./client-pack extra").unwrap_err();
+        assert!(error.to_string().contains("extra"), "{error}");
+        assert!(!error.to_string().contains("unknown"), "{error}");
+    }
+
+    #[test]
+    fn client_pack_out_with_no_value_is_a_usage_error() {
+        let error = parse("client pack --out").unwrap_err();
+        assert!(error.to_string().contains("--out"), "{error}");
+    }
+
+    #[test]
+    fn the_help_text_documents_client_pack() {
+        assert!(
+            USAGE_ALL.contains("lyracore client pack --out DIR [--zip]"),
+            "{USAGE_ALL}"
+        );
     }
 
     // ---- character gm ----
