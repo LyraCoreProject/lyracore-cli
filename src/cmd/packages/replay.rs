@@ -1,21 +1,33 @@
 //! `lyracore packages replay [DATABASE …] [--check] [--yes] [--force-all]` — reapply every enabled
-//! Package's Delta to every Shard that holds a copy of the spell catalogue.
+//! Package's artifacts to every Shard that holds a copy of the catalogues they claim.
 //!
-//! A base import replaces a whole Import Family, so a Package's claims are not a one-shot edit: they
-//! replay as the last stage of that family's import. The importer already does this for ONE Shard,
-//! idempotently and in one transaction. What was missing is the Realm: a catalogue lives on every
-//! World Shard and Instance Pool that owns a copy, and applying it Shard by Shard from memory is how
-//! a Realm ends up running two different Package sets without anything saying so.
+//! Two Import Families travel here, because a Package ships two artifact kinds.
 //!
-//! # What this verb adds over running the importer per Shard
+//! The **spell** family's artifact is a Package Delta: claims on columns of rows a base import owns.
+//! A base import replaces the whole family, so those claims are not a one-shot edit — they replay as
+//! the last stage of that family's import, which is why this family runs through the importer.
+//!
+//! The **script** family's artifact holds whole `game_script` rows and has no base import behind it:
+//! no DBC and no dump holds a Runtime Script. Its apply is the whole enabled plan and nothing else,
+//! so it goes straight to `apply_package_deltas` rather than behind a reimport. Applying the plan IS
+//! the reconciliation — a Package that left the enabled set takes its scripts off every Shard with
+//! it, which is why an empty plan is still applied.
+//!
+//! What was missing in both cases is the Realm: a catalogue lives on every World Shard and Instance
+//! Pool that owns a copy, and applying it Shard by Shard from memory is how a Realm ends up running
+//! two different Package sets without anything saying so.
+//!
+//! # What this verb adds over calling the module per Shard
 //!
 //! * **Preflight.** Every artifact is read, digested and traced ONCE, and every target is read from,
-//!   before the first write. A Claim Conflict or an unreachable Shard fails the run at Shard 0.
-//! * **Resume.** Each Shard records what it applied in `game_package_import`. A Shard whose
-//!   provenance already matches this checkout's artifacts AND its current base import is reported
-//!   complete and skipped, so re-running after a failure costs nothing on the Shards that finished.
-//! * **An honest report.** A failure names the Shards that completed, the one that failed, and the
-//!   ones never touched — then prints the command to resume, which is the same command.
+//!   before the first write. A Claim Conflict, a Runtime Script collision or an unreachable Shard
+//!   fails the run at Shard 0.
+//! * **Resume.** Each Shard records what it applied in `game_package_import`, per family. A Shard
+//!   whose provenance for a family already matches this checkout's artifacts is reported complete
+//!   and skipped for that family, so re-running after a failure costs nothing on what finished.
+//! * **An honest report.** A failure names the Shards that completed, the one that failed and the
+//!   family it failed in, and the ones never touched — then prints the command to resume, which is
+//!   the same command.
 //!
 //! Fail-fast, never rollback: #310 puts distributed atomic transactions and automatic rollback of
 //! completed Shards out of scope. A half-applied Realm is recoverable by re-running; a Realm that
@@ -25,11 +37,15 @@ use std::path::Path;
 
 use crate::cmd::import::{self, Prompt};
 use crate::cmd::packages::artifact::{self, Artifact, SPELL_FAMILY};
+use crate::cmd::packages::script::{self, ScriptArtifact, SCRIPT_FAMILY};
 use crate::cmd::packages::{recorded_databases, shard_list};
 use crate::cmd::publish::validate_database;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::ProjectLayout;
 use crate::{Error, Result};
+
+/// The reducer that applies one family's whole enabled plan in one transaction.
+const APPLY_REDUCER: &str = "apply_package_deltas";
 
 /// What `packages replay` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -47,22 +63,30 @@ pub struct ReplayOptions {
     pub force_all: bool,
 }
 
-/// One Shard's Package Delta provenance, as `spacetime sql` reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Provenance {
-    /// `(package, artifact_hash, base_source_sha)` for every Package this Shard has applied.
-    applied: Vec<(String, String, String)>,
-    /// This Shard's `game_import_meta.source_sha` for the spell family. Empty when the family has
-    /// never been stamped here, which is a fact rather than a reason to refuse.
-    base_source_sha: String,
-}
+/// One Package's provenance row for one family, as `spacetime sql` reports it:
+/// `(package, artifact_hash, base_source_sha)`. The script family has no base import, so its rows
+/// carry an empty stamp and nothing compares it.
+type Applied = (String, String, String);
 
 /// What preflight decided about one target, before anything was written.
+///
+/// One answer per Import Family, because they are independent: a Shard can hold this checkout's
+/// Package Deltas and none of its Runtime Scripts, which is exactly what a Realm looks like the
+/// first time a Package ships a script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     database: String,
-    /// Why this Shard does not need the run, when it does not.
-    complete: Option<String>,
+    /// Why the spell family does not need this Shard, when it does not.
+    spell: Option<String>,
+    /// Why the script family does not need this Shard, when it does not.
+    script: Option<String>,
+}
+
+impl Target {
+    /// Whether any family still has work here.
+    const fn wanted(&self) -> bool {
+        self.spell.is_none() || self.script.is_none()
+    }
 }
 
 /// The verb name this module's refusals quote back at the operator.
@@ -119,83 +143,194 @@ fn rows(output: &str, columns: &[&str]) -> Vec<Vec<String>> {
     rows
 }
 
-/// Read one Shard's Package Delta provenance.
-///
-/// Two exact-match queries, no `ORDER BY`, no `IN` and no subquery: `spacetime sql` supports none of
-/// them (docs/danger-zones.md §2). One query per FAMILY rather than one per Package, because the
-/// extra rows are the point — a Package that left the enabled set is visible only as a row this
-/// checkout no longer accounts for.
+/// One read of one Shard, with the diagnosis a failure needs.
 ///
 /// A failed query is NOT an empty result. Conflating them would turn one dead node into "this Shard
 /// has never applied anything", and this verb would then happily replay a Realm it cannot see.
-fn read_provenance(
+fn ask(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     database: &str,
-) -> Result<Provenance> {
-    let ask = |query: &str| {
-        runner
-            .run_and_wait(&import::sql_command(project, database, query))
-            .map_err(|e| {
-                Error::Process(format!(
-                    "could not read Package Delta provenance from '{database}': {e}\n  A failed \
-                     query is not an empty result, so nothing was replayed. Check that the node is \
-                     up and '{database}' is published (`lyracore dev status`), and that its module \
-                     is current — `game_package_import` only exists once the Package Delta apply \
-                     stage has been published to this Shard."
-                ))
-            })
-    };
-
-    let stamped = ask(&format!(
-        "SELECT source_sha FROM game_import_meta WHERE family = '{SPELL_FAMILY}'"
-    ))?;
-    let base_source_sha = rows(&stamped, &["source_sha"])
-        .first()
-        .and_then(|row| row.first().cloned())
-        .unwrap_or_default();
-
-    let recorded = ask(&format!(
-        "SELECT package, artifact_hash, base_source_sha FROM game_package_import WHERE family = \
-         '{SPELL_FAMILY}'"
-    ))?;
-    let applied = rows(&recorded, &["package", "artifact_hash", "base_source_sha"])
-        .into_iter()
-        .filter(|row| row.len() >= 3)
-        .map(|row| (row[0].clone(), row[1].clone(), row[2].clone()))
-        .collect();
-
-    Ok(Provenance {
-        applied,
-        base_source_sha,
-    })
+    query: &str,
+) -> Result<String> {
+    runner
+        .run_and_wait(&import::sql_command(project, database, query))
+        .map_err(|e| {
+            Error::Process(format!(
+                "could not read Package artifact provenance from '{database}': {e}\n  A failed \
+                 query is not an empty result, so nothing was replayed. Check that the node is up \
+                 and '{database}' is published (`lyracore dev status`), and that its module is \
+                 current — `game_package_import` only exists once the Package artifact apply stage \
+                 has been published to this Shard."
+            ))
+        })
 }
 
-/// Does this Shard already hold exactly these artifacts, on this base import?
+/// Read one Shard's spell-family provenance.
 ///
-/// Every enabled Package must be recorded with the digest this checkout produces, no Package may be
-/// recorded that is no longer enabled, and every row must sit on the Shard's CURRENT base stamp. A
-/// mismatch anywhere means replay; only a total match skips.
+/// One exact-match query, no `ORDER BY`, no `IN` and no subquery: `spacetime sql` supports none of
+/// them (docs/danger-zones.md §2). One query per FAMILY rather than one per Package, because the
+/// extra rows are the point — a Package that left the enabled set is visible only as a row this
+/// checkout no longer accounts for.
+fn read_spell_provenance(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    database: &str,
+) -> Result<Vec<Applied>> {
+    let recorded = ask(
+        project,
+        runner,
+        database,
+        &format!(
+            "SELECT package, artifact_hash, base_source_sha FROM game_package_import WHERE family \
+             = '{SPELL_FAMILY}'"
+        ),
+    )?;
+    Ok(
+        rows(&recorded, &["package", "artifact_hash", "base_source_sha"])
+            .into_iter()
+            .filter(|row| row.len() >= 3)
+            .map(|row| (row[0].clone(), row[1].clone(), row[2].clone()))
+            .collect(),
+    )
+}
+
+/// Read one Shard's script-family provenance.
 ///
-/// Returns the reason it is complete, or `None`.
-fn already_complete(artifacts: &[Artifact], provenance: &Provenance) -> Option<String> {
-    for artifact in artifacts {
-        let recorded = provenance
-            .applied
-            .iter()
-            .find(|(package, ..)| *package == artifact.package)?;
-        if recorded.1 != artifact.artifact_hash || recorded.2 != provenance.base_source_sha {
+/// Two columns, not the spell family's three: the script family has no base import, so every one of
+/// its rows carries an empty `base_source_sha` and there is nothing for it to sit on. Asking for a
+/// column whose every cell is empty only gives the answer parser a blank to misread.
+fn read_script_provenance(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    database: &str,
+) -> Result<Vec<Applied>> {
+    let recorded = ask(
+        project,
+        runner,
+        database,
+        &format!(
+            "SELECT package, artifact_hash FROM game_package_import WHERE family = \
+             '{SCRIPT_FAMILY}'"
+        ),
+    )?;
+    Ok(rows(&recorded, &["package", "artifact_hash"])
+        .into_iter()
+        .filter(|row| row.len() >= 2)
+        .map(|row| (row[0].clone(), row[1].clone(), String::new()))
+        .collect())
+}
+
+/// Read one Shard's `game_import_meta.source_sha` for a family with a base import.
+///
+/// Empty when the family has never been stamped here, which is a fact rather than a reason to
+/// refuse.
+fn read_base_stamp(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    database: &str,
+    family: &str,
+) -> Result<String> {
+    let stamped = ask(
+        project,
+        runner,
+        database,
+        &format!("SELECT source_sha FROM game_import_meta WHERE family = '{family}'"),
+    )?;
+    Ok(rows(&stamped, &["source_sha"])
+        .first()
+        .and_then(|row| row.first().cloned())
+        .unwrap_or_default())
+}
+
+/// Does this Shard already hold exactly these artifacts for `family`?
+///
+/// Every enabled Package must be recorded with the digest this checkout produces, and no Package may
+/// be recorded that is no longer enabled. `base` additionally holds every row to the Shard's CURRENT
+/// base stamp, for a family that has a base import: claims recorded against an older one sit on rows
+/// that import has since replaced. The script family passes `None`, because it has no base import to
+/// sit on.
+///
+/// A mismatch anywhere means replay; only a total match skips. Returns the reason it is complete, or
+/// `None`.
+fn already_complete(
+    family: &str,
+    digests: &[(&str, &str)],
+    recorded: &[Applied],
+    base: Option<&str>,
+) -> Option<String> {
+    for (package, artifact_hash) in digests {
+        let row = recorded.iter().find(|(recorded, ..)| recorded == package)?;
+        if row.1 != *artifact_hash {
+            return None;
+        }
+        if base.is_some_and(|sha| row.2 != sha) {
             return None;
         }
     }
-    if provenance.applied.len() != artifacts.len() {
+    if recorded.len() != digests.len() {
         return None;
     }
-    Some(match artifacts.len() {
-        0 => "no Package claims the spell family, and none is recorded here".to_string(),
-        1 => "1 Package, matching artifact digest and base import".to_string(),
-        n => format!("{n} Packages, matching artifact digests and base import"),
+    let on_base = if base.is_some() {
+        " and base import"
+    } else {
+        ""
+    };
+    Some(match digests.len() {
+        0 => format!("no enabled Package ships a {family} artifact, and none is recorded here"),
+        1 => format!("1 Package, matching artifact digest{on_base}"),
+        n => format!("{n} Packages, matching artifact digests{on_base}"),
     })
+}
+
+/// The `(package, artifact_hash)` pairs a family's completeness check compares.
+fn delta_digests(artifacts: &[Artifact]) -> Vec<(&str, &str)> {
+    artifacts
+        .iter()
+        .map(|a| (a.package.as_str(), a.artifact_hash.as_str()))
+        .collect()
+}
+
+fn script_digests(artifacts: &[ScriptArtifact]) -> Vec<(&str, &str)> {
+    artifacts
+        .iter()
+        .map(|a| (a.package.as_str(), a.artifact_hash.as_str()))
+        .collect()
+}
+
+/// Apply the whole enabled script plan to one Shard.
+///
+/// `spacetime call`, not the importer: the script family has no base import, so there is no reimport
+/// stage for this apply to be the last part of. Both arguments are JSON literals because that is
+/// what `spacetime call` parses each argument as, and the payload carries quotes and newlines that
+/// need escaping either way.
+fn script_apply_command(
+    project: &ProjectLayout,
+    database: &str,
+    packed: &str,
+) -> Result<CommandSpec> {
+    validate_database(VERB, database)?;
+    Ok(import::call_command(project, database, APPLY_REDUCER)
+        .arg(json_argument(SCRIPT_FAMILY))
+        .arg(json_argument(packed)))
+}
+
+/// One reducer argument, as a JSON string literal. Encoding a `&str` as JSON cannot fail.
+fn json_argument(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| String::from("\"\""))
+}
+
+/// What the module said about a refused script plan, without the rendered command.
+///
+/// The whole plan travels as one argument, so the rendered `spacetime call` IS the payload. Quoting
+/// it back at the operator would bury the refusal it exists to explain.
+fn refusal(error: &Error) -> String {
+    match error {
+        Error::SubprocessFailed { code, message, .. } => {
+            format!("{APPLY_REDUCER} refused the script plan (exit {code}): {message}")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// The command that resumes this run — the same one, because resume is what re-running does.
@@ -237,6 +372,7 @@ pub fn run(
     let root = project.packages_dir();
     let enabled = artifact::read_enabled(&root)?;
     let artifacts = &enabled.deltas;
+    let scripts = &enabled.scripts;
     let conflicts = artifact::conflicts(artifacts);
     if !conflicts.is_empty() {
         return Err(Error::Usage(format!(
@@ -251,14 +387,27 @@ pub fn run(
                 .join("\n")
         )));
     }
+    let collisions = script::collisions(scripts);
+    if !collisions.is_empty() {
+        return Err(Error::Usage(format!(
+            "{} Runtime Script collision(s) between enabled Packages — nothing was replayed:\n{}\n\
+             A script belongs to one Package outright, so there is nothing to merge and no priority \
+             to break the tie with. Resolve them by disabling a Package (`lyracore packages disable \
+             NAME`) or by renumbering or renaming one script. The module refuses the same plan.",
+            collisions.len(),
+            collisions
+                .iter()
+                .map(|c| format!("  {c}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
+    let packed = script::pack(scripts);
 
     println!();
     println!("=== enabled Package Deltas ({}) ===", root.display());
     if artifacts.is_empty() {
         println!("  no enabled Package claims the {SPELL_FAMILY} import family");
-    }
-    if let Some(note) = enabled.skipped_note() {
-        println!("  {note}");
     }
     for artifact in artifacts {
         println!(
@@ -270,33 +419,59 @@ pub fn run(
         );
     }
 
+    println!();
+    println!(
+        "=== enabled Package Runtime Scripts ({}) ===",
+        root.display()
+    );
+    if scripts.is_empty() {
+        println!("  no enabled Package ships a Runtime Script");
+    }
+    for artifact in scripts {
+        println!(
+            "  {:<32} {:>3} script(s)   {}",
+            artifact.package,
+            artifact.scripts().len(),
+            artifact.path.display()
+        );
+        for one in artifact.scripts() {
+            println!("    {:>8}  {:<32} {}", one.script_id, one.name, one.event);
+        }
+    }
+
     let client_data = import::resolve_client_data(project, prompt, options.client_data.as_deref())?;
 
     // ---- preflight: every target, before the first write ----
     println!();
     println!("=== targets ===");
+    let delta_digests = delta_digests(artifacts);
+    let script_digests = script_digests(scripts);
     let mut targets = Vec::with_capacity(shards.len());
     for database in &shards {
-        let provenance = read_provenance(project, runner, database)?;
-        let complete = if options.force_all {
-            None
+        let spell_rows = read_spell_provenance(project, runner, database)?;
+        let base = read_base_stamp(project, runner, database, SPELL_FAMILY)?;
+        let script_rows = read_script_provenance(project, runner, database)?;
+        let target = if options.force_all {
+            Target {
+                database: database.clone(),
+                spell: None,
+                script: None,
+            }
         } else {
-            already_complete(artifacts, &provenance)
+            Target {
+                database: database.clone(),
+                spell: already_complete(SPELL_FAMILY, &delta_digests, &spell_rows, Some(&base)),
+                script: already_complete(SCRIPT_FAMILY, &script_digests, &script_rows, None),
+            }
         };
-        match &complete {
-            Some(reason) => println!("  {database:<24} already complete — {reason}"),
-            None => println!("  {database:<24} replay"),
-        }
-        targets.push(Target {
-            database: database.clone(),
-            complete,
-        });
+        report_target(&target);
+        targets.push(target);
     }
 
-    let wanted: Vec<&Target> = targets.iter().filter(|t| t.complete.is_none()).collect();
+    let wanted: Vec<&Target> = targets.iter().filter(|t| t.wanted()).collect();
     let skipped: Vec<String> = targets
         .iter()
-        .filter(|t| t.complete.is_some())
+        .filter(|t| !t.wanted())
         .map(|t| t.database.clone())
         .collect();
 
@@ -313,6 +488,11 @@ pub fn run(
                 &client_data,
                 false,
             )?)?;
+            println!(
+                "  {SCRIPT_FAMILY}: {} Package(s), {} Runtime Script(s) would be applied",
+                scripts.len(),
+                script_count(scripts)
+            );
         }
         println!();
         println!("check only — nothing was written. Re-run without --check to apply.");
@@ -322,9 +502,10 @@ pub fn run(
     if wanted.is_empty() {
         println!();
         println!(
-            "every named Shard already holds these {} Package Delta(s) on its current base import: \
-             {}",
+            "every named Shard already holds these {} Package Delta(s) on its current base import, \
+             and these {} Runtime Script(s): {}",
             artifacts.len(),
+            script_count(scripts),
             shard_list(&skipped)
         );
         println!("nothing to replay. Use --force-all to reapply anyway.");
@@ -333,65 +514,201 @@ pub fn run(
 
     let pending: Vec<String> = wanted.iter().map(|t| t.database.clone()).collect();
     println!();
-    // An empty enabled inventory is a legitimate plan and a destructive one: it clears the Package
-    // spell range. The operator says it deliberately or not at all.
-    let question = if artifacts.is_empty() {
-        format!(
-            "No enabled Package claims the {SPELL_FAMILY} family. Replaying will CLEAR the Package \
-             spell range on {} — every row an unenabled Package invented is deleted. Proceed?",
-            shard_list(&pending)
-        )
-    } else {
-        format!(
-            "Reapply {} enabled Package Delta(s) to {}? Each Shard reimports Spell.dbc and then \
-             replays these claims over it.",
-            artifacts.len(),
-            shard_list(&pending)
-        )
-    };
-    crate::cmd::packages::confirm(prompt, &question, "Nothing was replayed.", options.yes)?;
+    crate::cmd::packages::confirm(
+        prompt,
+        &question(&wanted, artifacts, scripts, &pending),
+        "Nothing was replayed.",
+        options.yes,
+    )?;
 
-    runner.run_streaming(&import::build_importer_command(project))?;
+    // Only the spell family runs through the importer. A run that has nothing but Runtime Scripts
+    // to carry does not build it.
+    if wanted.iter().any(|t| t.spell.is_none()) {
+        runner.run_streaming(&import::build_importer_command(project))?;
+    }
+
+    // The fail-fast report, from inside the loop: which Shards finished, which one refused and in
+    // which family, and which were never touched.
+    let stopped = |failed: &str, family: &str, index: usize, cause: &str| {
+        Error::Process(format!(
+            "{cause}\n  replay stopped at: {failed} ({family} family)\n  completed: {completed}\n  \
+             already complete (skipped): {skipped}\n  untouched: {untouched}\n\n  The failed Shard \
+             wrote nothing for that family: the apply is one transaction, so it lands whole or not \
+             at all. Fix the cause and re-run the SAME command — the Shards above verify their \
+             provenance and skip:\n    {resume}",
+            completed = shard_list(
+                &wanted[..index]
+                    .iter()
+                    .map(|t| t.database.clone())
+                    .collect::<Vec<_>>()
+            ),
+            skipped = shard_list(&skipped),
+            untouched = shard_list(
+                &wanted[index + 1..]
+                    .iter()
+                    .map(|t| t.database.clone())
+                    .collect::<Vec<_>>()
+            ),
+            resume = resume_command(&shards, options),
+        ))
+    };
 
     for (index, target) in wanted.iter().enumerate() {
         println!();
         println!("==> replaying {}", target.database);
-        let command = replay_command(project, &target.database, &client_data, true)?;
-        if let Err(error) = runner.run_streaming(&command) {
-            let untouched: Vec<String> = wanted[index + 1..]
-                .iter()
-                .map(|t| t.database.clone())
-                .collect();
-            return Err(Error::Process(format!(
-                "{error}\n  replay stopped at: {failed}\n  completed: {completed}\n  already \
-                 complete (skipped): {skipped}\n  untouched: {untouched}\n\n  The failed Shard \
-                 wrote nothing: the apply is one transaction, so it lands whole or not at all. \
-                 Fix the cause and re-run the SAME command — the Shards above verify their \
-                 provenance and skip:\n    {resume}",
-                failed = target.database,
-                completed = shard_list(
-                    &wanted[..index]
-                        .iter()
-                        .map(|t| t.database.clone())
-                        .collect::<Vec<_>>()
-                ),
-                skipped = shard_list(&skipped),
-                untouched = shard_list(&untouched),
-                resume = resume_command(&shards, options),
-            )));
+
+        match &target.spell {
+            Some(reason) => println!("  {SPELL_FAMILY}: already complete — {reason}"),
+            None => {
+                let command = replay_command(project, &target.database, &client_data, true)?;
+                if let Err(error) = runner.run_streaming(&command) {
+                    return Err(stopped(
+                        &target.database,
+                        SPELL_FAMILY,
+                        index,
+                        &error.to_string(),
+                    ));
+                }
+            }
+        }
+
+        match &target.script {
+            Some(reason) => println!("  {SCRIPT_FAMILY}: already complete — {reason}"),
+            None => {
+                println!(
+                    "  {SCRIPT_FAMILY}: applying {} Runtime Script(s) from {} Package(s)",
+                    script_count(scripts),
+                    scripts.len()
+                );
+                let command = script_apply_command(project, &target.database, &packed)?;
+                if let Err(error) = runner.run_and_wait(&command) {
+                    return Err(stopped(
+                        &target.database,
+                        SCRIPT_FAMILY,
+                        index,
+                        &refusal(&error),
+                    ));
+                }
+            }
         }
     }
 
     println!();
+    println!("replayed:");
     println!(
-        "replayed {} enabled Package Delta(s) to: {}",
-        artifacts.len(),
-        shard_list(&pending)
+        "{}",
+        replayed(
+            SPELL_FAMILY,
+            &format!("{} enabled Package Delta(s)", artifacts.len()),
+            &written(&wanted, |t| t.spell.is_none()),
+        )
+    );
+    println!(
+        "{}",
+        replayed(
+            SCRIPT_FAMILY,
+            &format!(
+                "{} Runtime Script(s) from {} Package(s)",
+                script_count(scripts),
+                scripts.len()
+            ),
+            &written(&wanted, |t| t.script.is_none()),
+        )
     );
     if !skipped.is_empty() {
-        println!("already complete, untouched: {}", shard_list(&skipped));
+        println!(
+            "already complete in both families, untouched: {}",
+            shard_list(&skipped)
+        );
     }
     Ok(())
+}
+
+/// The Shards a family actually wrote to.
+fn written(wanted: &[&Target], needed: impl Fn(&Target) -> bool) -> Vec<String> {
+    wanted
+        .iter()
+        .filter(|t| needed(t))
+        .map(|t| t.database.clone())
+        .collect()
+}
+
+/// One family's closing line: what it applied and where, or that it had nothing to do. A family
+/// every named Shard already held must not read as a family this run reapplied.
+fn replayed(family: &str, what: &str, written: &[String]) -> String {
+    if written.is_empty() {
+        format!("  {family}: nothing — every named Shard was already complete")
+    } else {
+        format!("  {family}: {what} -> {}", shard_list(written))
+    }
+}
+
+/// One target's line in the preflight report: one row per Import Family, because the two are
+/// decided independently.
+fn report_target(target: &Target) {
+    for (name, complete) in [
+        (SPELL_FAMILY, &target.spell),
+        (SCRIPT_FAMILY, &target.script),
+    ] {
+        let state = match complete {
+            Some(reason) => format!("already complete — {reason}"),
+            None => "replay".to_string(),
+        };
+        // The Shard is named once, on the first line, so two families of one Shard read as one
+        // entry rather than two.
+        let shard = if name == SPELL_FAMILY {
+            target.database.as_str()
+        } else {
+            ""
+        };
+        println!("  {shard:<24} {name}: {state}");
+    }
+}
+
+fn script_count(scripts: &[ScriptArtifact]) -> usize {
+    scripts.iter().map(|a| a.scripts().len()).sum()
+}
+
+/// What the operator is agreeing to, named as its consequence rather than as a count.
+///
+/// An empty plan for a family is a legitimate statement and a destructive one: it clears that
+/// family's whole Package range. It is also exactly what an accidentally disabled Package looks
+/// like, so it is said out loud or not at all.
+fn question(
+    wanted: &[&Target],
+    artifacts: &[Artifact],
+    scripts: &[ScriptArtifact],
+    pending: &[String],
+) -> String {
+    let mut clauses = Vec::new();
+    if wanted.iter().any(|t| t.spell.is_none()) {
+        clauses.push(if artifacts.is_empty() {
+            "CLEAR the Package Spell Range — every row an unenabled Package invented is deleted"
+                .to_string()
+        } else {
+            format!(
+                "reimport Spell.dbc and replay {} enabled Package Delta(s) over it",
+                artifacts.len()
+            )
+        });
+    }
+    if wanted.iter().any(|t| t.script.is_none()) {
+        clauses.push(if scripts.is_empty() {
+            "CLEAR the Package Script Range — every Runtime Script a Package shipped is deleted"
+                .to_string()
+        } else {
+            format!(
+                "reconcile the Runtime Scripts to the {} shipped by {} enabled Package(s)",
+                script_count(scripts),
+                scripts.len()
+            )
+        });
+    }
+    format!(
+        "Replaying will {} on {}. Proceed?",
+        clauses.join(", and "),
+        shard_list(pending)
+    )
 }
 
 #[cfg(test)]
@@ -431,8 +748,7 @@ mod tests {
             self.tmp.path().join("client-data").display().to_string()
         }
 
-        /// An enabled Package whose artifact tunes one column of one real spell.
-        fn with_package(&self, package: &str, spell_id: u32, value: u32) -> &Self {
+        fn generated(&self, package: &str) -> std::path::PathBuf {
             let dir = self
                 .tmp
                 .path()
@@ -440,8 +756,13 @@ mod tests {
                 .join(package)
                 .join("data/.generated");
             std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// An enabled Package whose artifact tunes one column of one real spell.
+        fn with_package(&self, package: &str, spell_id: u32, value: u32) -> &Self {
             std::fs::write(
-                dir.join("spell.json"),
+                self.generated(package).join("spell.json"),
                 format!(
                     r#"{{"version":1,"package":"{package}","source_hash":"{HASH_A}","claims":[{{"table":"game_spell","key":{{"spell_id":{spell_id}}},"operation":"update","fields":{{"cooldown_ms":{{"type":"u32","value":{value}}}}}}}]}}"#
                 ),
@@ -450,14 +771,43 @@ mod tests {
             self
         }
 
+        /// An enabled Package that ships one Runtime Script.
+        fn with_script(&self, package: &str, script_id: u32, name: &str) -> &Self {
+            std::fs::write(
+                self.generated(package).join("script.json"),
+                format!(
+                    r#"{{"kind":"script","version":1,"package":"{package}","source_hash":"{HASH_A}","scripts":[{{"script_id":{script_id},"name":"{name}","event":"on_login","priority":0,"enabled":true,"source":"grant_xp(event.actor, 10)"}}]}}"#
+                ),
+            )
+            .unwrap();
+            self
+        }
+
+        fn enabled(&self) -> artifact::Enabled {
+            artifact::read_enabled(&self.project.packages_dir()).expect("the inventory reads")
+        }
+
         fn artifact_hash(&self, package: &str) -> String {
-            artifact::read_enabled(&self.project.packages_dir())
-                .unwrap()
+            self.enabled()
                 .deltas
                 .into_iter()
                 .find(|a| a.package == package)
                 .expect("the package is enabled")
                 .artifact_hash
+        }
+
+        fn script_hash(&self, package: &str) -> String {
+            self.enabled()
+                .scripts
+                .into_iter()
+                .find(|a| a.package == package)
+                .expect("the package ships a Script Artifact")
+                .artifact_hash
+        }
+
+        /// The canonical payload this checkout's Script Artifacts pack into.
+        fn script_payload(&self) -> String {
+            script::pack(&self.enabled().scripts)
         }
 
         fn options(&self, shards: &[&str]) -> ReplayOptions {
@@ -479,37 +829,61 @@ mod tests {
         out
     }
 
-    /// A Shard that has never applied a Package Delta but has a stamped spell import.
-    fn fresh_shard(stack: FakeStack, database: &str) -> FakeStack {
-        stack
-            .with_stdout(
-                &format!("{database} SELECT source_sha"),
-                &sql_rows(&["source_sha"], &[vec![BASE_SHA.to_string()]]),
-            )
-            .with_stdout(
-                &format!("{database} SELECT package"),
-                &sql_rows(&["package", "artifact_hash", "base_source_sha"], &[]),
-            )
+    /// What `game_package_import` holds for one Shard's spell family.
+    fn with_spell_provenance(stack: FakeStack, database: &str, rows: &[Vec<String>]) -> FakeStack {
+        stack.with_stdout(
+            &format!(
+                "{database} SELECT package, artifact_hash, base_source_sha FROM \
+                 game_package_import WHERE family = '{SPELL_FAMILY}'"
+            ),
+            &sql_rows(&["package", "artifact_hash", "base_source_sha"], rows),
+        )
     }
 
-    /// A Shard already running exactly `package` at `hash`, on the current base import.
+    /// What it holds for the script family. Two columns, matching the query that has no base import
+    /// to ask about.
+    fn with_script_provenance(stack: FakeStack, database: &str, rows: &[Vec<String>]) -> FakeStack {
+        stack.with_stdout(
+            &format!(
+                "{database} SELECT package, artifact_hash FROM game_package_import WHERE family = \
+                 '{SCRIPT_FAMILY}'"
+            ),
+            &sql_rows(&["package", "artifact_hash"], rows),
+        )
+    }
+
+    /// A Shard that has never applied a Package artifact but has a stamped spell import.
+    fn fresh_shard(stack: FakeStack, database: &str) -> FakeStack {
+        let stack = stack.with_stdout(
+            &format!("{database} SELECT source_sha"),
+            &sql_rows(&["source_sha"], &[vec![BASE_SHA.to_string()]]),
+        );
+        let stack = with_spell_provenance(stack, database, &[]);
+        with_script_provenance(stack, database, &[])
+    }
+
+    /// A Shard already running exactly `package` at `hash` in the spell family, on the current base
+    /// import, and holding no Runtime Script.
     fn applied_shard(stack: FakeStack, database: &str, package: &str, hash: &str) -> FakeStack {
-        stack
-            .with_stdout(
-                &format!("{database} SELECT source_sha"),
-                &sql_rows(&["source_sha"], &[vec![BASE_SHA.to_string()]]),
-            )
-            .with_stdout(
-                &format!("{database} SELECT package"),
-                &sql_rows(
-                    &["package", "artifact_hash", "base_source_sha"],
-                    &[vec![
-                        package.to_string(),
-                        hash.to_string(),
-                        BASE_SHA.to_string(),
-                    ]],
-                ),
-            )
+        let stack = fresh_shard(stack, database);
+        with_spell_provenance(
+            stack,
+            database,
+            &[vec![
+                package.to_string(),
+                hash.to_string(),
+                BASE_SHA.to_string(),
+            ]],
+        )
+    }
+
+    /// A Shard already holding exactly `package`'s Script Artifact at `hash`.
+    fn scripted_shard(stack: FakeStack, database: &str, package: &str, hash: &str) -> FakeStack {
+        with_script_provenance(
+            stack,
+            database,
+            &[vec![package.to_string(), hash.to_string()]],
+        )
     }
 
     fn applies(stack: &FakeStack) -> Vec<String> {
@@ -517,6 +891,15 @@ mod tests {
             .rendered()
             .into_iter()
             .filter(|r| r.contains("lyracore-importer") && r.contains("--apply"))
+            .collect()
+    }
+
+    /// Every `apply_package_deltas` call this run made — the script family's whole write path.
+    fn script_applies(stack: &FakeStack) -> Vec<String> {
+        stack
+            .rendered()
+            .into_iter()
+            .filter(|r| r.contains(APPLY_REDUCER))
             .collect()
     }
 
@@ -675,22 +1058,15 @@ mod tests {
         let checkout = Checkout::new();
         checkout.with_package("bolt", 133, 1500);
         let hash = checkout.artifact_hash("bolt");
-        let stack = FakeStack::new()
-            .with_stdout(
-                "lyracore-kalimdor SELECT source_sha",
-                &sql_rows(&["source_sha"], &[vec![BASE_SHA.to_string()]]),
-            )
-            .with_stdout(
-                "lyracore-kalimdor SELECT package",
-                &sql_rows(
-                    &["package", "artifact_hash", "base_source_sha"],
-                    &[vec![
-                        "bolt".to_string(),
-                        hash,
-                        "an-older-spell-dbc".to_string(),
-                    ]],
-                ),
-            );
+        let stack = with_spell_provenance(
+            fresh_shard(FakeStack::new(), "lyracore-kalimdor"),
+            "lyracore-kalimdor",
+            &[vec![
+                "bolt".to_string(),
+                hash,
+                "an-older-spell-dbc".to_string(),
+            ]],
+        );
 
         run(
             &checkout.project,
@@ -713,25 +1089,18 @@ mod tests {
         checkout.with_package("bolt", 133, 1500);
         let bolt = checkout.artifact_hash("bolt");
         // `lyracore-kalimdor` also recorded `ember`, which is no longer enabled in this checkout.
-        let stack = FakeStack::new()
-            .with_stdout(
-                "lyracore-kalimdor SELECT source_sha",
-                &sql_rows(&["source_sha"], &[vec![BASE_SHA.to_string()]]),
-            )
-            .with_stdout(
-                "lyracore-kalimdor SELECT package",
-                &sql_rows(
-                    &["package", "artifact_hash", "base_source_sha"],
-                    &[
-                        vec!["bolt".to_string(), bolt, BASE_SHA.to_string()],
-                        vec![
-                            "ember".to_string(),
-                            "whatever-ember-hashed-to".to_string(),
-                            BASE_SHA.to_string(),
-                        ],
-                    ],
-                ),
-            );
+        let stack = with_spell_provenance(
+            fresh_shard(FakeStack::new(), "lyracore-kalimdor"),
+            "lyracore-kalimdor",
+            &[
+                vec!["bolt".to_string(), bolt, BASE_SHA.to_string()],
+                vec![
+                    "ember".to_string(),
+                    "whatever-ember-hashed-to".to_string(),
+                    BASE_SHA.to_string(),
+                ],
+            ],
+        );
 
         run(
             &checkout.project,
@@ -841,7 +1210,7 @@ mod tests {
         let asked = prompt.asked();
         assert!(asked.iter().any(|q| q.contains("CLEAR")), "{asked:?}");
         assert!(
-            asked.iter().any(|q| q.contains("Package spell range")),
+            asked.iter().any(|q| q.contains("Package Spell Range")),
             "{asked:?}"
         );
         let applied = applies(&stack);
@@ -964,11 +1333,373 @@ mod tests {
             .into_iter()
             .filter(|r| r.contains("spacetime sql"))
             .collect();
-        assert_eq!(queries.len(), 2, "{queries:?}");
+        // The spell family's base stamp and provenance, then the script family's provenance.
+        assert_eq!(queries.len(), 3, "{queries:?}");
         for query in &queries {
             assert!(!query.contains("ORDER BY"), "{query}");
             assert!(!query.contains(" IN ("), "{query}");
-            assert!(query.contains("WHERE family = 'spell'"), "{query}");
         }
+        assert_eq!(
+            queries
+                .iter()
+                .filter(|q| q.contains("WHERE family = 'script'"))
+                .count(),
+            1,
+            "{queries:?}"
+        );
+    }
+
+    // ---- the script family ----
+
+    /// The acceptance criterion the issue is written for: one command carries a Package's script
+    /// edit to every Shard, with no hand-written `spacetime call` behind it.
+    #[test]
+    fn the_script_family_reaches_every_named_shard_in_one_run() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let mut stack = FakeStack::new();
+        for shard in ["lyracore", "lyracore-kalimdor"] {
+            stack = fresh_shard(stack, shard);
+        }
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&["yes"]),
+            &checkout.options(&["lyracore", "lyracore-kalimdor"]),
+        )
+        .unwrap();
+
+        let applied = script_applies(&stack);
+        assert_eq!(applied.len(), 2, "{applied:?}");
+        for (rendered, shard) in applied.iter().zip(["lyracore", "lyracore-kalimdor"]) {
+            assert!(
+                rendered.contains(&format!(" {shard} {APPLY_REDUCER} ")),
+                "{rendered}"
+            );
+        }
+    }
+
+    /// Both arguments are JSON literals, which is what `spacetime call` parses each argument as.
+    /// The payload is the canonical artifact, so the digest the Shard records describes what the
+    /// artifact SAYS rather than how it was spelled.
+    #[test]
+    fn the_script_plan_travels_as_json_arguments_carrying_the_canonical_artifact() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let stack = fresh_shard(FakeStack::new(), "lyracore");
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&["yes"]),
+            &checkout.options(&["lyracore"]),
+        )
+        .unwrap();
+
+        let applied = script_applies(&stack);
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert!(applied[0].contains(r#" "script" "#), "{}", applied[0]);
+        assert!(
+            applied[0].contains(&json_argument(&checkout.script_payload())),
+            "{}",
+            applied[0]
+        );
+        assert!(
+            checkout.script_payload().contains(r#""name":"bolt.greet""#),
+            "{}",
+            checkout.script_payload()
+        );
+    }
+
+    #[test]
+    fn a_shard_whose_script_provenance_already_matches_is_reported_complete_and_never_reapplied() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let hash = checkout.script_hash("bolt");
+        let stack = scripted_shard(
+            fresh_shard(
+                fresh_shard(FakeStack::new(), "lyracore"),
+                "lyracore-kalimdor",
+            ),
+            "lyracore-kalimdor",
+            "bolt",
+            &hash,
+        );
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&["yes"]),
+            &checkout.options(&["lyracore", "lyracore-kalimdor"]),
+        )
+        .unwrap();
+
+        let applied = script_applies(&stack);
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert!(applied[0].contains(" lyracore "), "{applied:?}");
+    }
+
+    #[test]
+    fn force_all_reapplies_a_script_plan_a_shard_already_holds() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let hash = checkout.script_hash("bolt");
+        let stack = scripted_shard(
+            fresh_shard(FakeStack::new(), "lyracore"),
+            "lyracore",
+            "bolt",
+            &hash,
+        );
+        let options = ReplayOptions {
+            force_all: true,
+            ..checkout.options(&["lyracore"])
+        };
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&["yes"]),
+            &options,
+        )
+        .unwrap();
+
+        assert_eq!(script_applies(&stack).len(), 1, "{:?}", stack.rendered());
+    }
+
+    /// Reconciliation is how a disabled Package's scripts leave a Shard, so the empty plan is a
+    /// statement that must still be sent — and, because it deletes, one the operator says out loud.
+    #[test]
+    fn an_empty_script_plan_is_still_applied_where_a_package_script_is_recorded() {
+        let checkout = Checkout::new();
+        let stack = scripted_shard(
+            fresh_shard(FakeStack::new(), "lyracore"),
+            "lyracore",
+            "bolt",
+            "whatever-bolt-hashed-to",
+        );
+        let prompt = ScriptedPrompt::new(&["yes"]);
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &prompt,
+            &ReplayOptions {
+                yes: false,
+                ..checkout.options(&["lyracore"])
+            },
+        )
+        .unwrap();
+
+        let asked = prompt.asked();
+        assert!(
+            asked
+                .iter()
+                .any(|q| q.contains("CLEAR the Package Script Range")),
+            "{asked:?}"
+        );
+        let applied = script_applies(&stack);
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert!(
+            applied[0].ends_with(r#" "script" """#),
+            "the empty plan is sent explicitly: {}",
+            applied[0]
+        );
+    }
+
+    /// The other half of the same decision: with nothing enabled AND nothing recorded, the Package
+    /// script range is already empty. There is no work, so there is no question and no write.
+    #[test]
+    fn an_empty_script_plan_over_a_shard_holding_no_package_script_is_already_complete() {
+        let checkout = Checkout::new();
+        let stack = fresh_shard(FakeStack::new(), "lyracore");
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &ReplayOptions {
+                yes: false,
+                ..checkout.options(&["lyracore"])
+            },
+        )
+        .unwrap();
+
+        assert!(script_applies(&stack).is_empty(), "{:?}", stack.rendered());
+    }
+
+    #[test]
+    fn a_refused_script_plan_stops_the_run_naming_the_shard_the_family_and_the_refusal() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let mut stack = FakeStack::new();
+        for shard in ["lyracore", "lyracore-kalimdor", "lyracore-instances"] {
+            stack = fresh_shard(stack, shard);
+        }
+        let stack = stack.fail_on(
+            &format!("lyracore-kalimdor {APPLY_REDUCER}"),
+            "1 Runtime Script conflicts, nothing applied",
+        );
+
+        let error = run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&["yes"]),
+            &checkout.options(&["lyracore", "lyracore-kalimdor", "lyracore-instances"]),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE);
+        assert!(
+            message.contains("replay stopped at: lyracore-kalimdor (script family)"),
+            "{message}"
+        );
+        assert!(message.contains("nothing applied"), "{message}");
+        assert!(message.contains("completed: lyracore\n"), "{message}");
+        assert!(
+            message.contains("untouched: lyracore-instances"),
+            "{message}"
+        );
+        assert!(
+            !script_applies(&stack)
+                .iter()
+                .any(|r| r.contains(" lyracore-instances ")),
+            "the run must stop at the failure: {:?}",
+            script_applies(&stack)
+        );
+    }
+
+    /// The whole plan is one argument, so the rendered command IS the payload. A refusal has to
+    /// report what the module said, not quote a megabyte of Lua back at the operator.
+    #[test]
+    fn a_refusal_reports_what_the_module_said_rather_than_the_rendered_payload() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let stack = fresh_shard(FakeStack::new(), "lyracore")
+            .fail_on(APPLY_REDUCER, "script 100001 is not in the Package band");
+
+        let error = run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&["yes"]),
+            &checkout.options(&["lyracore"]),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("is not in the Package band"), "{message}");
+        assert!(
+            !message.contains("grant_xp"),
+            "the payload is not quoted back: {message}"
+        );
+    }
+
+    #[test]
+    fn a_runtime_script_collision_fails_the_run_before_the_first_shard_is_read() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "shared.greet");
+        checkout.with_script("ember", 100_002, "shared.greet");
+        let stack = fresh_shard(FakeStack::new(), "lyracore");
+
+        let error = run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&["yes"]),
+            &checkout.options(&["lyracore"]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
+        assert!(
+            error.to_string().contains("Runtime Script collision"),
+            "{error}"
+        );
+        assert!(
+            stack.rendered().is_empty(),
+            "nothing may run before the artifacts are cleared: {:?}",
+            stack.rendered()
+        );
+    }
+
+    #[test]
+    fn check_prints_the_script_plan_and_calls_no_reducer() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let stack = fresh_shard(FakeStack::new(), "lyracore");
+        let options = ReplayOptions {
+            check: true,
+            yes: false,
+            ..checkout.options(&["lyracore"])
+        };
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &options,
+        )
+        .unwrap();
+
+        assert!(script_applies(&stack).is_empty(), "{:?}", stack.rendered());
+    }
+
+    /// Only the spell family runs through the importer, so a run carrying nothing but Runtime
+    /// Scripts must not pay for building it.
+    #[test]
+    fn a_script_only_run_never_builds_the_importer() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let stack = fresh_shard(FakeStack::new(), "lyracore");
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&["yes"]),
+            &checkout.options(&["lyracore"]),
+        )
+        .unwrap();
+
+        assert!(
+            !stack
+                .rendered()
+                .iter()
+                .any(|r| r.contains("cargo build") && r.contains("lyracore-importer")),
+            "{:?}",
+            stack.rendered()
+        );
+        assert_eq!(script_applies(&stack).len(), 1, "{:?}", stack.rendered());
+    }
+
+    /// The two families are decided independently: a Shard can hold this checkout's Package Deltas
+    /// and none of its Runtime Scripts, which is what every Realm looks like the first time a
+    /// Package ships a script.
+    #[test]
+    fn a_shard_complete_for_one_family_is_still_replayed_for_the_other() {
+        let checkout = Checkout::new();
+        checkout.with_package("bolt", 133, 1500);
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let hash = checkout.artifact_hash("bolt");
+        let stack = applied_shard(FakeStack::new(), "lyracore", "bolt", &hash);
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&["yes"]),
+            &checkout.options(&["lyracore"]),
+        )
+        .unwrap();
+
+        assert!(
+            applies(&stack).is_empty(),
+            "the spell family is complete here: {:?}",
+            applies(&stack)
+        );
+        assert_eq!(
+            script_applies(&stack).len(),
+            1,
+            "the script family is not: {:?}",
+            stack.rendered()
+        );
     }
 }

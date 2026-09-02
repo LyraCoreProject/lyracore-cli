@@ -35,6 +35,7 @@ pub mod lifecycle;
 pub(crate) mod official;
 pub mod replay;
 pub mod review;
+pub mod script;
 pub mod stamp;
 pub(crate) mod tree;
 

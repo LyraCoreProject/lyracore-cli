@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use super::script::{self, ScriptArtifact};
 use crate::{Error, Result};
 
 /// Where a Package's generated Delta artifacts live, relative to the Package folder.
@@ -39,10 +40,6 @@ const GENERATED_DIR: &str = "data/.generated";
 
 /// The only artifact envelope version this CLI reads.
 const DELTA_VERSION: u64 = 1;
-
-/// The `kind` a Script Artifact carries. A Package Delta carries no `kind` at all — version 1 of it
-/// shipped before there was a second kind to tell it from — so an absent member means a Delta.
-const SCRIPT_ARTIFACT_KIND: &str = "script";
 
 /// The Import Family the Package Delta schema covers.
 pub const SPELL_FAMILY: &str = "spell";
@@ -134,26 +131,14 @@ pub struct Artifact {
 ///
 /// A Package ships every artifact kind it has into one `data/.generated/` directory, so the walk
 /// meets Script Artifacts as well as Package Deltas. They are a different artifact with a different
-/// applier, and this reader has nothing to say about them beyond how many it passed over.
+/// applier and a different Import Family, so they are kept apart rather than merged: `packages
+/// replay` applies both, and every other caller wants only the Deltas.
 #[derive(Debug, Clone, Default)]
 pub struct Enabled {
     /// Every Package Delta, ordered by Package folder then file name.
     pub deltas: Vec<Artifact>,
-    /// How many Script Artifacts were passed over, for a report to name once.
-    pub scripts_skipped: usize,
-}
-
-impl Enabled {
-    /// The one line a report prints about the Script Artifacts it passed over, or nothing when
-    /// there were none.
-    #[must_use]
-    pub fn skipped_note(&self) -> Option<String> {
-        match self.scripts_skipped {
-            0 => None,
-            1 => Some("1 Script Artifact skipped: not a Package Delta".to_string()),
-            n => Some(format!("{n} Script Artifacts skipped: not Package Deltas")),
-        }
-    }
+    /// Every Script Artifact, in the same order.
+    pub scripts: Vec<ScriptArtifact>,
 }
 
 /// Every enabled Package's artifacts, ordered by Package folder then file name so the same tree
@@ -190,8 +175,16 @@ pub fn read_enabled(root: &Path) -> Result<Enabled> {
 
         for path in files {
             let text = std::fs::read_to_string(&path)?;
-            if is_script_artifact(&text) {
-                enabled.scripts_skipped += 1;
+            if script::is_script_artifact(&text) {
+                let artifact = script::parse(&text, &path)?;
+                if let Some(seen) = enabled
+                    .scripts
+                    .iter()
+                    .find(|a| a.package == artifact.package)
+                {
+                    return Err(named_twice(&artifact.package, &seen.path, &path));
+                }
+                enabled.scripts.push(artifact);
                 continue;
             }
             let artifact = parse(&text, &path)?;
@@ -200,13 +193,7 @@ pub fn read_enabled(root: &Path) -> Result<Enabled> {
                 .iter()
                 .find(|a| a.package == artifact.package)
             {
-                return Err(Error::Usage(format!(
-                    "package `{}` appears twice in the enabled Package Inventory:\n  {}\n  {}\nThe \
-                     module refuses a plan that names one Package twice, so nothing was applied.",
-                    artifact.package,
-                    seen.path.display(),
-                    path.display()
-                )));
+                return Err(named_twice(&artifact.package, &seen.path, &path));
             }
             enabled.deltas.push(artifact);
         }
@@ -214,22 +201,15 @@ pub fn read_enabled(root: &Path) -> Result<Enabled> {
     Ok(enabled)
 }
 
-/// Whether these bytes are a Script Artifact, from the root `kind` member alone.
-///
-/// Read before the parse, not after: a Script Artifact hard-parsed as a Package Delta fails on a
-/// missing `claims` member, which describes the symptom rather than the fact that this file was
-/// never a Delta. Anything that is not a JSON object with `"kind": "script"` goes to the parser,
-/// which reports what is wrong with it far better than this can.
-fn is_script_artifact(text: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .and_then(|root| {
-            root.as_object()
-                .and_then(|object| object.get("kind"))
-                .and_then(serde_json::Value::as_str)
-                .map(|kind| kind == SCRIPT_ARTIFACT_KIND)
-        })
-        .unwrap_or(false)
+/// The refusal for a Package that two artifacts of one kind both name. The module refuses a plan
+/// naming one Package twice; refusing here names the two files.
+fn named_twice(package: &str, first: &Path, second: &Path) -> Error {
+    Error::Usage(format!(
+        "package `{package}` appears twice in the enabled Package Inventory:\n  {}\n  {}\nThe \
+         module refuses a plan that names one Package twice, so nothing was applied.",
+        first.display(),
+        second.display()
+    ))
 }
 
 /// Every disagreement between these Packages, in canonical order.
@@ -517,7 +497,10 @@ fn canonical(package: &str, source_hash: &str, claims: &[Claim]) -> String {
     out
 }
 
-fn write_string(out: &mut String, text: &str) {
+/// A JSON string escaping only what JSON requires, using the short escape where one exists. Shared
+/// with [`super::script`]: both artifact kinds promise the same spelling, and two copies of it
+/// could only drift into two different digests for one artifact.
+pub(super) fn write_string(out: &mut String, text: &str) {
     out.push('"');
     for ch in text.chars() {
         match ch {
@@ -762,7 +745,7 @@ mod tests {
     /// Package Delta and has a different applier, so reading one as a Delta would refuse a Package
     /// that did nothing wrong.
     #[test]
-    fn a_script_artifact_is_skipped_rather_than_read_as_a_package_delta() {
+    fn a_script_artifact_is_read_as_a_script_rather_than_as_a_package_delta() {
         let tree = Tree::new();
         tree.write(
             "bolt/data/.generated/spell.json",
@@ -778,15 +761,12 @@ mod tests {
 
         let packages: Vec<&str> = found.deltas.iter().map(|a| a.package.as_str()).collect();
         assert_eq!(packages, ["example.bolt"]);
-        assert_eq!(found.scripts_skipped, 1);
-        assert_eq!(
-            found.skipped_note().as_deref(),
-            Some("1 Script Artifact skipped: not a Package Delta")
-        );
+        let scripts: Vec<&str> = found.scripts.iter().map(|a| a.package.as_str()).collect();
+        assert_eq!(scripts, ["example.bolt"]);
     }
 
     /// A Package that ships only Runtime Scripts claims no Delta at all. That is a clean empty
-    /// plan, not a refusal, and the report still says what it passed over.
+    /// Delta plan, not a refusal, and its scripts still reach the walk.
     #[test]
     fn a_package_shipping_only_a_script_artifact_contributes_no_delta() {
         let tree = Tree::new();
@@ -795,28 +775,41 @@ mod tests {
         let found = read_enabled(tree.root()).expect("discovery succeeds");
 
         assert!(found.deltas.is_empty());
-        assert_eq!(found.scripts_skipped, 1);
+        assert_eq!(found.scripts.len(), 1);
     }
 
-    /// The skip is a fact about the file, not about the Package it came from: the same Package may
-    /// still ship a Delta, and a second Package's script is counted too.
     #[test]
-    fn every_script_artifact_is_counted_and_the_note_reads_as_a_plural() {
+    fn every_enabled_packages_script_artifact_is_read_in_folder_order() {
         let tree = Tree::new();
-        tree.write("alpha/data/.generated/script.json", SCRIPT_ARTIFACT);
-        tree.write("zeta/data/.generated/script.json", SCRIPT_ARTIFACT);
+        tree.write(
+            "zeta/data/.generated/script.json",
+            &SCRIPT_ARTIFACT.replace("example.bolt", "example.zeta"),
+        );
+        tree.write(
+            "alpha/data/.generated/script.json",
+            &SCRIPT_ARTIFACT.replace("example.bolt", "example.alpha"),
+        );
 
         let found = read_enabled(tree.root()).expect("discovery succeeds");
 
-        assert_eq!(found.scripts_skipped, 2);
-        assert_eq!(
-            found.skipped_note().as_deref(),
-            Some("2 Script Artifacts skipped: not Package Deltas")
-        );
+        let packages: Vec<&str> = found.scripts.iter().map(|a| a.package.as_str()).collect();
+        assert_eq!(packages, ["example.alpha", "example.zeta"]);
     }
 
-    /// Only the Script Artifact kind is passed over. Anything else still meets the parser, which
-    /// reports what is wrong with it far better than a silent skip would.
+    /// The module refuses a plan naming one Package twice, whichever kind the two artifacts are.
+    #[test]
+    fn one_package_named_by_two_script_artifacts_is_refused() {
+        let tree = Tree::new();
+        tree.write("one/data/.generated/a.json", SCRIPT_ARTIFACT);
+        tree.write("two/data/.generated/b.json", SCRIPT_ARTIFACT);
+
+        let refusal = read_enabled(tree.root()).expect_err("refused");
+
+        assert!(refusal.to_string().contains("appears twice"), "{refusal}");
+    }
+
+    /// Only the Script Artifact kind goes to the script parser. Anything else still meets the
+    /// Package Delta parser, which reports what is wrong with it far better than a silent skip.
     #[test]
     fn an_artifact_of_an_unknown_kind_is_still_refused_by_the_parser() {
         let tree = Tree::new();

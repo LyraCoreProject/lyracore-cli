@@ -944,7 +944,7 @@ fn class_spells_command(
 /// `spacetime call`, pinned to the loopback node — bare `spacetime call` inherits the CLI's
 /// AMBIENT default server, which on a fresh machine is maincloud, not the node `dev up` started
 /// (the #440 class of failure the bash flow's `SPACETIME_SERVER` chokepoint exists for).
-fn call_command(project: &ProjectLayout, database: &str, reducer: &str) -> CommandSpec {
+pub(crate) fn call_command(project: &ProjectLayout, database: &str, reducer: &str) -> CommandSpec {
     CommandSpec::new("spacetime")
         .arg("call")
         .arg("--server")
