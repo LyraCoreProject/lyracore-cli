@@ -39,10 +39,12 @@
 //!    the authoritative Rust-side check — the same trace `packages replay` runs before it writes to
 //!    a Shard — so what a build just emitted is validated by the code that also decides whether it
 //!    may apply, not by a second, looser implementation of the same rules.
-//! 8. A Build Identity sidecar (`packages::identity`) is written next to each artifact that just
-//!    validated: every input the artifact was built from, so `packages check`, `preflight` and CI
-//!    can tell later whether it is still current. Writing it only after step 7 succeeds means a
-//!    sidecar never describes an artifact this build itself would have refused.
+//! 8. A Build Identity sidecar (`packages::identity`) is written next to each source-built artifact
+//!    that just validated: every input it was built from, so `packages check`, `preflight` and CI
+//!    can tell later whether it is still current. A source-free prebuilt Script Artifact has no
+//!    local author inputs or sidecar; the authoritative checker still parses and traces it. The
+//!    sidecar persists before its prebuilt predecessor retires, so an I/O failure restores that
+//!    predecessor instead of leaving an uncertified source-built artifact.
 //!
 //! Steps 1-3 and 5-7 STREAM to the terminal rather than being captured. `tsc` writes its
 //! diagnostics to stdout, so a captured run surfaced an empty error and lost the file and line this
@@ -414,12 +416,11 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
             return Err(error);
         }
     };
-    if let Err(error) = transition.commit() {
+    if let Err(error) = identity::write_all(project, &enabled.deltas) {
         transition.rollback()?;
         return Err(error);
     }
-    identity::write_all(project, &enabled.deltas)?;
-    identity::write_script_identities(project, &enabled.script_paths())?;
+    transition.certify(project, &enabled.script_paths())?;
 
     println!();
     println!("Package artifacts emitted and validated.");

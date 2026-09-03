@@ -39,6 +39,7 @@
 //! asking Bun to confirm its own version a second time would only be a slower way to read the same
 //! constant.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -531,8 +532,31 @@ pub fn write_script_identities(project: &ProjectLayout, artifacts: &[PathBuf]) -
                 ))
             })?
             .join(SCRIPT_IDENTITY_FILE);
-        std::fs::write(sidecar, compute_script(project, path)?.render())?;
+        write_atomically(&sidecar, compute_script(project, path)?.render().as_bytes())?;
     }
+    Ok(())
+}
+
+/// Replace a Build Identity only after its complete replacement is durable in a sibling temporary
+/// file. A failed write or rename leaves the prior sidecar untouched.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        Error::State(format!(
+            "Build Identity {} has no parent directory",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| {
+        Error::Process(format!(
+            "cannot replace Build Identity {} atomically: {}",
+            path.display(),
+            error.error
+        ))
+    })?;
     Ok(())
 }
 

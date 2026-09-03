@@ -530,6 +530,8 @@ struct PriorArtifact {
 struct PackageBuildArtifacts {
     target: PathBuf,
     prior: Vec<PriorArtifact>,
+    sidecar: PathBuf,
+    prior_sidecar: Option<Vec<u8>>,
 }
 
 /// The Script Artifacts in place before source compilation starts.
@@ -548,12 +550,23 @@ impl BuildArtifactTransition {
         for package in packages {
             let generated = project.packages_dir().join(package).join("data/.generated");
             let target = generated.join(format!("{package}.script.json"));
+            let sidecar = generated.join(identity::SCRIPT_IDENTITY_FILE);
+            let prior_sidecar = match std::fs::read(&sidecar) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
             let mut prior = Vec::new();
             for path in script_artifact_files(&generated)? {
                 let bytes = std::fs::read(&path)?;
                 prior.push(PriorArtifact { path, bytes });
             }
-            captured.push(PackageBuildArtifacts { target, prior });
+            captured.push(PackageBuildArtifacts {
+                target,
+                prior,
+                sidecar,
+                prior_sidecar,
+            });
         }
         Ok(Self { packages: captured })
     }
@@ -593,6 +606,21 @@ impl BuildArtifactTransition {
         Ok(())
     }
 
+    /// Persist source-built identities, then retire the prebuilt names. Both operations remain in
+    /// the transition: a full disk or failed rename must restore the prebuilt inventory rather
+    /// than leave a canonical artifact that `packages check` cannot certify.
+    pub fn certify(&self, project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<()> {
+        if let Err(error) = identity::write_script_identities(project, artifacts) {
+            self.rollback()?;
+            return Err(error);
+        }
+        if let Err(error) = self.commit() {
+            self.rollback()?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Restore the complete prior inventory after a failed transition.
     pub fn rollback(&self) -> Result<()> {
         for package in &self.packages {
@@ -606,6 +634,11 @@ impl BuildArtifactTransition {
             }
             for prior in &package.prior {
                 write_atomically(&prior.path, &prior.bytes)?;
+            }
+            match &package.prior_sidecar {
+                Some(bytes) => write_atomically(&package.sidecar, bytes)?,
+                None if package.sidecar.is_file() => std::fs::remove_file(&package.sidecar)?,
+                None => {}
             }
         }
         Ok(())
@@ -1301,5 +1334,35 @@ mod tests {
 
         assert_eq!(std::fs::read(&target).unwrap(), prior);
         assert_eq!(std::fs::read_dir(&generated).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_sidecar_write_failure_restores_the_prebuilt_artifact() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.ts");
+        let generated = project.packages_dir().join("playerbots/data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let prebuilt = generated.join("personality.json");
+        let prior = b"{\"kind\":\"script\",\"prior\":true}\n";
+        std::fs::write(&prebuilt, prior).unwrap();
+        let transition =
+            BuildArtifactTransition::capture(&project, &["playerbots".to_string()]).unwrap();
+        let target = generated.join("playerbots.script.json");
+        std::fs::write(&target, "{\"kind\":\"script\",\"candidate\":true}\n").unwrap();
+
+        // A directory at the sidecar path gives the real filesystem failure a full disk or failed
+        // replacement would give, without a mock below the filesystem seam.
+        std::fs::create_dir(generated.join(identity::SCRIPT_IDENTITY_FILE)).unwrap();
+        let error = transition
+            .certify(&project, std::slice::from_ref(&target))
+            .expect_err("the sidecar cannot replace a directory");
+
+        assert!(error.to_string().contains("script.identity"), "{error}");
+        assert_eq!(std::fs::read(&prebuilt).unwrap(), prior);
+        assert!(
+            !target.exists(),
+            "the uncertified canonical artifact must be removed"
+        );
     }
 }
