@@ -242,17 +242,16 @@ pub fn check_collision(project: &ProjectLayout, name: &PackageName) -> Result<()
     }
 }
 
-/// Refuse a destination `packages/<name>` that Git already tracks in the core checkout — a
+/// Refuse a destination `packages/<name>` that Git already tracks in the core checkout: a
 /// first-party Package like the Reference Package (`example`) or an in-tree instance Package
 /// (`fire_nova`). Installing over one would overwrite tracked content outside any Package
-/// Inventory move, dirtying the checkout; `lyracore update` and `service reconcile` then refuse to
-/// run against a dirty tree. This is a name collision `check_collision` cannot see, because a
-/// tracked Package is not itself installed through this CLI.
+/// Inventory move, dirtying the checkout. `lyracore update` and `service reconcile` then refuse to
+/// run against a dirty tree.
 fn check_not_tracked(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     name: &PackageName,
-    origin: &Origin,
+    source: &str,
 ) -> Result<()> {
     let relative = format!("{}/{}", ProjectLayout::PACKAGES_DIR, name.as_str());
     let tracked = runner.run_and_wait(
@@ -270,7 +269,7 @@ fn check_not_tracked(
          over a tracked Package would dirty the checkout, and `lyracore update` and `service \
          reconcile` then refuse to run. Nothing was copied.",
         name.as_str(),
-        origin.named(),
+        source,
         project.root.join(&relative).display()
     )))
 }
@@ -479,8 +478,8 @@ pub(crate) fn install(
     yes: bool,
 ) -> Result<()> {
     let destination = project.packages_dir().join(name.as_str());
+    check_not_tracked(project, runner, name, &origin.named())?;
     check_collision(project, name)?;
-    check_not_tracked(project, runner, name, origin)?;
     // Computing the identity validates the WHOLE tree (including client content) before the
     // narrower shape and trust-review passes. The same identity must describe the staged copy
     // after the operator answers, binding consent to the bytes that are actually installed.
@@ -1295,13 +1294,27 @@ pub(super) mod tests {
         let source = candidate(&tmp, "greeter");
 
         // Enabled collision.
-        std::fs::create_dir_all(project.packages_dir().join("greeter")).unwrap();
-        let error = check_collision(&project, &PackageName::parse("greeter").unwrap()).unwrap_err();
+        let enabled = project.packages_dir().join("greeter");
+        std::fs::create_dir_all(&enabled).unwrap();
+        std::fs::write(enabled.join("installed.txt"), "keep me\n").unwrap();
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("enabled"), "{error}");
+        assert!(!error.to_string().contains("tracked by Git"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(enabled.join("installed.txt")).unwrap(),
+            "keep me\n"
+        );
 
-        // ...and a DISABLED one, which the build cannot see today but would collide the moment it
+        // A disabled one would collide the moment it
         // was re-enabled.
-        std::fs::remove_dir_all(project.packages_dir().join("greeter")).unwrap();
+        std::fs::remove_dir_all(&enabled).unwrap();
         std::fs::create_dir_all(project.packages_disabled_dir().join("greeter")).unwrap();
         let error = add(
             &project,
@@ -1336,6 +1349,9 @@ pub(super) mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let source = candidate(&tmp, "example");
+        let tracked = project.packages_dir().join("example");
+        std::fs::create_dir_all(&tracked).unwrap();
+        std::fs::write(tracked.join("README.md"), "tracked Reference Package\n").unwrap();
         let stack = FakeStack::new().with_stdout("ls-files", "packages/example\n");
 
         let error = add(
@@ -1348,7 +1364,6 @@ pub(super) mod tests {
         .unwrap_err();
 
         assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
-        // Both paths named: the candidate being installed, and the tracked path it collides with.
         assert!(
             error.to_string().contains(&source.display().to_string()),
             "{error}"
@@ -1359,7 +1374,10 @@ pub(super) mod tests {
                 .contains(&project.packages_dir().join("example").display().to_string()),
             "{error}"
         );
-        assert!(!project.packages_dir().join("example").exists(), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(tracked.join("README.md")).unwrap(),
+            "tracked Reference Package\n"
+        );
     }
 
     #[test]

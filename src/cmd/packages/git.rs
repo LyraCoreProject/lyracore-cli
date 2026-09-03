@@ -200,6 +200,7 @@ pub(crate) fn add(
 ) -> Result<()> {
     let name = source.name()?;
     // Before the network: an install the inventory would refuse anyway is not worth a clone.
+    super::check_not_tracked(project, runner, &name, source.url())?;
     super::check_collision(project, &name)?;
 
     let clone = RepositoryClone::fetch(project, runner, source)?;
@@ -841,6 +842,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let url = "https://example.invalid/example.git";
+        let tracked = project.packages_dir().join("example");
+        std::fs::create_dir_all(&tracked).unwrap();
+        std::fs::write(tracked.join("README.md"), "tracked Reference Package\n").unwrap();
         let stack = repository(&candidate(&tmp, "anything"), FIRST)
             .with_stdout("ls-files", "packages/example\n");
 
@@ -848,7 +852,6 @@ mod tests {
             super::super::add(&project, &stack.runner(), &Answer("yes"), url, true).unwrap_err();
 
         assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
-        // Both paths named: the Git Package Source, and the tracked path it collides with.
         assert!(error.to_string().contains(url), "{error}");
         assert!(
             error
@@ -856,7 +859,17 @@ mod tests {
                 .contains(&project.packages_dir().join("example").display().to_string()),
             "{error}"
         );
-        assert!(!project.packages_dir().join("example").exists(), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(tracked.join("README.md")).unwrap(),
+            "tracked Reference Package\n"
+        );
+        assert!(
+            stack
+                .rendered()
+                .iter()
+                .all(|call| !call.contains("git clone")),
+            "a known tracked destination must be refused before the network"
+        );
     }
 
     #[test]
