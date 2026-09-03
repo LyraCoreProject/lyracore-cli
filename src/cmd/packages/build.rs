@@ -43,8 +43,10 @@
 //!    that just validated: every input it was built from, so `packages check`, `preflight` and CI
 //!    can tell later whether it is still current. A source-free prebuilt Script Artifact has no
 //!    local author inputs or sidecar; the authoritative checker still parses and traces it. The
-//!    sidecar persists before its prebuilt predecessor retires, so an I/O failure restores that
-//!    predecessor instead of leaving an uncertified source-built artifact.
+//!    sidecar persists before its prebuilt predecessor retires. Before compilation, the old
+//!    entries gain same-directory hard-link backups, so a pre-commit failure restores them without
+//!    rewriting their contents. A filesystem that refuses a directory-entry operation instead
+//!    stops the command with the last intact inventory or an explicit recovery error.
 //!
 //! Steps 1-3 and 5-7 STREAM to the terminal rather than being captured. `tsc` writes its
 //! diagnostics to stdout, so a captured run surfaced an empty error and lost the file and line this
@@ -371,6 +373,7 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     println!();
     println!("Datascripts typecheck against the current Module schema.");
 
+    script::recover_interrupted_transition(project)?;
     let datascript_packages = packages_with_datascripts(project)?;
     let script_packages = script::packages_with_scripts(project)?;
     for path in script::remove_artifacts_without_sources(project)? {
