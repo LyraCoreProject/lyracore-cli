@@ -1,5 +1,7 @@
 //! The enabled Packages' Script Artifacts: the Runtime Scripts they ship, the digest a Shard
 //! records for each one, and the payload `apply_package_deltas` reads for the script Import Family.
+//! The same module builds them: `packages build` compiles a Package's `scripts/` sources into the
+//! artifact this parser then reads back.
 //!
 //! A Runtime Script has no base import and no other owner, so two Packages meeting on one
 //! `script_id` or name is always a collision, never the row merge [`super::artifact`] does.
@@ -11,10 +13,26 @@
 //! This parser refuses only what would corrupt the bytes or the plan — unknown version, an
 //! undeclared member, an in-Package id/name clash — and leaves the event catalogue, identifier
 //! bands, and name rules to the Module, which refuses an over-permissive plan on the first Shard.
+//!
+//! The build half is the Datascript step's sibling and deliberately shaped like it: one `bun run`
+//! subprocess per Package, streamed so the toolchain's own diagnostics reach the author, fail-fast,
+//! and the artifact validated afterwards by the same `lyracore-delta-check` that traces Package
+//! Deltas. Two things differ, both because a Runtime Script is Package-authored rather than
+//! schema-derived:
+//!
+//!  * The sources live INSIDE the Package (`packages/<name>/scripts/`), not under `datascripts/src/`.
+//!    A Datascript sits outside a Package folder because only artifacts belong in one; a Runtime
+//!    Script is a Package's own content, and the Official Package Collection ships both halves.
+//!  * The builder is handed the hook Event Binding catalogue, read from `lyracore-delta-check
+//!    --print-events`, so a `@event` typo fails while the author can still see which file it is in.
+//!    The catalogue is never copied into the toolchain: the Module owns it, and a copy would drift.
 
 use std::path::{Path, PathBuf};
 
 use super::artifact::write_string;
+use crate::cmd::packages::identity;
+use crate::proc::{CommandSpec, ProcessRunner};
+use crate::project::ProjectLayout;
 use crate::{Error, Result};
 
 /// The Import Family a Script Artifact belongs to — the name `apply_package_deltas` takes and
@@ -318,9 +336,581 @@ pub fn pack(artifacts: &[ScriptArtifact]) -> String {
         .join("\n")
 }
 
+// ---- building a Script Artifact ----
+
+/// The environment variable the builder reads its Event Binding catalogue from, one event per line.
+const HOOK_EVENTS_ENV: &str = "LYRACORE_HOOK_EVENTS";
+
+/// A hard-linked old artifact or sidecar. The unique tail has no `.json` suffix, so artifact
+/// discovery cannot mistake it for a candidate. A leftover name means a process stopped outside
+/// the in-memory rollback boundary; a later build refuses it without guessing what to restore.
+const TRANSITION_BACKUP_PREFIX: &str = ".lyracore-script-build-backup-";
+const LEGACY_TRANSITION_BACKUP_SUFFIX: &str = ".lyracore-script-build-backup";
+
+/// The Runtime Script sources the builder reads, in file-name order.
+///
+/// The inventory is deliberately shallow and contains only regular `.ts` and `.lua` files. This
+/// is the same definition as the Runtime Script Toolchain's `scriptSources`: a nested file, a
+/// symlink, or a README cannot affect emitted Lua and therefore cannot affect its Build Identity.
+pub fn source_files(project: &ProjectLayout, package: &str) -> Result<Vec<PathBuf>> {
+    let scripts_dir = project.package_scripts_dir(package);
+    if !scripts_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(scripts_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "ts" || extension == "lua")
+        {
+            sources.push(path);
+        }
+    }
+    sources.sort();
+    Ok(sources)
+}
+
+/// Enabled Packages carrying at least one Runtime Script source, in folder-name order. The same
+/// listing already means "enabled", so a disabled Package's scripts are not there to find.
+pub fn packages_with_scripts(project: &ProjectLayout) -> Result<Vec<String>> {
+    let packages_dir = project.packages_dir();
+    if !packages_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&packages_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !source_files(project, &name)?.is_empty() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Remove Script Artifacts previously emitted by this build after their last source disappears.
+///
+/// A `script.identity` sidecar marks the source-built mode. A source-free Script Artifact without
+/// that sidecar is prebuilt Lua and remains untouched, so an Operator can install and replay it
+/// without Bun. Artifact files are removed before the sidecar. If removal fails, the remaining
+/// sidecar keeps any surviving artifact from being mistaken for prebuilt Lua by `packages check`.
+pub fn remove_artifacts_without_sources(project: &ProjectLayout) -> Result<Vec<PathBuf>> {
+    let packages_dir = project.packages_dir();
+    if !packages_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut removed = Vec::new();
+    for entry in std::fs::read_dir(packages_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Ok(package) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !source_files(project, &package)?.is_empty() {
+            continue;
+        }
+
+        let generated = entry.path().join("data/.generated");
+        let sidecar = generated.join(identity::SCRIPT_IDENTITY_FILE);
+        if !sidecar.is_file() {
+            continue;
+        }
+
+        for path in script_artifact_files(&generated)? {
+            std::fs::remove_file(&path)?;
+            removed.push(path);
+        }
+        std::fs::remove_file(sidecar)?;
+    }
+    Ok(removed)
+}
+
+/// Every Script Artifact file in one Package's generated directory, in file-name order.
+///
+/// A path walk rather than a plan read: `packages build` handles artifacts a Shard would refuse,
+/// including the prebuilt file it is about to replace.
+fn script_artifact_files(generated: &Path) -> Result<Vec<PathBuf>> {
+    if !generated.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(generated)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    let mut found = Vec::new();
+    for path in files {
+        if is_script_artifact(&std::fs::read_to_string(&path)?) {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+/// Print the Module's Event Binding catalogue. Captured, not streamed: the answer is the output.
+pub fn hook_events_command(project: &ProjectLayout) -> CommandSpec {
+    CommandSpec::new("cargo")
+        .arg("run")
+        .arg("-p")
+        .arg("lyracore-package-delta")
+        .arg("--bin")
+        .arg("lyracore-delta-check")
+        .arg("--")
+        .arg("--print-events")
+        .cwd(project.root.clone())
+}
+
+/// One Package's Runtime Script build, as a subprocess.
+pub fn build_command(project: &ProjectLayout, package: &str, events: &str) -> CommandSpec {
+    CommandSpec::new("bun")
+        .arg("run")
+        .arg(project.script_builder_file().to_string_lossy().to_string())
+        .arg(package.to_string())
+        .env(
+            "LYRACORE_PACKAGES_ROOT",
+            project.packages_dir().to_string_lossy().to_string(),
+        )
+        .env(HOOK_EVENTS_ENV, events.to_string())
+        .cwd(project.root.clone())
+}
+
+/// Read the Event Binding catalogue once, then compile each Package's scripts in folder-name order.
+/// The first Package to fail stops the build; later Packages never run.
+pub fn run_builds(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    packages: &[String],
+) -> Result<()> {
+    let events = runner
+        .run_and_wait(&hook_events_command(project))
+        .map_err(|e| {
+            Error::Process(format!(
+                "could not read the Event Binding catalogue from `lyracore-delta-check \
+                 --print-events`, so a script's `@event` could not be checked against the Module. \
+                 Nothing was compiled.\n  ({e})"
+            ))
+        })?;
+
+    for package in packages {
+        println!(
+            "compiling Runtime Scripts in {} ({package})",
+            project.package_scripts_dir(package).display()
+        );
+        runner
+            .run_streaming(&build_command(project, package, &events))
+            .map_err(|e| {
+                Error::Process(format!(
+                    "the Runtime Scripts of `{package}` did not compile into a Script Artifact. \
+                     The toolchain's own diagnostic is above, naming the file and the directive or \
+                     line to fix. A refused build writes nothing, so the Package's artifact is \
+                     exactly what it was before this run.\n  ({e})"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PriorArtifact {
+    path: PathBuf,
+    backup: PathBuf,
+}
+
+#[derive(Debug)]
+struct PackageBuildArtifacts {
+    target: PathBuf,
+    prior: Vec<PriorArtifact>,
+    sidecar: PathBuf,
+    prior_sidecar: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct PackagePriorPaths {
+    target: PathBuf,
+    prior: Vec<PathBuf>,
+    sidecar: PathBuf,
+    has_sidecar: bool,
+}
+
+/// The Script Artifacts in place before source compilation starts.
+///
+/// Before compilation, old files gain unique same-directory hard-link backup entries. That leaves
+/// the original inventory intact until every backup exists and lets in-process rollback restore it
+/// with directory operations rather than a content rewrite. This transition deliberately has no
+/// crash-recovery protocol. A later process cannot know where the stopped process was, so it refuses
+/// a leftover backup without changing the Package inventory.
+#[derive(Debug)]
+pub struct BuildArtifactTransition {
+    packages: Vec<PackageBuildArtifacts>,
+}
+
+impl BuildArtifactTransition {
+    pub fn capture(project: &ProjectLayout, packages: &[String]) -> Result<Self> {
+        refuse_stale_transition(project)?;
+        let mut prior_paths = Vec::with_capacity(packages.len());
+        for package in packages {
+            let generated = project.packages_dir().join(package).join("data/.generated");
+            let target = generated.join(format!("{package}.script.json"));
+            let sidecar = generated.join(identity::SCRIPT_IDENTITY_FILE);
+            let mut prior = Vec::new();
+            for path in script_artifact_files(&generated)? {
+                require_regular_file(&path, "Script Artifact")?;
+                prior.push(path);
+            }
+            let has_sidecar = regular_file_exists(&sidecar, "Runtime Script Build Identity")?;
+            prior_paths.push(PackagePriorPaths {
+                target,
+                prior,
+                sidecar,
+                has_sidecar,
+            });
+        }
+
+        let mut created = Vec::new();
+        let mut captured = Vec::with_capacity(prior_paths.len());
+        for package in prior_paths {
+            let mut prior = Vec::with_capacity(package.prior.len());
+            for path in package.prior {
+                let backup = match link_to_unique_backup(&path) {
+                    Ok(backup) => backup,
+                    Err(error) => return backup_setup_failed(error, &created),
+                };
+                created.push(backup.clone());
+                prior.push(PriorArtifact { path, backup });
+            }
+            let prior_sidecar = if package.has_sidecar {
+                let backup = match link_to_unique_backup(&package.sidecar) {
+                    Ok(backup) => backup,
+                    Err(error) => return backup_setup_failed(error, &created),
+                };
+                created.push(backup.clone());
+                Some(backup)
+            } else {
+                None
+            };
+            captured.push(PackageBuildArtifacts {
+                target: package.target,
+                prior,
+                sidecar: package.sidecar,
+                prior_sidecar,
+            });
+        }
+        Ok(Self { packages: captured })
+    }
+
+    /// The prior names this transition will retire — the files the checker must not see, because
+    /// they and their compiled replacement name one Package.
+    pub fn retiring(&self) -> Vec<PathBuf> {
+        self.packages
+            .iter()
+            .flat_map(|package| {
+                package
+                    .prior
+                    .iter()
+                    .map(|prior| prior.path.clone())
+                    .filter(|path| *path != package.target)
+            })
+            .collect()
+    }
+
+    /// Retire prior noncanonical paths after every candidate and Build Identity is in place.
+    fn commit(&self) -> Result<()> {
+        for package in &self.packages {
+            if !regular_file_exists(&package.target, "compiled Script Artifact")? {
+                return Err(Error::State(format!(
+                    "Runtime Script compilation reported success but wrote no Script Artifact at {}",
+                    package.target.display()
+                )));
+            }
+        }
+        for package in &self.packages {
+            for prior in &package.prior {
+                if prior.path != package.target {
+                    remove_regular_file_if_present(&prior.path, "prior Script Artifact")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist source-built identities, then retire the old inventory. Any failure before retirement
+    /// completes restores the old names by rename. Once retirement completes, the candidate is
+    /// logically committed and backup cleanup never changes the Package inventory.
+    pub fn certify(&self, project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<()> {
+        if let Err(error) = identity::write_script_identities(project, artifacts) {
+            self.rollback()?;
+            return Err(error);
+        }
+        if let Err(error) = self.commit() {
+            self.rollback()?;
+            return Err(error);
+        }
+        self.discard_backups().map_err(|error| {
+            Error::State(format!(
+                "the Runtime Script build committed, but an internal backup could not be removed. \
+                 The candidate inventory and Build Identities are current; remove the named backup \
+                 after checking it, then rerun the build. ({error})"
+            ))
+        })
+    }
+
+    /// Restore the complete prior inventory after a failed transition without allocating file
+    /// contents. Backup creation happens before the builder can replace a candidate.
+    pub fn rollback(&self) -> Result<()> {
+        for package in &self.packages {
+            remove_regular_file_if_present(&package.target, "candidate Script Artifact")?;
+            for prior in &package.prior {
+                require_regular_file(&prior.backup, "Runtime Script build backup")?;
+                if regular_file_exists(&prior.path, "prior Script Artifact")? {
+                    std::fs::remove_file(&prior.backup)?;
+                } else {
+                    std::fs::rename(&prior.backup, &prior.path)?;
+                }
+            }
+            match &package.prior_sidecar {
+                Some(backup) => {
+                    require_regular_file(backup, "Runtime Script Build Identity backup")?;
+                    remove_regular_file_if_present(
+                        &package.sidecar,
+                        "candidate Runtime Script Build Identity",
+                    )?;
+                    std::fs::rename(backup, &package.sidecar)?;
+                }
+                None => remove_regular_file_if_present(
+                    &package.sidecar,
+                    "candidate Runtime Script Build Identity",
+                )?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove backups after a successful logical commit. An error leaves only an internal hard-link
+    /// name behind; it never changes the committed candidate inventory.
+    fn discard_backups(&self) -> Result<()> {
+        for package in &self.packages {
+            for prior in &package.prior {
+                remove_regular_file_if_present(&prior.backup, "Runtime Script build backup")?;
+            }
+            if let Some(sidecar) = &package.prior_sidecar {
+                remove_regular_file_if_present(sidecar, "Runtime Script Build Identity backup")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn link_to_unique_backup(path: &Path) -> Result<PathBuf> {
+    require_regular_file(path, "Runtime Script transition input")?;
+    let parent = path.parent().ok_or_else(|| {
+        Error::State(format!(
+            "Runtime Script transition input {} has no parent directory",
+            path.display()
+        ))
+    })?;
+    let backup = tempfile::Builder::new()
+        .prefix(TRANSITION_BACKUP_PREFIX)
+        .make_in(parent, |backup| std::fs::hard_link(path, backup))
+        .map_err(|error| {
+            Error::Process(format!(
+                "cannot create same-directory hard-link backup for {}: {error}",
+                path.display()
+            ))
+        })?;
+    backup.keep().map(|(_, path)| path).map_err(|error| {
+        Error::Process(format!(
+            "cannot retain same-directory hard-link backup for {}: {}",
+            path.display(),
+            error.error
+        ))
+    })
+}
+
+pub(crate) fn refuse_stale_transition(project: &ProjectLayout) -> Result<()> {
+    let packages_dir = project.packages_dir();
+    if !directory_exists(&packages_dir, "enabled Package Inventory")? {
+        return Ok(());
+    }
+    for package in std::fs::read_dir(packages_dir)? {
+        let package = package?;
+        if !package.file_type()?.is_dir() {
+            continue;
+        }
+        let generated = package.path().join("data/.generated");
+        if !directory_exists(&generated, "generated Package artifact directory")? {
+            continue;
+        }
+        for entry in std::fs::read_dir(generated)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(TRANSITION_BACKUP_PREFIX)
+                || name.ends_with(LEGACY_TRANSITION_BACKUP_SUFFIX)
+            {
+                return Err(Error::State(format!(
+                    "stale Runtime Script build backup {} blocks a new build. A prior process may \
+                     have stopped during an artifact transition; inspect the Package artifact and \
+                     Build Identity, then remove this internal backup manually",
+                    entry.path().display(),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn directory_exists(path: &Path, description: &str) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(Error::State(format!(
+            "{description} {} is not a directory",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::Process(format!(
+            "cannot inspect {description} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn regular_file_exists(path: &Path, description: &str) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(Error::State(format!(
+            "{description} {} is not a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::Process(format!(
+            "cannot inspect {description} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn require_regular_file(path: &Path, description: &str) -> Result<()> {
+    if regular_file_exists(path, description)? {
+        Ok(())
+    } else {
+        Err(Error::State(format!(
+            "{description} {} disappeared before it could be backed up",
+            path.display()
+        )))
+    }
+}
+
+fn remove_regular_file_if_present(path: &Path, description: &str) -> Result<()> {
+    if regular_file_exists(path, description)? {
+        std::fs::remove_file(path).map_err(|error| {
+            Error::Process(format!(
+                "cannot remove {description} {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn backup_setup_failed(error: Error, created: &[PathBuf]) -> Result<BuildArtifactTransition> {
+    let mut cleanup_failure = None;
+    for backup in created {
+        if let Err(cleanup_error) = std::fs::remove_file(backup) {
+            if cleanup_error.kind() != std::io::ErrorKind::NotFound && cleanup_failure.is_none() {
+                cleanup_failure = Some(format!("{}: {cleanup_error}", backup.display()));
+            }
+        }
+    }
+    match cleanup_failure {
+        Some(cleanup) => Err(Error::State(format!(
+            "backup setup failed before candidate compilation and the original inventory is \
+             unchanged, but an internal backup could not be removed ({cleanup}). The setup error \
+             was: {error}"
+        ))),
+        None => Err(error),
+    }
+}
+
+/// Verify every Script Artifact against its recorded Build Identity, the way `packages check` does
+/// for Package Deltas. Returns one problem line per stale artifact.
+pub fn stale(project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<Vec<String>> {
+    let mut problems = Vec::new();
+    for path in artifacts {
+        let package_dir = identity::package_dir(project, path)?;
+        let package = package_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                Error::State(format!(
+                    "Package directory {} has no UTF-8 folder name",
+                    package_dir.display()
+                ))
+            })?;
+        let has_sources = !source_files(project, package)?.is_empty();
+        let sidecar = path.with_file_name(identity::SCRIPT_IDENTITY_FILE);
+        let text = match std::fs::read_to_string(&sidecar) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !has_sources {
+                    // Source-free Script Artifacts are published prebuilt. They carry no Build
+                    // Identity because this checkout has no source tree to compare against.
+                    continue;
+                }
+                problems.push(format!(
+                    "{}: no Build Identity sidecar (predates identity tracking, or was removed). \
+                     Rebuild with `lyracore packages build`.",
+                    path.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                return Err(Error::Process(format!(
+                    "cannot read Script Artifact Build Identity {}: {error}",
+                    sidecar.display()
+                )))
+            }
+        };
+        if !has_sources {
+            problems.push(format!(
+                "{}: its Runtime Script sources were removed, but a source-built Script Artifact \
+                 remains. Run `lyracore packages build` to remove it before replay.",
+                path.display()
+            ));
+            continue;
+        }
+        let recorded = identity::ScriptIdentity::parse(&text, &sidecar)?;
+        let current = identity::compute_script(project, path)?;
+        for input in recorded.changed_against(&current) {
+            problems.push(format!(
+                "{}: {} changed. Rebuild with `lyracore packages build`.",
+                path.display(),
+                input.description()
+            ));
+        }
+    }
+    Ok(problems)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proc::fake::FakeStack;
+    use tempfile::TempDir;
 
     const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -616,5 +1206,484 @@ mod tests {
         assert!(!is_script_artifact(r#"{"version":1,"claims":[]}"#));
         assert!(!is_script_artifact(r#"{"kind":"weather","version":1}"#));
         assert!(!is_script_artifact("{ not even valid }"));
+    }
+
+    // ---- the build half ----
+
+    fn checkout(tmp: &TempDir) -> ProjectLayout {
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        std::fs::create_dir_all(project.runtime_scripts_dir()).unwrap();
+        std::fs::write(project.script_builder_file(), "// the builder\n").unwrap();
+        std::fs::write(project.datascripts_dir().join("bun.lock"), "{}\n").unwrap();
+        project
+    }
+
+    fn with_scripts(project: &ProjectLayout, package: &str, file: &str) {
+        let dir = project.package_scripts_dir(package);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), "// @event on_login\n// @id 100200\n").unwrap();
+    }
+
+    /// The Script Artifact a build would have written, plus its sidecar.
+    fn with_built_artifact(project: &ProjectLayout, package: &str) -> PathBuf {
+        let dir = project.packages_dir().join(package).join("data/.generated");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{package}.script.json"));
+        std::fs::write(&path, "{\"kind\":\"script\"}\n").unwrap();
+        identity::write_script_identities(project, std::slice::from_ref(&path)).unwrap();
+        path
+    }
+
+    /// Match the builder's sibling-temp-file replacement so a hard-link backup keeps the old inode.
+    fn replace_file(path: &Path, text: &str) {
+        let parent = path.parent().unwrap();
+        let temporary = tempfile::NamedTempFile::new_in(parent).unwrap();
+        std::fs::write(temporary.path(), text).unwrap();
+        temporary.persist(path).unwrap();
+    }
+
+    #[test]
+    fn only_enabled_packages_carrying_a_scripts_folder_are_built() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "zeta", "a.ts");
+        with_scripts(&project, "alpha", "a.ts");
+        std::fs::create_dir_all(project.packages_dir().join("rust_only")).unwrap();
+        let notes = project.package_scripts_dir("notes_only");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("README.md"), "not executable\n").unwrap();
+        std::fs::create_dir_all(notes.join("nested.ts")).unwrap();
+
+        assert_eq!(packages_with_scripts(&project).unwrap(), ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn the_source_inventory_is_shallow_and_contains_only_regular_typescript_and_lua_files() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let scripts = project.package_scripts_dir("fire_nova");
+        std::fs::create_dir_all(scripts.join("nested")).unwrap();
+        std::fs::write(scripts.join("alpha.ts"), "one\n").unwrap();
+        std::fs::write(scripts.join("zeta.lua"), "two\n").unwrap();
+        std::fs::write(scripts.join("README.md"), "notes\n").unwrap();
+        std::fs::write(scripts.join("nested/hidden.ts"), "ignored\n").unwrap();
+
+        let relative = source_files(&project, "fire_nova")
+            .unwrap()
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(relative, ["alpha.ts", "zeta.lua"]);
+    }
+
+    #[test]
+    fn the_builder_subprocess_carries_the_packages_root_and_the_event_catalogue() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let stack = FakeStack::new().with_stdout("--print-events", "on_login\non_death\n");
+
+        run_builds(&project, &stack.runner(), &["fire_nova".to_string()]).unwrap();
+
+        let spec = stack
+            .calls()
+            .into_iter()
+            .find_map(|call| match call {
+                crate::proc::fake::Call::Stream(spec) if spec.render().starts_with("bun run") => {
+                    Some(spec)
+                }
+                _ => None,
+            })
+            .expect("the builder ran");
+        assert!(spec.render().ends_with("fire_nova"), "{}", spec.render());
+        assert_eq!(
+            spec.env_value("LYRACORE_PACKAGES_ROOT"),
+            Some(project.packages_dir().to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            spec.env_value(HOOK_EVENTS_ENV),
+            Some("on_login\non_death\n")
+        );
+    }
+
+    #[test]
+    fn a_catalogue_that_cannot_be_read_stops_the_build_before_any_package_compiles() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new().fail_on("--print-events", "the delta crate does not compile");
+
+        let error = run_builds(&project, &stack.runner(), &["fire_nova".to_string()]).unwrap_err();
+
+        assert!(error.to_string().contains("Event Binding"), "{error}");
+        for call in stack.rendered() {
+            assert!(!call.contains("bun run"), "{call}");
+        }
+    }
+
+    #[test]
+    fn a_mid_loop_failure_stops_the_build_and_a_later_package_never_compiles() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new()
+            .with_stdout("--print-events", "on_login\n")
+            .fail_on("build-scripts.ts alpha", "the script does not compile");
+
+        let error = run_builds(
+            &project,
+            &stack.runner(),
+            &["alpha".to_string(), "zeta".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("alpha"), "{error}");
+        for call in stack.rendered() {
+            assert!(!call.contains("zeta"), "{call}");
+        }
+    }
+
+    // ---- staleness ----
+
+    #[test]
+    fn a_freshly_built_script_artifact_is_current() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+
+        assert!(stale(&project, &[path]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_edited_script_source_is_stale_and_names_that_input() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+
+        std::fs::write(
+            project
+                .package_scripts_dir("fire_nova")
+                .join("ember_echo.ts"),
+            "// @event on_death\n// @id 100200\n",
+        )
+        .unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("Runtime Script sources"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_edited_toolchain_is_stale_and_an_installed_node_modules_is_not() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+
+        // An install under the toolchain is not an input: `bun.lock` is the pin for what it holds.
+        let modules = project.runtime_scripts_dir().join("node_modules/whatever");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(modules.join("index.js"), "module.exports = {};\n").unwrap();
+        assert!(stale(&project, std::slice::from_ref(&path))
+            .unwrap()
+            .is_empty());
+
+        std::fs::write(project.script_builder_file(), "// a different builder\n").unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("toolchain"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_hand_edited_artifact_is_stale() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+        std::fs::write(&path, "{\"kind\":\"script\",\"edited\":true}\n").unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("hand-edited"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_missing_sidecar_is_stale_and_names_the_rebuild_command() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+        std::fs::remove_file(path.with_file_name(identity::SCRIPT_IDENTITY_FILE)).unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("lyracore packages build"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_source_free_prebuilt_artifact_needs_no_build_identity() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.lua");
+        let path = with_built_artifact(&project, "playerbots");
+        std::fs::remove_dir_all(project.package_scripts_dir("playerbots")).unwrap();
+        std::fs::remove_file(path.with_file_name(identity::SCRIPT_IDENTITY_FILE)).unwrap();
+
+        assert!(stale(&project, &[path]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_source_built_artifact_without_its_sources_is_stale_even_if_its_identity_matches() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+        std::fs::remove_dir_all(project.package_scripts_dir("fire_nova")).unwrap();
+        let incorrectly_recertified = identity::compute_script(&project, &path).unwrap();
+        std::fs::write(
+            path.with_file_name(identity::SCRIPT_IDENTITY_FILE),
+            incorrectly_recertified.render(),
+        )
+        .unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("sources were removed"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_non_not_found_sidecar_read_error_is_not_treated_as_prebuilt() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.lua");
+        let path = with_built_artifact(&project, "playerbots");
+        std::fs::remove_dir_all(project.package_scripts_dir("playerbots")).unwrap();
+        let sidecar = path.with_file_name(identity::SCRIPT_IDENTITY_FILE);
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+
+        let error = stale(&project, &[path]).unwrap_err();
+
+        assert!(error.to_string().contains("cannot read"), "{error}");
+        assert!(error.to_string().contains("script.identity"), "{error}");
+    }
+
+    #[test]
+    fn a_prebuilt_to_source_transition_retires_the_old_name_only_after_commit() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.ts");
+        let generated = project.packages_dir().join("playerbots/data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let prebuilt = generated.join("personality.json");
+        std::fs::write(&prebuilt, artifact_json("playerbots", &[])).unwrap();
+        let transition =
+            BuildArtifactTransition::capture(&project, &["playerbots".to_string()]).unwrap();
+        let target = generated.join("playerbots.script.json");
+        replace_file(&target, &artifact_json("playerbots", &[]));
+        let backup = transition.packages[0].prior[0].backup.clone();
+
+        // Both names hold a Script Artifact for one Package until the new one validates, so only
+        // the walk that passes over the retiring name can read this tree at all.
+        let inventory = crate::cmd::packages::artifact::read_enabled_except(
+            &project.packages_dir(),
+            &transition.retiring(),
+        )
+        .unwrap();
+        assert_eq!(inventory.script_paths(), *std::slice::from_ref(&target));
+        assert!(
+            backup.is_file(),
+            "the prior artifact is linked before candidate compilation"
+        );
+        assert_eq!(backup.parent(), prebuilt.parent());
+        assert!(backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(TRANSITION_BACKUP_PREFIX));
+        assert!(prebuilt.exists());
+
+        identity::write_script_identities(&project, std::slice::from_ref(&target)).unwrap();
+        transition.commit().unwrap();
+        assert!(!prebuilt.exists());
+        assert!(backup.exists());
+        assert!(target.is_file());
+
+        let error = refuse_stale_transition(&project)
+            .expect_err("an interrupted committed transition leaves its backup for inspection");
+        assert!(error.to_string().contains(&backup.display().to_string()));
+        assert!(!prebuilt.exists() && target.is_file());
+
+        transition.discard_backups().unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn a_failed_transition_restores_a_prebuilt_canonical_artifact_byte_for_byte() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.ts");
+        let generated = project.packages_dir().join("playerbots/data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let target = generated.join("playerbots.script.json");
+        let prior = b"{\"kind\":\"script\",\"prior\":true}\n";
+        std::fs::write(&target, prior).unwrap();
+        let transition =
+            BuildArtifactTransition::capture(&project, &["playerbots".to_string()]).unwrap();
+        let backup = transition.packages[0].prior[0].backup.clone();
+        assert!(backup.is_file());
+        assert!(target.exists());
+
+        replace_file(&target, "{\"kind\":\"script\",\"candidate\":true}\n");
+        transition.rollback().unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), prior);
+        assert!(
+            !backup.exists(),
+            "rollback renames the backup back in place"
+        );
+        assert_eq!(std::fs::read_dir(&generated).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_sidecar_write_failure_restores_the_prebuilt_artifact() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.ts");
+        let generated = project.packages_dir().join("playerbots/data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let prebuilt = generated.join("personality.json");
+        let prior = b"{\"kind\":\"script\",\"prior\":true}\n";
+        std::fs::write(&prebuilt, prior).unwrap();
+        let transition =
+            BuildArtifactTransition::capture(&project, &["playerbots".to_string()]).unwrap();
+        let target = generated.join("playerbots.script.json");
+        replace_file(&target, "{\"kind\":\"script\",\"candidate\":true}\n");
+
+        // The directory makes the real sidecar replacement fail without a mock below the
+        // filesystem seam. The old artifact itself has a same-directory backup link, so restoring
+        // it allocates no content blocks.
+        std::fs::create_dir(generated.join(identity::SCRIPT_IDENTITY_FILE)).unwrap();
+        let error = transition
+            .certify(&project, std::slice::from_ref(&target))
+            .expect_err("the sidecar cannot replace a directory");
+
+        assert!(error.to_string().contains("script.identity"), "{error}");
+        assert_eq!(std::fs::read(&prebuilt).unwrap(), prior);
+        assert!(
+            !target.exists(),
+            "the uncertified canonical artifact must be removed"
+        );
+    }
+
+    #[test]
+    fn rollback_renames_back_a_canonical_artifact_and_an_earlier_replaced_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "alpha", "first.ts");
+        with_scripts(&project, "beta", "second.ts");
+        let alpha = with_built_artifact(&project, "alpha");
+        let beta = with_built_artifact(&project, "beta");
+        let alpha_sidecar = alpha.with_file_name(identity::SCRIPT_IDENTITY_FILE);
+        let old_artifact = std::fs::read(&alpha).unwrap();
+        let old_sidecar = std::fs::read(&alpha_sidecar).unwrap();
+        let transition =
+            BuildArtifactTransition::capture(&project, &["alpha".to_string(), "beta".to_string()])
+                .unwrap();
+
+        let alpha_backup = transition.packages[0].prior[0].backup.clone();
+        let alpha_sidecar_backup = transition.packages[0].prior_sidecar.clone().unwrap();
+        assert!(alpha_backup.is_file());
+        assert!(alpha_sidecar_backup.is_file());
+        assert_ne!(alpha_backup, alpha_sidecar_backup);
+        replace_file(&alpha, "{\"kind\":\"script\",\"candidate\":true}\n");
+        replace_file(&beta, "{\"kind\":\"script\",\"candidate\":true}\n");
+
+        let invalid_later_artifact = project.root.join("not-a-package/script.json");
+        let error = transition
+            .certify(&project, &[alpha.clone(), invalid_later_artifact])
+            .expect_err("the second identity cannot be computed");
+        assert!(error.to_string().contains("not inside"), "{error}");
+
+        assert_eq!(std::fs::read(&alpha).unwrap(), old_artifact);
+        assert_eq!(std::fs::read(&alpha_sidecar).unwrap(), old_sidecar);
+        assert!(!alpha_backup.exists() && !alpha_sidecar_backup.exists());
+    }
+
+    #[test]
+    fn a_stale_backup_refuses_without_changing_the_package_inventory() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.ts");
+        let target = with_built_artifact(&project, "playerbots");
+        let sidecar = target.with_file_name(identity::SCRIPT_IDENTITY_FILE);
+        let prior = std::fs::read(&target).unwrap();
+        let prior_sidecar = std::fs::read(&sidecar).unwrap();
+        let stale = target.with_file_name(format!("notes{LEGACY_TRANSITION_BACKUP_SUFFIX}"));
+        std::fs::write(&stale, "unrelated bytes\n").unwrap();
+
+        let error = BuildArtifactTransition::capture(&project, &["playerbots".to_string()])
+            .expect_err("stale internal state blocks the build");
+
+        assert!(
+            error.to_string().contains(&stale.display().to_string()),
+            "{error}"
+        );
+        assert!(error.to_string().contains("manually"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), prior);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), prior_sidecar);
+        assert_eq!(std::fs::read(&stale).unwrap(), b"unrelated bytes\n");
+    }
+
+    #[test]
+    fn a_legacy_commit_marker_has_no_recovery_meaning_and_is_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.packages_dir()).unwrap();
+        let marker = project
+            .packages_dir()
+            .join(".lyracore-script-build-committed");
+        std::fs::write(&marker, "unrelated bytes\n").unwrap();
+
+        refuse_stale_transition(&project).unwrap();
+
+        assert_eq!(std::fs::read(marker).unwrap(), b"unrelated bytes\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_artifacts_and_sidecars_are_refused_before_backup() {
+        for sidecar_link in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let project = checkout(&tmp);
+            with_scripts(&project, "playerbots", "personality.ts");
+            let target = with_built_artifact(&project, "playerbots");
+            let linked = if sidecar_link {
+                target.with_file_name(identity::SCRIPT_IDENTITY_FILE)
+            } else {
+                target.clone()
+            };
+            let bytes = std::fs::read(&linked).unwrap();
+            std::fs::remove_file(&linked).unwrap();
+            let outside = tmp.path().join("outside");
+            std::fs::write(&outside, bytes).unwrap();
+            std::os::unix::fs::symlink(&outside, &linked).unwrap();
+
+            let error = BuildArtifactTransition::capture(&project, &["playerbots".to_string()])
+                .expect_err("a symlink is not a regular transition input");
+
+            assert!(error.to_string().contains("not a regular file"), "{error}");
+            assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+        }
     }
 }

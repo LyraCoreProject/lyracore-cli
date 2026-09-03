@@ -141,12 +141,33 @@ pub struct Enabled {
     pub scripts: Vec<ScriptArtifact>,
 }
 
+impl Enabled {
+    /// The Script Artifact files, for the steps that hand a path to a subprocess or a sidecar
+    /// rather than reading the parsed artifact.
+    #[must_use]
+    pub fn script_paths(&self) -> Vec<PathBuf> {
+        self.scripts
+            .iter()
+            .map(|artifact| artifact.path.clone())
+            .collect()
+    }
+}
+
 /// Every enabled Package's artifacts, ordered by Package folder then file name so the same tree
 /// always produces the same plan.
 ///
 /// A missing root is an error, never an empty set: "no Package claims this family" is a statement
 /// the operator makes by pointing at a real Package Inventory that happens to hold no artifacts.
 pub fn read_enabled(root: &Path) -> Result<Enabled> {
+    read_enabled_except(root, &[])
+}
+
+/// The same walk, passing over files the caller is about to retire.
+///
+/// `packages build` holds a Package's prebuilt Script Artifact on disk until its compiled
+/// replacement validates, and for that moment two files name one Package — which the plain walk
+/// refuses, rightly, for every other caller.
+pub fn read_enabled_except(root: &Path, retiring: &[PathBuf]) -> Result<Enabled> {
     if !root.is_dir() {
         return Err(Error::Usage(format!(
             "enabled packages root `{}` is not a directory — name the directory holding the \
@@ -170,6 +191,7 @@ pub fn read_enabled(root: &Path) -> Result<Enabled> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&generated)?
             .filter_map(|entry| entry.ok().map(|e| e.path()))
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter(|path| !retiring.contains(path))
             .collect();
         files.sort();
 

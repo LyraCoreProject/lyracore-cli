@@ -39,6 +39,7 @@
 //! asking Bun to confirm its own version a second time would only be a slower way to read the same
 //! constant.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -53,6 +54,10 @@ use crate::{Error, Result};
 /// No `.json` suffix, despite JSON content — see the module doc comment for why: that suffix would
 /// put this file inside `artifact::read_enabled`'s own artifact glob.
 pub const IDENTITY_FILE: &str = "spell.identity";
+
+/// The same sidecar, for the Script Artifact next to it. A Package may ship both kinds, and they
+/// are built from different inputs, so each records its own.
+pub const SCRIPT_IDENTITY_FILE: &str = "script.identity";
 
 /// The only sidecar envelope version this CLI reads or writes.
 const IDENTITY_VERSION: u64 = 1;
@@ -70,6 +75,8 @@ pub enum Input {
     PackageJson,
     BunLock,
     Artifact,
+    ScriptSource,
+    Toolchain,
 }
 
 impl Input {
@@ -88,6 +95,10 @@ impl Input {
             Input::BunLock => "datascripts/bun.lock",
             Input::Artifact => {
                 "the artifact file itself (its bytes no longer match what was last built — hand-edited?)"
+            }
+            Input::ScriptSource => "its Runtime Script sources under packages/<package>/scripts/",
+            Input::Toolchain => {
+                "the pinned Runtime Script toolchain in datascripts/runtime-scripts/"
             }
         }
     }
@@ -170,23 +181,7 @@ impl Identity {
     /// Read a sidecar back. `path` is used only to name the file in a refusal.
     pub fn parse(text: &str, path: &Path) -> Result<Identity> {
         let refuse = |what: String| Error::Usage(format!("{}: {what}", path.display()));
-
-        let root: serde_json::Value =
-            serde_json::from_str(text).map_err(|e| refuse(format!("not valid JSON ({e})")))?;
-        let object = root
-            .as_object()
-            .ok_or_else(|| refuse("a Build Identity sidecar is a JSON object".to_string()))?;
-
-        let version = object
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| refuse("no `version`".to_string()))?;
-        if version != IDENTITY_VERSION {
-            return Err(refuse(format!(
-                "sidecar version {version}; this CLI reads version {IDENTITY_VERSION}. Rebuild \
-                 the Package with `lyracore packages build`, or update this checkout."
-            )));
-        }
+        let object = parse_sidecar(text, path)?;
 
         let field = |name: &str| -> Result<String> {
             object
@@ -384,6 +379,206 @@ pub fn write_all(project: &ProjectLayout, artifacts: &[super::artifact::Artifact
         write(project, artifact)?;
     }
     Ok(())
+}
+
+// ---- the Script Artifact's own Build Identity ----
+
+/// What a Script Artifact was built from. Four inputs, not the Delta's nine: a Runtime Script reads
+/// no Base Snapshot, imports no authoring library, and never sees the Module schema typings.
+///
+/// `artifact_hash` here is SHA-256 of the artifact file's raw bytes, not the Delta's BLAKE3
+/// canonical-form digest: this CLI reproduces the canonical form for Package Deltas only, and the
+/// question a sidecar answers is "were these bytes hand-edited", which raw bytes answer exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptIdentity {
+    pub source_hash: String,
+    pub toolchain_hash: String,
+    pub bun_version: String,
+    pub bun_lock_hash: String,
+    pub artifact_hash: String,
+}
+
+impl ScriptIdentity {
+    /// Every recorded input that differs between `self` and `current`, in the sidecar's field order.
+    pub fn changed_against(&self, current: &ScriptIdentity) -> Vec<Input> {
+        let mut changed = Vec::with_capacity(5);
+        let mut check = |same: bool, input: Input| {
+            if !same {
+                changed.push(input);
+            }
+        };
+        check(self.source_hash == current.source_hash, Input::ScriptSource);
+        check(
+            self.toolchain_hash == current.toolchain_hash,
+            Input::Toolchain,
+        );
+        check(self.bun_version == current.bun_version, Input::BunVersion);
+        check(self.bun_lock_hash == current.bun_lock_hash, Input::BunLock);
+        check(self.artifact_hash == current.artifact_hash, Input::Artifact);
+        changed
+    }
+
+    /// Canonical bytes, in the same spelling [`Identity::render`] uses.
+    pub fn render(&self) -> String {
+        format!(
+            "{{\"artifact_hash\":{a},\"bun_lock_hash\":{bl},\"bun_version\":{bv},\
+             \"source_hash\":{s},\"toolchain_hash\":{t},\"version\":{v}}}",
+            a = json_string(&self.artifact_hash),
+            bl = json_string(&self.bun_lock_hash),
+            bv = json_string(&self.bun_version),
+            s = json_string(&self.source_hash),
+            t = json_string(&self.toolchain_hash),
+            v = IDENTITY_VERSION,
+        )
+    }
+
+    /// Read a sidecar back. `path` is used only to name the file in a refusal.
+    pub fn parse(text: &str, path: &Path) -> Result<ScriptIdentity> {
+        let object = parse_sidecar(text, path)?;
+        let refuse = |what: String| Error::Usage(format!("{}: {what}", path.display()));
+        let field = |name: &str| -> Result<String> {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| refuse(format!("no `{name}`")))
+        };
+        Ok(ScriptIdentity {
+            source_hash: field("source_hash")?,
+            toolchain_hash: field("toolchain_hash")?,
+            bun_version: field("bun_version")?,
+            bun_lock_hash: field("bun_lock_hash")?,
+            artifact_hash: field("artifact_hash")?,
+        })
+    }
+}
+
+/// SHA-256 over the FILES directly inside `root`, sorted by name, each length-prefixed.
+///
+/// Shallow on purpose: `datascripts/runtime-scripts/` holds an installed `node_modules/` beside its
+/// checked-in files, and the pin for what is in there is `bun.lock`, which is a recorded input of
+/// its own. A new toolchain file dropped in that directory is picked up without editing this.
+fn hash_dir_files(root: &Path) -> Result<String> {
+    let mut names: Vec<PathBuf> = Vec::new();
+    if root.is_dir() {
+        for entry in std::fs::read_dir(root)? {
+            let path = entry?.path();
+            if path.is_file() {
+                names.push(path);
+            }
+        }
+    }
+    names.sort();
+
+    let mut hasher = Sha256::new();
+    for path in names {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let bytes = std::fs::read(&path)?;
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(bytes.len().to_string().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(&bytes);
+    }
+    Ok(format!("sha256-dir-v1:{:x}", hasher.finalize()))
+}
+
+/// Compute the Build Identity of one Package's Script Artifact from the checkout on disk right now.
+///
+/// `artifact_path` is the Script Artifact itself; the Package folder it sits in selects the
+/// `scripts/` sources, exactly as the Delta side derives its Datascript folder.
+pub fn compute_script(project: &ProjectLayout, artifact_path: &Path) -> Result<ScriptIdentity> {
+    let dir = package_dir(project, artifact_path)?;
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    Ok(ScriptIdentity {
+        source_hash: hash_script_sources(&super::script::source_files(project, &name)?)?,
+        toolchain_hash: hash_dir_files(&project.runtime_scripts_dir())?,
+        bun_version: doctor::REQUIRED_BUN.to_string(),
+        bun_lock_hash: hash_file(&project.datascripts_dir().join("bun.lock"))?,
+        artifact_hash: hash_file(artifact_path)?,
+    })
+}
+
+/// SHA-256 over the exact Runtime Script source inventory, mirrored in `build-scripts.ts`.
+fn hash_script_sources(files: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for path in files {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let bytes = std::fs::read(path)?;
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(bytes.len().to_string().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(&bytes);
+    }
+    Ok(format!("sha256-script-sources-v1:{:x}", hasher.finalize()))
+}
+
+/// Write one Script Artifact Build Identity sidecar next to each of `artifacts`. Called only after
+/// the artifacts have validated, for the same reason the Delta side is.
+pub fn write_script_identities(project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<()> {
+    for path in artifacts {
+        let dir = package_dir(project, path)?;
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        if super::script::source_files(project, &name)?.is_empty() {
+            continue;
+        }
+        let sidecar = path
+            .parent()
+            .ok_or_else(|| {
+                Error::State(format!(
+                    "artifact path {} has no parent directory",
+                    path.display()
+                ))
+            })?
+            .join(SCRIPT_IDENTITY_FILE);
+        write_atomically(&sidecar, compute_script(project, path)?.render().as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Replace a Build Identity only after its complete replacement is durable in a sibling temporary
+/// file. A failed write or rename leaves the prior sidecar untouched.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        Error::State(format!(
+            "Build Identity {} has no parent directory",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| {
+        Error::Process(format!(
+            "cannot replace Build Identity {} atomically: {}",
+            path.display(),
+            error.error
+        ))
+    })?;
+    Ok(())
+}
+
+/// The JSON object of a sidecar of either kind, with its envelope version already checked.
+fn parse_sidecar(text: &str, path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let refuse = |what: String| Error::Usage(format!("{}: {what}", path.display()));
+    let root: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| refuse(format!("not valid JSON ({e})")))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| refuse("a Build Identity sidecar is a JSON object".to_string()))?;
+    let version = object
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| refuse("no `version`".to_string()))?;
+    if version != IDENTITY_VERSION {
+        return Err(refuse(format!(
+            "sidecar version {version}; this CLI reads version {IDENTITY_VERSION}. Rebuild \
+             the Package with `lyracore packages build`, or update this checkout."
+        )));
+    }
+    Ok(object.clone())
 }
 
 #[cfg(test)]
@@ -761,5 +956,39 @@ mod tests {
 
         assert!(error.to_string().contains("unreachable"), "{error}");
         assert!(!generated_dir.join(IDENTITY_FILE).exists());
+    }
+
+    #[test]
+    fn script_source_hash_matches_the_toolchains_shallow_inventory() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let scripts = project.package_scripts_dir("fire_nova");
+        std::fs::create_dir_all(scripts.join("nested")).unwrap();
+        std::fs::write(
+            scripts.join("alpha.ts"),
+            "// @event on_login\n// @id 100201\nfunction script(): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts.join("zeta.lua"),
+            "-- @event on_login\n-- @id 100202\nreturn 2\n",
+        )
+        .unwrap();
+        std::fs::write(scripts.join("README.md"), "ignored\n").unwrap();
+        std::fs::write(scripts.join("nested/hidden.ts"), "ignored\n").unwrap();
+        std::fs::create_dir_all(project.runtime_scripts_dir()).unwrap();
+        std::fs::write(project.script_builder_file(), "// builder\n").unwrap();
+        let artifact = project
+            .packages_dir()
+            .join("fire_nova/data/.generated/fire_nova.script.json");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, "{}\n").unwrap();
+
+        let identity = compute_script(&project, &artifact).unwrap();
+
+        assert_eq!(
+            identity.source_hash,
+            "sha256-script-sources-v1:8395ead00aad341a7daa23658447385da94dabf6932b406cbfbdb5e2fd664002"
+        );
     }
 }

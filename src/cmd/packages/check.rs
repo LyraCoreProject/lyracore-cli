@@ -1,29 +1,36 @@
-//! `lyracore packages check` — is every enabled Package's generated Package Delta still current?
+//! `lyracore packages check` — is every enabled Package's generated artifact still current?
 //!
 //! `packages build` records a Build Identity next to each artifact it emits (see [`super::
 //! identity`]). This verb recomputes every recorded input from the checkout ON DISK right now and
 //! refuses, naming the specific input, the moment one no longer matches — the same report `preflight`
 //! folds into its own gate on `publish`'s behalf, so a stale artifact never reaches a Shard.
 //!
+//! Both artifact kinds are checked, each against its own sidecar: a Package Delta against the
+//! Datascript inputs, a Script Artifact against its `scripts/` sources and the Runtime Script
+//! toolchain.
+//!
 //! # What "current" means here
 //!
 //! `datascripts/generated/` is regenerated FRESH, every run, with the same `spacetime generate`
 //! invocation `packages build`'s typegen step uses — so a Module schema change makes a committed
-//! artifact stale even on a clean checkout that never ran `packages build` itself. Nothing else is
-//! regenerated: this verb never runs Bun and never re-emits a Datascript, so it needs neither Bun nor
-//! a Base Snapshot to do its job.
+//! artifact stale even on a clean checkout that never ran `packages build` itself. It is an input of
+//! a Package Delta alone, so a checkout shipping only Runtime Scripts skips that step. Nothing else
+//! is regenerated: this verb never runs Bun and never re-emits anything, so it needs neither Bun nor
+//! a Base Snapshot to do its job. Every Script Artifact still passes through the authoritative
+//! Rust parser and tracer, including source-free prebuilt artifacts that have no sidecar.
 //!
 //! A missing Base Snapshot is reported as UNVERIFIABLE, not stale: the snapshot is the Operator's own
 //! client-derived data, and a CI machine holding none cannot regenerate one to compare against. A
 //! Base Snapshot that IS present and no longer matches its recorded hash is a real mismatch and fails
 //! like any other input.
 //!
-//! A missing sidecar is treated as stale — it predates identity tracking, so there is nothing to
-//! compare against and no way to call the artifact current.
+//! A source-built artifact without a sidecar is stale. A source-free artifact without one is
+//! prebuilt Lua: there is no source tree in this checkout to compare, and an Operator can install
+//! and replay it without Bun.
 
 use crate::cmd::packages::artifact::{self, Artifact};
 use crate::cmd::packages::build;
-use crate::cmd::packages::identity;
+use crate::cmd::packages::{identity, script};
 use crate::proc::ProcessRunner;
 use crate::project::ProjectLayout;
 use crate::{Error, Result};
@@ -31,16 +38,25 @@ use crate::{Error, Result};
 /// One artifact's problems, and whether its Base Snapshot comparison had to be skipped.
 fn check_one(project: &ProjectLayout, artifact: &Artifact) -> Result<(Vec<String>, bool)> {
     let sidecar_path = artifact.path.with_file_name(identity::IDENTITY_FILE);
-    let Ok(text) = std::fs::read_to_string(&sidecar_path) else {
-        return Ok((
-            vec![format!(
-                "`{}`: no Build Identity sidecar next to {} (predates identity tracking, or was \
-                 removed). Rebuild with `lyracore packages build`.",
-                artifact.package,
-                artifact.path.display()
-            )],
-            false,
-        ));
+    let text = match std::fs::read_to_string(&sidecar_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                vec![format!(
+                    "`{}`: no Build Identity sidecar next to {} (predates identity tracking, or \
+                     was removed). Rebuild with `lyracore packages build`.",
+                    artifact.package,
+                    artifact.path.display()
+                )],
+                false,
+            ))
+        }
+        Err(error) => {
+            return Err(Error::Process(format!(
+                "cannot read Package Delta Build Identity {}: {error}",
+                sidecar_path.display()
+            )))
+        }
     };
     let recorded = identity::Identity::parse(&text, &sidecar_path)?;
     let dir = identity::package_dir(project, &artifact.path)?;
@@ -73,44 +89,44 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
         return Ok(());
     }
     let enabled = artifact::read_enabled(&project.packages_dir())?;
-    // A Script Artifact has no Build Identity sidecar and no Base Snapshot to drift against, so
-    // this verb has nothing to check about one. `packages replay` is what applies them.
-    match enabled.scripts.len() {
-        0 => {}
-        1 => println!(
-            "1 Script Artifact is not a Package Delta; `lyracore packages replay` applies it"
-        ),
-        n => println!(
-            "{n} Script Artifacts are not Package Deltas; `lyracore packages replay` applies them"
-        ),
-    }
-    let artifacts = enabled.deltas;
-    if artifacts.is_empty() {
-        println!("no Package claims a Datascript-generated artifact; nothing to check.");
+    let checked = enabled.deltas.len() + enabled.scripts.len();
+    if checked == 0 {
+        println!("no Package claims a generated artifact; nothing to check.");
         return Ok(());
     }
 
-    println!(
-        "regenerating Module schema typings -> {} (so a schema change is visible even on a clean \
-         checkout)",
-        project.datascript_types_dir().display()
-    );
-    runner
-        .run_streaming(&build::typegen_command(project))
-        .map_err(|e| {
-            Error::Process(format!(
-                "could not extract the Module schema as TypeScript, so `packages check` cannot \
-                 tell whether the generated typings are current. Nothing was checked.\n  ({e})"
-            ))
-        })?;
-
     let mut problems = Vec::new();
     let mut snapshot_unverifiable = false;
-    for artifact in &artifacts {
-        let (found, unverifiable) = check_one(project, artifact)?;
-        problems.extend(found);
-        snapshot_unverifiable |= unverifiable;
+
+    // The shared core parser owns Script Artifact structure, Event Binding contracts, and the
+    // one-artifact-per-Package rule. This Rust-only check needs neither Bun nor the Module wasm.
+    build::validate_script_artifacts(project, runner, &enabled.script_paths())?;
+
+    // The typings are an input of a Package Delta only, so a checkout that ships Runtime Scripts
+    // and no Datascript is checked without building the module wasm at all.
+    if !enabled.deltas.is_empty() {
+        println!(
+            "regenerating Module schema typings -> {} (so a schema change is visible even on a \
+             clean checkout)",
+            project.datascript_types_dir().display()
+        );
+        runner
+            .run_streaming(&build::typegen_command(project))
+            .map_err(|e| {
+                Error::Process(format!(
+                    "could not extract the Module schema as TypeScript, so `packages check` cannot \
+                     tell whether the generated typings are current. Nothing was checked.\n  ({e})"
+                ))
+            })?;
+
+        for artifact in &enabled.deltas {
+            let (found, unverifiable) = check_one(project, artifact)?;
+            problems.extend(found);
+            snapshot_unverifiable |= unverifiable;
+        }
     }
+
+    problems.extend(script::stale(project, &enabled.script_paths())?);
 
     if snapshot_unverifiable {
         println!(
@@ -121,14 +137,13 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     }
 
     if problems.is_empty() {
-        println!("{} Package Delta artifact(s) are current.", artifacts.len());
+        println!("{checked} generated Package artifact(s) are current.");
         return Ok(());
     }
 
     Err(Error::Process(format!(
-        "{} of {} Package Delta artifact(s) are stale:\n{}",
+        "{} of {checked} generated Package artifact(s) are stale:\n{}",
         problems.len(),
-        artifacts.len(),
         problems
             .iter()
             .map(|p| format!("  {p}"))
@@ -197,6 +212,49 @@ mod tests {
         project
     }
 
+    /// A Runtime Script source, its Script Artifact and the sidecar `packages build` would leave
+    /// behind, beside the Package Delta `checked_out` already wrote.
+    fn with_built_script_artifact(project: &ProjectLayout) -> std::path::PathBuf {
+        let scripts = project.package_scripts_dir("fire_nova");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("greet.ts"),
+            "// @event on_login\n// @id 100001\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.runtime_scripts_dir()).unwrap();
+        std::fs::write(project.script_builder_file(), "// the builder\n").unwrap();
+
+        let path = project
+            .packages_dir()
+            .join("fire_nova/data/.generated/script.json");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"kind":"script","version":1,"package":"fire_nova","#,
+                r#""source_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","#,
+                r#""scripts":[{"script_id":100001,"name":"fire_nova.greet","event":"on_login","#,
+                r#""priority":0,"enabled":true,"source":"grant_xp(event.actor, 10)"}]}"#,
+            ),
+        )
+        .unwrap();
+        identity::write_script_identities(project, std::slice::from_ref(&path)).unwrap();
+        path
+    }
+
+    fn with_prebuilt_script_artifact(
+        project: &ProjectLayout,
+        package: &str,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let generated = project.packages_dir().join(package).join("data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let path = generated.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
     // ---- the clean pass ----
 
     #[test]
@@ -213,27 +271,143 @@ mod tests {
         assert!(calls[0].contains("--lang typescript"), "{calls:?}");
     }
 
-    /// The seam this verb sits on globs every `*.json` beside the Delta, so a Package that also
-    /// ships Runtime Scripts must not make `packages check` refuse the Package Deltas it can check.
+    /// A Package may ship both kinds into one generated directory. Each is checked against its own
+    /// Build Identity, and a current pair passes.
     #[test]
-    fn a_script_artifact_beside_the_delta_is_skipped_rather_than_failing_the_check() {
+    fn a_script_artifact_beside_the_delta_is_checked_on_its_own_terms() {
         let tmp = TempDir::new().unwrap();
         let project = checked_out(&tmp);
-        std::fs::write(
-            project
-                .packages_dir()
-                .join("fire_nova/data/.generated/script.json"),
-            concat!(
-                r#"{"kind":"script","version":1,"package":"fire_nova","#,
-                r#""source_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","#,
-                r#""scripts":[{"script_id":100001,"name":"fire_nova.greet","event":"on_login","#,
-                r#""priority":0,"enabled":true,"source":"grant_xp(event.actor, 10)"}]}"#,
+        with_built_script_artifact(&project);
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner()).unwrap();
+    }
+
+    #[test]
+    fn a_source_free_prebuilt_artifact_uses_only_the_authoritative_rust_checker() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        with_prebuilt_script_artifact(
+            &project,
+            "playerbots",
+            "personality.json",
+            &format!(
+                r#"{{"kind":"script","version":1,"package":"playerbots","source_hash":"{HASH_A}","scripts":[]}}"#
             ),
+        );
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner()).unwrap();
+
+        let calls = stack.rendered();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].contains("lyracore-delta-check"), "{calls:?}");
+        assert!(!calls[0].contains("spacetime generate"), "{calls:?}");
+        assert!(!calls[0].contains("bun"), "{calls:?}");
+    }
+
+    /// Structure is the CLI's own refusal: the enabled Package Inventory is read before anything
+    /// is run, so a file no Shard could apply never reaches the authoritative checker.
+    #[test]
+    fn a_malformed_prebuilt_artifact_is_refused_before_the_authoritative_checker_runs() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        let path = with_prebuilt_script_artifact(
+            &project,
+            "playerbots",
+            "personality.json",
+            r#"{"kind":"script","version":99}"#,
+        );
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(
+            error.to_string().contains(path.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(error.to_string().contains("version 99"), "{error}");
+        assert!(stack.rendered().is_empty(), "{:?}", stack.rendered());
+    }
+
+    /// Two artifacts naming one Package is the plan the module refuses; the CLI names both files
+    /// rather than letting the pair reach a Shard.
+    #[test]
+    fn duplicate_prebuilt_artifacts_are_refused_before_the_authoritative_check() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        let first = with_prebuilt_script_artifact(
+            &project,
+            "playerbots",
+            "one.json",
+            &format!(
+                r#"{{"kind":"script","version":1,"package":"playerbots","source_hash":"{HASH_A}","scripts":[]}}"#
+            ),
+        );
+        let second = with_prebuilt_script_artifact(
+            &project,
+            "playerbots",
+            "two.json",
+            &format!(
+                r#"{{"kind":"script","version":1,"package":"playerbots","source_hash":"{HASH_A}","scripts":[]}}"#
+            ),
+        );
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("appears twice"), "{error}");
+        assert!(
+            error.to_string().contains(first.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(second.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(stack.rendered().is_empty(), "{:?}", stack.rendered());
+    }
+
+    #[test]
+    fn a_script_artifact_without_a_sidecar_is_stale() {
+        let tmp = TempDir::new().unwrap();
+        let project = checked_out(&tmp);
+        let path = with_built_script_artifact(&project);
+        std::fs::remove_file(path.with_file_name(identity::SCRIPT_IDENTITY_FILE)).unwrap();
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("script.json"), "{error}");
+        assert!(
+            error.to_string().contains("no Build Identity sidecar"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_edited_runtime_script_source_makes_its_script_artifact_stale() {
+        let tmp = TempDir::new().unwrap();
+        let project = checked_out(&tmp);
+        with_built_script_artifact(&project);
+        std::fs::write(
+            project.package_scripts_dir("fire_nova").join("greet.ts"),
+            "// @event on_death\n// @id 100001\n",
         )
         .unwrap();
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner()).unwrap();
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(
+            error.to_string().contains("Runtime Script sources"),
+            "{error}"
+        );
     }
 
     // ---- no-op checkouts ----
