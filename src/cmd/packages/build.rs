@@ -29,7 +29,9 @@
 //! 6. Every enabled Package with an immediate `.ts` or `.lua` file under
 //!    `packages/<package>/scripts/` compiles its Runtime Scripts into one Script Artifact, again one
 //!    `bun run` subprocess per Package. A source-built artifact is removed when its last source
-//!    disappears. See [`super::script`] for the source-free prebuilt mode.
+//!    disappears. A prebuilt artifact stays available until its source-built replacement passes
+//!    step 7, and is restored if compilation or validation fails. See [`super::script`] for the
+//!    source-free prebuilt mode.
 //! 7. `cargo run -p lyracore-package-delta --bin lyracore-delta-check` traces every enabled
 //!    Package's generated artifacts TOGETHER, in one invocation, Package Deltas and Script
 //!    Artifacts alike. A Claim Conflict and a Runtime Script collision are both BETWEEN Packages,
@@ -240,8 +242,11 @@ fn run_datascripts(
 fn validate_generated_artifacts(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
+    transition: Option<&script::BuildArtifactTransition>,
 ) -> Result<artifact::Enabled> {
-    let enabled = artifact::read_enabled(&project.packages_dir())?;
+    let retiring = transition.map(script::BuildArtifactTransition::retiring);
+    let enabled =
+        artifact::read_enabled_except(&project.packages_dir(), retiring.as_deref().unwrap_or(&[]))?;
     if enabled.deltas.is_empty() && enabled.scripts.is_empty() {
         return Ok(enabled);
     }
@@ -274,6 +279,37 @@ fn validate_generated_artifacts(
         ))
     })?;
     Ok(enabled)
+}
+
+/// Run the authoritative core parser and tracer over prebuilt Script Artifacts.
+///
+/// This compiles only the pure Package Delta checker crate. It does not run Bun or build the
+/// Module wasm.
+pub(crate) fn validate_script_artifacts(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    paths: &[PathBuf],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut command = CommandSpec::new("cargo")
+        .arg("run")
+        .arg("-p")
+        .arg("lyracore-package-delta")
+        .arg("--bin")
+        .arg("lyracore-delta-check")
+        .cwd(project.root.clone())
+        .arg("--");
+    for path in paths {
+        command = command.arg(path.to_string_lossy().to_string());
+    }
+    runner.run_streaming(&command).map_err(|e| {
+        Error::Process(format!(
+            "the Script Artifacts do not check out. The authoritative validator's report is \
+             above, naming the malformed contract or conflicting Package.\n  ({e})"
+        ))
+    })
 }
 
 pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
@@ -357,6 +393,7 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
         run_datascripts(project, runner, &datascript_packages)?;
     }
 
+    let transition = script::BuildArtifactTransition::capture(project, &script_packages)?;
     if !script_packages.is_empty() {
         println!();
         println!(
@@ -364,10 +401,23 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
             script_packages.len(),
             script_packages.join(", ")
         );
-        script::run_builds(project, runner, &script_packages)?;
+        if let Err(error) = script::run_builds(project, runner, &script_packages) {
+            transition.rollback()?;
+            return Err(error);
+        }
     }
 
-    let enabled = validate_generated_artifacts(project, runner)?;
+    let enabled = match validate_generated_artifacts(project, runner, Some(&transition)) {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            transition.rollback()?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = transition.commit() {
+        transition.rollback()?;
+        return Err(error);
+    }
     identity::write_all(project, &enabled.deltas)?;
     identity::write_script_identities(project, &enabled.script_paths())?;
 

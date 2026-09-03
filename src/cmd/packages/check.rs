@@ -16,7 +16,8 @@
 //! artifact stale even on a clean checkout that never ran `packages build` itself. It is an input of
 //! a Package Delta alone, so a checkout shipping only Runtime Scripts skips that step. Nothing else
 //! is regenerated: this verb never runs Bun and never re-emits anything, so it needs neither Bun nor
-//! a Base Snapshot to do its job.
+//! a Base Snapshot to do its job. Every Script Artifact still passes through the authoritative
+//! Rust parser and tracer, including source-free prebuilt artifacts that have no sidecar.
 //!
 //! A missing Base Snapshot is reported as UNVERIFIABLE, not stale: the snapshot is the Operator's own
 //! client-derived data, and a CI machine holding none cannot regenerate one to compare against. A
@@ -37,16 +38,25 @@ use crate::{Error, Result};
 /// One artifact's problems, and whether its Base Snapshot comparison had to be skipped.
 fn check_one(project: &ProjectLayout, artifact: &Artifact) -> Result<(Vec<String>, bool)> {
     let sidecar_path = artifact.path.with_file_name(identity::IDENTITY_FILE);
-    let Ok(text) = std::fs::read_to_string(&sidecar_path) else {
-        return Ok((
-            vec![format!(
-                "`{}`: no Build Identity sidecar next to {} (predates identity tracking, or was \
-                 removed). Rebuild with `lyracore packages build`.",
-                artifact.package,
-                artifact.path.display()
-            )],
-            false,
-        ));
+    let text = match std::fs::read_to_string(&sidecar_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                vec![format!(
+                    "`{}`: no Build Identity sidecar next to {} (predates identity tracking, or \
+                     was removed). Rebuild with `lyracore packages build`.",
+                    artifact.package,
+                    artifact.path.display()
+                )],
+                false,
+            ))
+        }
+        Err(error) => {
+            return Err(Error::Process(format!(
+                "cannot read Package Delta Build Identity {}: {error}",
+                sidecar_path.display()
+            )))
+        }
     };
     let recorded = identity::Identity::parse(&text, &sidecar_path)?;
     let dir = identity::package_dir(project, &artifact.path)?;
@@ -87,6 +97,10 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
 
     let mut problems = Vec::new();
     let mut snapshot_unverifiable = false;
+
+    // The shared core parser owns Script Artifact structure, Event Binding contracts, and the
+    // one-artifact-per-Package rule. This Rust-only check needs neither Bun nor the Module wasm.
+    build::validate_script_artifacts(project, runner, &enabled.script_paths())?;
 
     // The typings are an input of a Package Delta only, so a checkout that ships Runtime Scripts
     // and no Datascript is checked without building the module wasm at all.
@@ -228,6 +242,19 @@ mod tests {
         path
     }
 
+    fn with_prebuilt_script_artifact(
+        project: &ProjectLayout,
+        package: &str,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let generated = project.packages_dir().join(package).join("data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let path = generated.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
     // ---- the clean pass ----
 
     #[test]
@@ -254,6 +281,96 @@ mod tests {
         let stack = FakeStack::new();
 
         run(&project, &stack.runner()).unwrap();
+    }
+
+    #[test]
+    fn a_source_free_prebuilt_artifact_uses_only_the_authoritative_rust_checker() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        with_prebuilt_script_artifact(
+            &project,
+            "playerbots",
+            "personality.json",
+            &format!(
+                r#"{{"kind":"script","version":1,"package":"playerbots","source_hash":"{HASH_A}","scripts":[]}}"#
+            ),
+        );
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner()).unwrap();
+
+        let calls = stack.rendered();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].contains("lyracore-delta-check"), "{calls:?}");
+        assert!(!calls[0].contains("spacetime generate"), "{calls:?}");
+        assert!(!calls[0].contains("bun"), "{calls:?}");
+    }
+
+    /// Structure is the CLI's own refusal: the enabled Package Inventory is read before anything
+    /// is run, so a file no Shard could apply never reaches the authoritative checker.
+    #[test]
+    fn a_malformed_prebuilt_artifact_is_refused_before_the_authoritative_checker_runs() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        let path = with_prebuilt_script_artifact(
+            &project,
+            "playerbots",
+            "personality.json",
+            r#"{"kind":"script","version":99}"#,
+        );
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(
+            error.to_string().contains(path.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(error.to_string().contains("version 99"), "{error}");
+        assert!(stack.rendered().is_empty(), "{:?}", stack.rendered());
+    }
+
+    /// Two artifacts naming one Package is the plan the module refuses; the CLI names both files
+    /// rather than letting the pair reach a Shard.
+    #[test]
+    fn duplicate_prebuilt_artifacts_are_refused_before_the_authoritative_check() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        let first = with_prebuilt_script_artifact(
+            &project,
+            "playerbots",
+            "one.json",
+            &format!(
+                r#"{{"kind":"script","version":1,"package":"playerbots","source_hash":"{HASH_A}","scripts":[]}}"#
+            ),
+        );
+        let second = with_prebuilt_script_artifact(
+            &project,
+            "playerbots",
+            "two.json",
+            &format!(
+                r#"{{"kind":"script","version":1,"package":"playerbots","source_hash":"{HASH_A}","scripts":[]}}"#
+            ),
+        );
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("appears twice"), "{error}");
+        assert!(
+            error.to_string().contains(first.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(second.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(stack.rendered().is_empty(), "{:?}", stack.rendered());
     }
 
     #[test]

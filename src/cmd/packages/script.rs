@@ -27,6 +27,7 @@
 //!    --print-events`, so a `@event` typo fails while the author can still see which file it is in.
 //!    The catalogue is never copied into the toolchain: the Module owns it, and a copy would drift.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::artifact::write_string;
@@ -425,31 +426,35 @@ pub fn remove_artifacts_without_sources(project: &ProjectLayout) -> Result<Vec<P
             continue;
         }
 
-        if generated.is_dir() {
-            let mut files = Vec::new();
-            for candidate in std::fs::read_dir(&generated)? {
-                let candidate = candidate?;
-                if candidate.file_type()?.is_file()
-                    && candidate
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension == "json")
-                {
-                    files.push(candidate.path());
-                }
-            }
-            files.sort();
-            for path in files {
-                let text = std::fs::read_to_string(&path)?;
-                if is_script_artifact(&text) {
-                    std::fs::remove_file(&path)?;
-                    removed.push(path);
-                }
-            }
+        for path in script_artifact_files(&generated)? {
+            std::fs::remove_file(&path)?;
+            removed.push(path);
         }
         std::fs::remove_file(sidecar)?;
     }
     Ok(removed)
+}
+
+/// Every Script Artifact file in one Package's generated directory, in file-name order.
+///
+/// A path walk rather than a plan read: `packages build` handles artifacts a Shard would refuse,
+/// including the prebuilt file it is about to replace.
+fn script_artifact_files(generated: &Path) -> Result<Vec<PathBuf>> {
+    if !generated.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(generated)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    let mut found = Vec::new();
+    for path in files {
+        if is_script_artifact(&std::fs::read_to_string(&path)?) {
+            found.push(path);
+        }
+    }
+    Ok(found)
 }
 
 /// Print the Module's Event Binding catalogue. Captured, not streamed: the answer is the output.
@@ -515,6 +520,113 @@ pub fn run_builds(
     Ok(())
 }
 
+#[derive(Debug)]
+struct PriorArtifact {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct PackageBuildArtifacts {
+    target: PathBuf,
+    prior: Vec<PriorArtifact>,
+}
+
+/// The Script Artifacts in place before source compilation starts.
+///
+/// Compilation writes each Package's canonical target. Noncanonical prebuilt artifacts stay in
+/// place until the complete candidate inventory passes the authoritative checker. If compilation,
+/// validation, or retirement fails, restoring these bytes leaves the prior inventory intact.
+#[derive(Debug)]
+pub struct BuildArtifactTransition {
+    packages: Vec<PackageBuildArtifacts>,
+}
+
+impl BuildArtifactTransition {
+    pub fn capture(project: &ProjectLayout, packages: &[String]) -> Result<Self> {
+        let mut captured = Vec::with_capacity(packages.len());
+        for package in packages {
+            let generated = project.packages_dir().join(package).join("data/.generated");
+            let target = generated.join(format!("{package}.script.json"));
+            let mut prior = Vec::new();
+            for path in script_artifact_files(&generated)? {
+                let bytes = std::fs::read(&path)?;
+                prior.push(PriorArtifact { path, bytes });
+            }
+            captured.push(PackageBuildArtifacts { target, prior });
+        }
+        Ok(Self { packages: captured })
+    }
+
+    /// The prior names this transition will retire — the files the checker must not see, because
+    /// they and their compiled replacement name one Package.
+    pub fn retiring(&self) -> Vec<PathBuf> {
+        self.packages
+            .iter()
+            .flat_map(|package| {
+                package
+                    .prior
+                    .iter()
+                    .map(|prior| prior.path.clone())
+                    .filter(|path| *path != package.target)
+            })
+            .collect()
+    }
+
+    /// Retire prebuilt names only after every replacement has compiled and validated.
+    pub fn commit(&self) -> Result<()> {
+        for package in &self.packages {
+            if !package.target.is_file() {
+                return Err(Error::State(format!(
+                    "Runtime Script compilation reported success but wrote no Script Artifact at {}",
+                    package.target.display()
+                )));
+            }
+        }
+        for package in &self.packages {
+            for prior in &package.prior {
+                if prior.path != package.target {
+                    std::fs::remove_file(&prior.path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the complete prior inventory after a failed transition.
+    pub fn rollback(&self) -> Result<()> {
+        for package in &self.packages {
+            if !package
+                .prior
+                .iter()
+                .any(|prior| prior.path == package.target)
+                && package.target.is_file()
+            {
+                std::fs::remove_file(&package.target)?;
+            }
+            for prior in &package.prior {
+                write_atomically(&prior.path, &prior.bytes)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        Error::State(format!(
+            "Script Artifact {} has no parent directory",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// Verify every Script Artifact against its recorded Build Identity, the way `packages check` does
 /// for Package Deltas. Returns one problem line per stale artifact.
 pub fn stale(project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<Vec<String>> {
@@ -532,18 +644,27 @@ pub fn stale(project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<Vec<Strin
             })?;
         let has_sources = !source_files(project, package)?.is_empty();
         let sidecar = path.with_file_name(identity::SCRIPT_IDENTITY_FILE);
-        let Ok(text) = std::fs::read_to_string(&sidecar) else {
-            if !has_sources {
-                // Source-free Script Artifacts are published prebuilt. They carry no Build
-                // Identity because this checkout has no source tree to compare against.
+        let text = match std::fs::read_to_string(&sidecar) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !has_sources {
+                    // Source-free Script Artifacts are published prebuilt. They carry no Build
+                    // Identity because this checkout has no source tree to compare against.
+                    continue;
+                }
+                problems.push(format!(
+                    "{}: no Build Identity sidecar (predates identity tracking, or was removed). \
+                     Rebuild with `lyracore packages build`.",
+                    path.display()
+                ));
                 continue;
             }
-            problems.push(format!(
-                "{}: no Build Identity sidecar (predates identity tracking, or was removed). \
-                 Rebuild with `lyracore packages build`.",
-                path.display()
-            ));
-            continue;
+            Err(error) => {
+                return Err(Error::Process(format!(
+                    "cannot read Script Artifact Build Identity {}: {error}",
+                    sidecar.display()
+                )))
+            }
         };
         if !has_sources {
             problems.push(format!(
@@ -1111,5 +1232,74 @@ mod tests {
 
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("sources were removed"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_non_not_found_sidecar_read_error_is_not_treated_as_prebuilt() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.lua");
+        let path = with_built_artifact(&project, "playerbots");
+        std::fs::remove_dir_all(project.package_scripts_dir("playerbots")).unwrap();
+        let sidecar = path.with_file_name(identity::SCRIPT_IDENTITY_FILE);
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+
+        let error = stale(&project, &[path]).unwrap_err();
+
+        assert!(error.to_string().contains("cannot read"), "{error}");
+        assert!(error.to_string().contains("script.identity"), "{error}");
+    }
+
+    #[test]
+    fn a_prebuilt_to_source_transition_retires_the_old_name_only_after_commit() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.ts");
+        let generated = project.packages_dir().join("playerbots/data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let prebuilt = generated.join("personality.json");
+        std::fs::write(&prebuilt, artifact_json("playerbots", &[])).unwrap();
+        let transition =
+            BuildArtifactTransition::capture(&project, &["playerbots".to_string()]).unwrap();
+        let target = generated.join("playerbots.script.json");
+        std::fs::write(&target, artifact_json("playerbots", &[])).unwrap();
+
+        // Both names hold a Script Artifact for one Package until the new one validates, so only
+        // the walk that passes over the retiring name can read this tree at all.
+        let inventory = crate::cmd::packages::artifact::read_enabled_except(
+            &project.packages_dir(),
+            &transition.retiring(),
+        )
+        .unwrap();
+        assert_eq!(inventory.script_paths(), *std::slice::from_ref(&target));
+        assert!(
+            prebuilt.is_file(),
+            "the prior artifact stays until validation"
+        );
+
+        transition.commit().unwrap();
+        assert!(!prebuilt.exists());
+        assert!(target.is_file());
+    }
+
+    #[test]
+    fn a_failed_transition_restores_a_prebuilt_canonical_artifact_byte_for_byte() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.ts");
+        let generated = project.packages_dir().join("playerbots/data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let target = generated.join("playerbots.script.json");
+        let prior = b"{\"kind\":\"script\",\"prior\":true}\n";
+        std::fs::write(&target, prior).unwrap();
+        let transition =
+            BuildArtifactTransition::capture(&project, &["playerbots".to_string()]).unwrap();
+
+        std::fs::write(&target, "{\"kind\":\"script\",\"candidate\":true}\n").unwrap();
+        transition.rollback().unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), prior);
+        assert_eq!(std::fs::read_dir(&generated).unwrap().count(), 1);
     }
 }
