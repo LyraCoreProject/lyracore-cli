@@ -40,7 +40,7 @@ pub(crate) mod tree;
 
 use crate::cmd::import::Prompt;
 use crate::cmd::preflight;
-use crate::proc::ProcessRunner;
+use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::{Component, ProjectLayout, Topology};
 use crate::state::RuntimeState;
 use crate::{Error, Result};
@@ -240,6 +240,38 @@ pub fn check_collision(project: &ProjectLayout, name: &PackageName) -> Result<()
         ))),
         None => Ok(()),
     }
+}
+
+/// Refuse a destination `packages/<name>` that Git already tracks in the core checkout: a
+/// first-party Package like the Reference Package (`example`) or an in-tree instance Package
+/// (`fire_nova`). Installing over one would overwrite tracked content outside any Package
+/// Inventory move, dirtying the checkout. `lyracore update` and `service reconcile` then refuse to
+/// run against a dirty tree.
+fn check_not_tracked(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    name: &PackageName,
+    source: &str,
+) -> Result<()> {
+    let relative = format!("{}/{}", ProjectLayout::PACKAGES_DIR, name.as_str());
+    let tracked = runner.run_and_wait(
+        &CommandSpec::new("git")
+            .cwd(project.root.clone())
+            .arg("ls-files")
+            .arg("--")
+            .arg(&relative),
+    )?;
+    if tracked.trim().is_empty() {
+        return Ok(());
+    }
+    Err(Error::Usage(format!(
+        "cannot install '{}' from {}: {} is already tracked by Git in this checkout. Installing \
+         over a tracked Package would dirty the checkout, and `lyracore update` and `service \
+         reconcile` then refuse to run. Nothing was copied.",
+        name.as_str(),
+        source,
+        project.root.join(&relative).display()
+    )))
 }
 
 /// The shapes `module/build.rs` accepts.
@@ -446,6 +478,7 @@ pub(crate) fn install(
     yes: bool,
 ) -> Result<()> {
     let destination = project.packages_dir().join(name.as_str());
+    check_not_tracked(project, runner, name, &origin.named())?;
     check_collision(project, name)?;
     // Computing the identity validates the WHOLE tree (including client content) before the
     // narrower shape and trust-review passes. The same identity must describe the staged copy
@@ -1261,13 +1294,27 @@ pub(super) mod tests {
         let source = candidate(&tmp, "greeter");
 
         // Enabled collision.
-        std::fs::create_dir_all(project.packages_dir().join("greeter")).unwrap();
-        let error = check_collision(&project, &PackageName::parse("greeter").unwrap()).unwrap_err();
+        let enabled = project.packages_dir().join("greeter");
+        std::fs::create_dir_all(&enabled).unwrap();
+        std::fs::write(enabled.join("installed.txt"), "keep me\n").unwrap();
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("enabled"), "{error}");
+        assert!(!error.to_string().contains("tracked by Git"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(enabled.join("installed.txt")).unwrap(),
+            "keep me\n"
+        );
 
-        // ...and a DISABLED one, which the build cannot see today but would collide the moment it
+        // A disabled one would collide the moment it
         // was re-enabled.
-        std::fs::remove_dir_all(project.packages_dir().join("greeter")).unwrap();
+        std::fs::remove_dir_all(&enabled).unwrap();
         std::fs::create_dir_all(project.packages_disabled_dir().join("greeter")).unwrap();
         let error = add(
             &project,
@@ -1293,6 +1340,44 @@ pub(super) mod tests {
             check_collision(&project, &PackageName::parse("my_package").unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("pkg_my_package"), "{error}");
+    }
+
+    #[test]
+    fn an_install_over_a_git_tracked_destination_is_refused_before_anything_is_written() {
+        // `example` is core's tracked Reference Package; a same-named local folder must not
+        // silently overwrite it and dirty the checkout the way this bug did twice in production.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "example");
+        let tracked = project.packages_dir().join("example");
+        std::fs::create_dir_all(&tracked).unwrap();
+        std::fs::write(tracked.join("README.md"), "tracked Reference Package\n").unwrap();
+        let stack = FakeStack::new().with_stdout("ls-files", "packages/example\n");
+
+        let error = add(
+            &project,
+            &stack.runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(
+            error.to_string().contains(&source.display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&project.packages_dir().join("example").display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tracked.join("README.md")).unwrap(),
+            "tracked Reference Package\n"
+        );
     }
 
     #[test]

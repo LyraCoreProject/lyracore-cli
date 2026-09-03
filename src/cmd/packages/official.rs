@@ -47,6 +47,8 @@ pub(crate) fn add(
     yes: bool,
 ) -> Result<()> {
     // Before the network: an install the inventory would refuse anyway is not worth a clone.
+    let source_name = format!("the Official Package Collection ({COLLECTION_URL})");
+    super::check_not_tracked(project, runner, name, &source_name)?;
     super::check_collision(project, name)?;
 
     let collection = collection_source();
@@ -172,6 +174,42 @@ mod tests {
             recorded.content_identity,
             stamp::content_identity(&installed).unwrap(),
             "the stamp must record the identity of what was actually copied"
+        );
+    }
+
+    #[test]
+    fn an_install_over_a_git_tracked_destination_is_refused_before_anything_is_written() {
+        // `example` is core's tracked Reference Package; a future collection Package that shadows
+        // it (or any other tracked `packages/` directory, e.g. `fire_nova`) must be refused too.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let tracked = project.packages_dir().join("example");
+        std::fs::create_dir_all(&tracked).unwrap();
+        std::fs::write(tracked.join("README.md"), "tracked Reference Package\n").unwrap();
+        let stack = repository(&collection(&tmp, &["example"]), FIRST)
+            .with_stdout("ls-files", "packages/example\n");
+
+        let error = super::super::add(&project, &stack.runner(), &Answer("yes"), "example", true)
+            .unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(error.to_string().contains(COLLECTION_URL), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&project.packages_dir().join("example").display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tracked.join("README.md")).unwrap(),
+            "tracked Reference Package\n"
+        );
+        assert!(
+            stack
+                .rendered()
+                .iter()
+                .all(|call| !call.contains("git clone")),
+            "a known tracked destination must be refused before the network"
         );
     }
 
