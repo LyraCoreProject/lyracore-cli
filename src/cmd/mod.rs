@@ -130,14 +130,18 @@ USAGE:
                                                its recorded content identity, because those local
                                                changes exist nowhere else
   lyracore packages replay [DATABASE ...] [--check] [--yes] [--force-all]
-                                               reapply every enabled Package's Delta to each named
-                                               Shard: reimport Spell.dbc, then replay the claims
-                                               over it. Preflights every artifact and every target
-                                               before the first write, applies Shard by Shard, and
-                                               stops at the first failure naming what completed,
-                                               what failed and what was never touched. A Shard
-                                               whose recorded provenance already matches this
-                                               checkout is skipped, so re-running resumes. --check
+                                               reapply every enabled Package's artifacts to each
+                                               named Shard, in two Import Families. spell: reimport
+                                               Spell.dbc, then replay the Package Deltas over it.
+                                               script: reconcile the Runtime Scripts to exactly the
+                                               ones the enabled Packages ship, which is also how a
+                                               disabled Package's scripts leave a Shard. Preflights
+                                               every artifact and every target before the first
+                                               write, applies Shard by Shard, and stops at the first
+                                               failure naming the Shard, the family, what completed
+                                               and what was never touched. A Shard whose recorded
+                                               provenance for a family already matches this checkout
+                                               is skipped for it, so re-running resumes. --check
                                                prints the plan and writes nothing; --force-all
                                                replays even the Shards that match
   lyracore packages config NAME [KEY [VALUE]] [--new]

@@ -73,8 +73,16 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
         return Ok(());
     }
     let enabled = artifact::read_enabled(&project.packages_dir())?;
-    if let Some(note) = enabled.skipped_note() {
-        println!("{note}");
+    // A Script Artifact has no Build Identity sidecar and no Base Snapshot to drift against, so
+    // this verb has nothing to check about one. `packages replay` is what applies them.
+    match enabled.scripts.len() {
+        0 => {}
+        1 => println!(
+            "1 Script Artifact is not a Package Delta; `lyracore packages replay` applies it"
+        ),
+        n => println!(
+            "{n} Script Artifacts are not Package Deltas; `lyracore packages replay` applies them"
+        ),
     }
     let artifacts = enabled.deltas;
     if artifacts.is_empty() {
