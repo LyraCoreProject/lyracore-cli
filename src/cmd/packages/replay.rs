@@ -1,36 +1,17 @@
 //! `lyracore packages replay [DATABASE …] [--check] [--yes] [--force-all]` — reapply every enabled
 //! Package's artifacts to every Shard that holds a copy of the catalogues they claim.
 //!
-//! Two Import Families travel here, because a Package ships two artifact kinds.
+//! Two Import Families travel here. **spell** claims columns of rows a base import owns, so it
+//! replays as the last stage of that import. **script** owns whole `game_script` rows with no base
+//! import behind it, so its apply goes straight to `apply_package_deltas` and IS the reconciliation
+//! — an empty plan is still applied, because that is how a disabled Package's scripts leave a Shard.
 //!
-//! The **spell** family's artifact is a Package Delta: claims on columns of rows a base import owns.
-//! A base import replaces the whole family, so those claims are not a one-shot edit — they replay as
-//! the last stage of that family's import, which is why this family runs through the importer.
+//! Over calling the module per Shard, this verb adds: preflight (every artifact read, digested, and
+//! traced once, before any write), resume (a Shard whose per-family provenance already matches this
+//! checkout is skipped for that family), and an honest report naming what completed, what failed,
+//! and what was never touched.
 //!
-//! The **script** family's artifact holds whole `game_script` rows and has no base import behind it:
-//! no DBC and no dump holds a Runtime Script. Its apply is the whole enabled plan and nothing else,
-//! so it goes straight to `apply_package_deltas` rather than behind a reimport. Applying the plan IS
-//! the reconciliation — a Package that left the enabled set takes its scripts off every Shard with
-//! it, which is why an empty plan is still applied.
-//!
-//! What was missing in both cases is the Realm: a catalogue lives on every World Shard and Instance
-//! Pool that owns a copy, and applying it Shard by Shard from memory is how a Realm ends up running
-//! two different Package sets without anything saying so.
-//!
-//! # What this verb adds over calling the module per Shard
-//!
-//! * **Preflight.** Every artifact is read, digested and traced ONCE, and every target is read from,
-//!   before the first write. A Claim Conflict, a Runtime Script collision or an unreachable Shard
-//!   fails the run at Shard 0.
-//! * **Resume.** Each Shard records what it applied in `game_package_import`, per family. A Shard
-//!   whose provenance for a family already matches this checkout's artifacts is reported complete
-//!   and skipped for that family, so re-running after a failure costs nothing on what finished.
-//! * **An honest report.** A failure names the Shards that completed, the one that failed and the
-//!   family it failed in, and the ones never touched — then prints the command to resume, which is
-//!   the same command.
-//!
-//! Fail-fast, never rollback: #310 puts distributed atomic transactions and automatic rollback of
-//! completed Shards out of scope. A half-applied Realm is recoverable by re-running; a Realm that
+//! Fail-fast, never rollback: a half-applied Realm is recoverable by re-running, but one that
 //! reported success while half-applied is not.
 
 use std::path::Path;
@@ -70,9 +51,8 @@ type Applied = (String, String, String);
 
 /// What preflight decided about one target, before anything was written.
 ///
-/// One answer per Import Family, because they are independent: a Shard can hold this checkout's
-/// Package Deltas and none of its Runtime Scripts, which is exactly what a Realm looks like the
-/// first time a Package ships a script.
+/// One answer per Import Family: a Shard can hold this checkout's Package Deltas without its
+/// Runtime Scripts, which is what a Realm looks like before its first Package script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     database: String,
@@ -94,9 +74,8 @@ pub const VERB: &str = "packages replay";
 
 /// Validate the Shard names given on the command line.
 ///
-/// The same guard `publish` uses, for the same reason: these names reach a rendered subprocess, and
-/// a flag smuggled in among them must be refused before any process starts. There is deliberately no
-/// path here that infers a production Realm's Shard list.
+/// Same guard as `publish`: these names reach a rendered subprocess, so a smuggled flag must be
+/// refused before any process starts. Never infers a production Realm's Shard list.
 pub fn databases(args: &[String]) -> Result<Vec<String>> {
     for name in args {
         validate_database(VERB, name)?;
@@ -129,9 +108,8 @@ fn replay_command(
 
 /// The answer's data rows, without the column header `spacetime sql` prints above them.
 ///
-/// The header is dropped by MATCHING the columns that were asked for rather than by counting lines:
-/// this reads digests straight out of the first row, and a header cell silently read as a digest
-/// would make every Shard look like it was applied by a Package called `package`.
+/// Drops the header by matching the asked-for columns, not by counting lines — a header cell
+/// silently read as a digest would make every Shard look applied by a Package called `package`.
 fn rows(output: &str, columns: &[&str]) -> Vec<Vec<String>> {
     let mut rows = import::table_cells(output);
     let header_first = rows.first().is_some_and(|row| {
@@ -145,8 +123,8 @@ fn rows(output: &str, columns: &[&str]) -> Vec<Vec<String>> {
 
 /// One read of one Shard, with the diagnosis a failure needs.
 ///
-/// A failed query is NOT an empty result. Conflating them would turn one dead node into "this Shard
-/// has never applied anything", and this verb would then happily replay a Realm it cannot see.
+/// A failed query is not an empty result — conflating them would read a dead node as "never
+/// applied" and replay a Realm this verb cannot actually see.
 fn ask(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
@@ -168,10 +146,9 @@ fn ask(
 
 /// Read one Shard's spell-family provenance.
 ///
-/// One exact-match query, no `ORDER BY`, no `IN` and no subquery: `spacetime sql` supports none of
-/// them (docs/danger-zones.md §2). One query per FAMILY rather than one per Package, because the
-/// extra rows are the point — a Package that left the enabled set is visible only as a row this
-/// checkout no longer accounts for.
+/// One exact-match query — `spacetime sql` supports no `ORDER BY`, `IN`, or subquery
+/// (docs/danger-zones.md §2) — per family rather than per Package, because a Package that left the
+/// enabled set is visible only as a row this checkout no longer accounts for.
 fn read_spell_provenance(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
@@ -197,9 +174,9 @@ fn read_spell_provenance(
 
 /// Read one Shard's script-family provenance.
 ///
-/// Two columns, not the spell family's three: the script family has no base import, so every one of
-/// its rows carries an empty `base_source_sha` and there is nothing for it to sit on. Asking for a
-/// column whose every cell is empty only gives the answer parser a blank to misread.
+/// Two columns, not the spell family's three: the script family has no base import, so its rows
+/// carry no `base_source_sha` — asking for an always-empty column only gives the parser a blank to
+/// misread.
 fn read_script_provenance(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
@@ -245,14 +222,10 @@ fn read_base_stamp(
 
 /// Does this Shard already hold exactly these artifacts for `family`?
 ///
-/// Every enabled Package must be recorded with the digest this checkout produces, and no Package may
-/// be recorded that is no longer enabled. `base` additionally holds every row to the Shard's CURRENT
-/// base stamp, for a family that has a base import: claims recorded against an older one sit on rows
-/// that import has since replaced. The script family passes `None`, because it has no base import to
-/// sit on.
-///
-/// A mismatch anywhere means replay; only a total match skips. Returns the reason it is complete, or
-/// `None`.
+/// Matches when every enabled Package is recorded with a matching digest, no other Package is
+/// recorded, and — when `base` is `Some` — every row sits on the Shard's current base stamp (a claim
+/// recorded against a replaced import is stale; the script family has no base import, so it passes
+/// `None`). Any mismatch means replay; a total match returns the reason it is complete.
 fn already_complete(
     family: &str,
     digests: &[(&str, &str)],
@@ -300,10 +273,9 @@ fn script_digests(artifacts: &[ScriptArtifact]) -> Vec<(&str, &str)> {
 
 /// Apply the whole enabled script plan to one Shard.
 ///
-/// `spacetime call`, not the importer: the script family has no base import, so there is no reimport
-/// stage for this apply to be the last part of. Both arguments are JSON literals because that is
-/// what `spacetime call` parses each argument as, and the payload carries quotes and newlines that
-/// need escaping either way.
+/// `spacetime call`, not the importer: the script family has no base import to reimport into. Both
+/// arguments are JSON literals — what `spacetime call` parses each argument as, and the payload's
+/// quotes and newlines need escaping either way.
 fn script_apply_command(
     project: &ProjectLayout,
     database: &str,
@@ -671,9 +643,8 @@ fn script_count(scripts: &[ScriptArtifact]) -> usize {
 
 /// What the operator is agreeing to, named as its consequence rather than as a count.
 ///
-/// An empty plan for a family is a legitimate statement and a destructive one: it clears that
-/// family's whole Package range. It is also exactly what an accidentally disabled Package looks
-/// like, so it is said out loud or not at all.
+/// An empty plan for a family clears that family's whole Package range — legitimate, but exactly
+/// what an accidentally disabled Package looks like, so it is said out loud or not at all.
 fn question(
     wanted: &[&Target],
     artifacts: &[Artifact],

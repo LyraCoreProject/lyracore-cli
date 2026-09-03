@@ -1801,7 +1801,7 @@ mod tests {
                 value: "Hello".to_string(),
                 allow_new: true,
             },
-            databases: vec![],
+                databases: vec![],
         });
         for line in [
             "packages config greeter greeting Hello --new",
@@ -1833,10 +1833,7 @@ mod tests {
         ] {
             let error = parse(line).unwrap_err();
             assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
-            assert!(
-                error.to_string().contains("needs a Shard name"),
-                "{line}: {error}"
-            );
+            assert!(error.to_string().contains("needs a Shard name"), "{line}: {error}");
         }
     }
 

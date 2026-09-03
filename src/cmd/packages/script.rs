@@ -1,31 +1,16 @@
 //! The enabled Packages' Script Artifacts: the Runtime Scripts they ship, the digest a Shard
 //! records for each one, and the payload `apply_package_deltas` reads for the script Import Family.
 //!
-//! A Package Delta states COLUMNS of rows a base import owns, so [`super::artifact`] has to merge
-//! two Packages that meet on one row. A Runtime Script has no base import behind it and no other
-//! owner: the Package that ships a script ships all of it. Two Packages meeting on one `script_id`
-//! or one name is therefore never a merge, only a collision a human has to settle.
+//! A Runtime Script has no base import and no other owner, so two Packages meeting on one
+//! `script_id` or name is always a collision, never the row merge [`super::artifact`] does.
 //!
-//! # Why the canonical form is rebuilt here
+//! The canonical form mirrors [`super::artifact`]'s, for the same reason: the module hashes it into
+//! `artifact_hash`, so this module's fixtures are copied verbatim from the engine crate's own
+//! canonical-form tests, and a drift shows up as a failing test here too.
 //!
-//! Same reason [`super::artifact`] rebuilds the Package Delta's, and on the same terms: the module
-//! records `game_package_import.artifact_hash` as BLAKE3 over an artifact's canonical bytes, so
-//! comparing a Shard's recorded digest against this checkout means reproducing those bytes exactly.
-//! The rules are fixed and small — no whitespace, a declared member order, scripts sorted by
-//! identifier, and JSON's own string escapes — and the fixtures in this module's tests are taken
-//! verbatim from the engine crate's own canonical-form tests, so a drift shows up as a failing test.
-//!
-//! # What this parser refuses, and what it leaves to the module
-//!
-//! It refuses what would make the canonical bytes wrong or the plan unapplyable: an unknown version,
-//! a member no artifact declares, and one Package shipping two scripts at one identifier or under
-//! one name.
-//!
-//! It does NOT re-check the event catalogue, the Package script identifier band, the name character
-//! rules or the empty-source rule. Those are the Module's, held once in the engine's artifact crate
-//! and asserted against the Module's own dispatch. A copy here could only drift into refusing a
-//! Package the Module accepts, and the Module refuses such a plan on the first Shard before it
-//! writes anything.
+//! This parser refuses only what would corrupt the bytes or the plan — unknown version, an
+//! undeclared member, an in-Package id/name clash — and leaves the event catalogue, identifier
+//! bands, and name rules to the Module, which refuses an over-permissive plan on the first Shard.
 
 use std::path::{Path, PathBuf};
 
@@ -81,10 +66,8 @@ impl ScriptArtifact {
 
 /// Whether these bytes are a Script Artifact, from the root `kind` member alone.
 ///
-/// Read before either parse, not after: each parser reports what is wrong with its OWN kind, and a
-/// file read by the wrong one describes a symptom rather than the mistake. Anything that is not a
-/// JSON object with `"kind": "script"` goes to the Package Delta parser, which reports what is
-/// wrong with it far better than this can.
+/// Read before either parse: each parser then reports what is wrong with its OWN kind, instead of
+/// routing a file to the wrong parser and describing a symptom rather than the mistake.
 pub fn is_script_artifact(text: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
