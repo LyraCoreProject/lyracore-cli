@@ -386,7 +386,8 @@ impl ProjectLayout {
     /// The builder entry point inside [`Self::RUNTIME_SCRIPTS_DIR`].
     pub const SCRIPT_BUILDER_FILE: &'static str = "build-scripts.ts";
     /// Where a Package keeps its Runtime Script sources, relative to the Package folder. The
-    /// sources are Package-authored, so unlike a Datascript they live inside the Package.
+    /// sources are immediate regular `.ts` and `.lua` files. They are Package-authored, so unlike
+    /// a Datascript they live inside the Package.
     pub const PACKAGE_SCRIPTS_DIR: &'static str = "scripts";
 
     /// The pinned wire-harness release this checkout consumes (#246).

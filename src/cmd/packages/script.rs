@@ -341,21 +341,115 @@ pub fn pack(artifacts: &[ScriptArtifact]) -> String {
 /// The environment variable the builder reads its Event Binding catalogue from, one event per line.
 const HOOK_EVENTS_ENV: &str = "LYRACORE_HOOK_EVENTS";
 
-/// Enabled Packages carrying Runtime Script sources, in folder-name order — the same listing that
-/// already means "enabled", so a disabled Package's scripts simply are not there to find.
+/// The Runtime Script sources the builder reads, in file-name order.
+///
+/// The inventory is deliberately shallow and contains only regular `.ts` and `.lua` files. This
+/// is the same definition as the Runtime Script Toolchain's `scriptSources`: a nested file, a
+/// symlink, or a README cannot affect emitted Lua and therefore cannot affect its Build Identity.
+pub fn source_files(project: &ProjectLayout, package: &str) -> Result<Vec<PathBuf>> {
+    let scripts_dir = project.package_scripts_dir(package);
+    if !scripts_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(scripts_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "ts" || extension == "lua")
+        {
+            sources.push(path);
+        }
+    }
+    sources.sort();
+    Ok(sources)
+}
+
+/// Enabled Packages carrying at least one Runtime Script source, in folder-name order. The same
+/// listing already means "enabled", so a disabled Package's scripts are not there to find.
 pub fn packages_with_scripts(project: &ProjectLayout) -> Result<Vec<String>> {
     let packages_dir = project.packages_dir();
     if !packages_dir.is_dir() {
         return Ok(Vec::new());
     }
-    let mut names: Vec<String> = std::fs::read_dir(&packages_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| project.package_scripts_dir(name).is_dir())
-        .collect();
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&packages_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !source_files(project, &name)?.is_empty() {
+            names.push(name);
+        }
+    }
     names.sort();
     Ok(names)
+}
+
+/// Remove Script Artifacts previously emitted by this build after their last source disappears.
+///
+/// A `script.identity` sidecar marks the source-built mode. A source-free Script Artifact without
+/// that sidecar is prebuilt Lua and remains untouched, so an Operator can install and replay it
+/// without Bun. Artifact files are removed before the sidecar. If removal fails, the remaining
+/// sidecar keeps any surviving artifact from being mistaken for prebuilt Lua by `packages check`.
+pub fn remove_artifacts_without_sources(project: &ProjectLayout) -> Result<Vec<PathBuf>> {
+    let packages_dir = project.packages_dir();
+    if !packages_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut removed = Vec::new();
+    for entry in std::fs::read_dir(packages_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Ok(package) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !source_files(project, &package)?.is_empty() {
+            continue;
+        }
+
+        let generated = entry.path().join("data/.generated");
+        let sidecar = generated.join(identity::SCRIPT_IDENTITY_FILE);
+        if !sidecar.is_file() {
+            continue;
+        }
+
+        if generated.is_dir() {
+            let mut files = Vec::new();
+            for candidate in std::fs::read_dir(&generated)? {
+                let candidate = candidate?;
+                if candidate.file_type()?.is_file()
+                    && candidate
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                {
+                    files.push(candidate.path());
+                }
+            }
+            files.sort();
+            for path in files {
+                let text = std::fs::read_to_string(&path)?;
+                if is_script_artifact(&text) {
+                    std::fs::remove_file(&path)?;
+                    removed.push(path);
+                }
+            }
+        }
+        std::fs::remove_file(sidecar)?;
+    }
+    Ok(removed)
 }
 
 /// Print the Module's Event Binding catalogue. Captured, not streamed: the answer is the output.
@@ -426,8 +520,24 @@ pub fn run_builds(
 pub fn stale(project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for path in artifacts {
+        let package_dir = identity::package_dir(project, path)?;
+        let package = package_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                Error::State(format!(
+                    "Package directory {} has no UTF-8 folder name",
+                    package_dir.display()
+                ))
+            })?;
+        let has_sources = !source_files(project, package)?.is_empty();
         let sidecar = path.with_file_name(identity::SCRIPT_IDENTITY_FILE);
         let Ok(text) = std::fs::read_to_string(&sidecar) else {
+            if !has_sources {
+                // Source-free Script Artifacts are published prebuilt. They carry no Build
+                // Identity because this checkout has no source tree to compare against.
+                continue;
+            }
             problems.push(format!(
                 "{}: no Build Identity sidecar (predates identity tracking, or was removed). \
                  Rebuild with `lyracore packages build`.",
@@ -435,6 +545,14 @@ pub fn stale(project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<Vec<Strin
             ));
             continue;
         };
+        if !has_sources {
+            problems.push(format!(
+                "{}: its Runtime Script sources were removed, but a source-built Script Artifact \
+                 remains. Run `lyracore packages build` to remove it before replay.",
+                path.display()
+            ));
+            continue;
+        }
         let recorded = identity::ScriptIdentity::parse(&text, &sidecar)?;
         let current = identity::compute_script(project, path)?;
         for input in recorded.changed_against(&current) {
@@ -784,8 +902,32 @@ mod tests {
         with_scripts(&project, "zeta", "a.ts");
         with_scripts(&project, "alpha", "a.ts");
         std::fs::create_dir_all(project.packages_dir().join("rust_only")).unwrap();
+        let notes = project.package_scripts_dir("notes_only");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("README.md"), "not executable\n").unwrap();
+        std::fs::create_dir_all(notes.join("nested.ts")).unwrap();
 
         assert_eq!(packages_with_scripts(&project).unwrap(), ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn the_source_inventory_is_shallow_and_contains_only_regular_typescript_and_lua_files() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let scripts = project.package_scripts_dir("fire_nova");
+        std::fs::create_dir_all(scripts.join("nested")).unwrap();
+        std::fs::write(scripts.join("alpha.ts"), "one\n").unwrap();
+        std::fs::write(scripts.join("zeta.lua"), "two\n").unwrap();
+        std::fs::write(scripts.join("README.md"), "notes\n").unwrap();
+        std::fs::write(scripts.join("nested/hidden.ts"), "ignored\n").unwrap();
+
+        let relative = source_files(&project, "fire_nova")
+            .unwrap()
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(relative, ["alpha.ts", "zeta.lua"]);
     }
 
     #[test]
@@ -937,5 +1079,37 @@ mod tests {
             problems[0].contains("lyracore packages build"),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn a_source_free_prebuilt_artifact_needs_no_build_identity() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "playerbots", "personality.lua");
+        let path = with_built_artifact(&project, "playerbots");
+        std::fs::remove_dir_all(project.package_scripts_dir("playerbots")).unwrap();
+        std::fs::remove_file(path.with_file_name(identity::SCRIPT_IDENTITY_FILE)).unwrap();
+
+        assert!(stale(&project, &[path]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_source_built_artifact_without_its_sources_is_stale_even_if_its_identity_matches() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+        std::fs::remove_dir_all(project.package_scripts_dir("fire_nova")).unwrap();
+        let incorrectly_recertified = identity::compute_script(&project, &path).unwrap();
+        std::fs::write(
+            path.with_file_name(identity::SCRIPT_IDENTITY_FILE),
+            incorrectly_recertified.render(),
+        )
+        .unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("sources were removed"), "{problems:?}");
     }
 }

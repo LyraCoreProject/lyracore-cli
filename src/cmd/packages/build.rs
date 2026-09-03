@@ -26,9 +26,10 @@
 //!    `Bun.main`, the running process's own entry script, into the artifact's `source_hash`;
 //!    importing the script into one host process instead would hash the host, not the script. The
 //!    first script to fail stops the build: later scripts, and later Packages, never run.
-//! 6. Every enabled Package with a `packages/<package>/scripts/` folder compiles its Runtime
-//!    Scripts into one Script Artifact, again one `bun run` subprocess per Package. See
-//!    [`super::script`] for what the builder is handed and why.
+//! 6. Every enabled Package with an immediate `.ts` or `.lua` file under
+//!    `packages/<package>/scripts/` compiles its Runtime Scripts into one Script Artifact, again one
+//!    `bun run` subprocess per Package. A source-built artifact is removed when its last source
+//!    disappears. See [`super::script`] for the source-free prebuilt mode.
 //! 7. `cargo run -p lyracore-package-delta --bin lyracore-delta-check` traces every enabled
 //!    Package's generated artifacts TOGETHER, in one invocation, Package Deltas and Script
 //!    Artifacts alike. A Claim Conflict and a Runtime Script collision are both BETWEEN Packages,
@@ -334,6 +335,12 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
 
     let datascript_packages = packages_with_datascripts(project)?;
     let script_packages = script::packages_with_scripts(project)?;
+    for path in script::remove_artifacts_without_sources(project)? {
+        println!(
+            "removed source-built Script Artifact with no Runtime Script sources: {}",
+            path.display()
+        );
+    }
     if datascript_packages.is_empty() && script_packages.is_empty() {
         return Ok(());
     }
@@ -832,6 +839,57 @@ mod tests {
             .join("fire_nova/data/.generated")
             .join(identity::SCRIPT_IDENTITY_FILE);
         assert!(sidecar.is_file(), "no Script Artifact sidecar was written");
+    }
+
+    #[test]
+    fn removing_the_last_script_source_retires_the_artifact_and_check_stays_clean() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_runtime_script(&project, "fire_nova");
+        let stack = FakeStack::new().with_stdout("--print-events", "on_login\n");
+
+        run(&project, &stack.runner()).unwrap();
+        let generated = project.packages_dir().join("fire_nova/data/.generated");
+        assert!(generated.join("fire_nova.script.json").is_file());
+        assert!(generated.join(identity::SCRIPT_IDENTITY_FILE).is_file());
+
+        std::fs::remove_dir_all(project.package_scripts_dir("fire_nova")).unwrap();
+        run(&project, &stack.runner()).unwrap();
+
+        assert!(!generated.join("fire_nova.script.json").exists());
+        assert!(!generated.join(identity::SCRIPT_IDENTITY_FILE).exists());
+        super::super::check::run(&project, &stack.runner()).unwrap();
+        let enabled = artifact::read_enabled(&project.packages_dir()).unwrap();
+        assert!(
+            enabled.scripts.is_empty(),
+            "a later replay must see no old Lua"
+        );
+    }
+
+    #[test]
+    fn a_source_free_prebuilt_script_artifact_survives_build_and_passes_check() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_package(&project, "playerbots");
+        let generated = project.packages_dir().join("playerbots/data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let artifact = generated.join("personality.json");
+        std::fs::write(
+            &artifact,
+            concat!(
+                r#"{"kind":"script","version":1,"package":"playerbots","#,
+                r#""source_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","#,
+                r#""scripts":[]}"#,
+            ),
+        )
+        .unwrap();
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner()).unwrap();
+        super::super::check::run(&project, &stack.runner()).unwrap();
+
+        assert!(artifact.is_file());
+        assert!(!generated.join(identity::SCRIPT_IDENTITY_FILE).exists());
     }
 
     #[test]

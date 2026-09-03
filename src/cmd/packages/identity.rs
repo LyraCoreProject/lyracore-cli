@@ -490,7 +490,7 @@ pub fn compute_script(project: &ProjectLayout, artifact_path: &Path) -> Result<S
     let dir = package_dir(project, artifact_path)?;
     let name = dir.file_name().unwrap_or_default().to_string_lossy();
     Ok(ScriptIdentity {
-        source_hash: hash_tree(&project.package_scripts_dir(&name), None)?,
+        source_hash: hash_script_sources(&super::script::source_files(project, &name)?)?,
         toolchain_hash: hash_dir_files(&project.runtime_scripts_dir())?,
         bun_version: doctor::REQUIRED_BUN.to_string(),
         bun_lock_hash: hash_file(&project.datascripts_dir().join("bun.lock"))?,
@@ -498,10 +498,30 @@ pub fn compute_script(project: &ProjectLayout, artifact_path: &Path) -> Result<S
     })
 }
 
+/// SHA-256 over the exact Runtime Script source inventory, mirrored in `build-scripts.ts`.
+fn hash_script_sources(files: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for path in files {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let bytes = std::fs::read(path)?;
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(bytes.len().to_string().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(&bytes);
+    }
+    Ok(format!("sha256-script-sources-v1:{:x}", hasher.finalize()))
+}
+
 /// Write one Script Artifact Build Identity sidecar next to each of `artifacts`. Called only after
 /// the artifacts have validated, for the same reason the Delta side is.
 pub fn write_script_identities(project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<()> {
     for path in artifacts {
+        let dir = package_dir(project, path)?;
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        if super::script::source_files(project, &name)?.is_empty() {
+            continue;
+        }
         let sidecar = path
             .parent()
             .ok_or_else(|| {
@@ -912,5 +932,39 @@ mod tests {
 
         assert!(error.to_string().contains("unreachable"), "{error}");
         assert!(!generated_dir.join(IDENTITY_FILE).exists());
+    }
+
+    #[test]
+    fn script_source_hash_matches_the_toolchains_shallow_inventory() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let scripts = project.package_scripts_dir("fire_nova");
+        std::fs::create_dir_all(scripts.join("nested")).unwrap();
+        std::fs::write(
+            scripts.join("alpha.ts"),
+            "// @event on_login\n// @id 100201\nfunction script(): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts.join("zeta.lua"),
+            "-- @event on_login\n-- @id 100202\nreturn 2\n",
+        )
+        .unwrap();
+        std::fs::write(scripts.join("README.md"), "ignored\n").unwrap();
+        std::fs::write(scripts.join("nested/hidden.ts"), "ignored\n").unwrap();
+        std::fs::create_dir_all(project.runtime_scripts_dir()).unwrap();
+        std::fs::write(project.script_builder_file(), "// builder\n").unwrap();
+        let artifact = project
+            .packages_dir()
+            .join("fire_nova/data/.generated/fire_nova.script.json");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, "{}\n").unwrap();
+
+        let identity = compute_script(&project, &artifact).unwrap();
+
+        assert_eq!(
+            identity.source_hash,
+            "sha256-script-sources-v1:8395ead00aad341a7daa23658447385da94dabf6932b406cbfbdb5e2fd664002"
+        );
     }
 }

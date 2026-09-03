@@ -23,8 +23,9 @@
 //! Base Snapshot that IS present and no longer matches its recorded hash is a real mismatch and fails
 //! like any other input.
 //!
-//! A missing sidecar is treated as stale — it predates identity tracking, so there is nothing to
-//! compare against and no way to call the artifact current.
+//! A source-built artifact without a sidecar is stale. A source-free artifact without one is
+//! prebuilt Lua: there is no source tree in this checkout to compare, and an Operator can install
+//! and replay it without Bun.
 
 use crate::cmd::packages::artifact::{self, Artifact};
 use crate::cmd::packages::build;
