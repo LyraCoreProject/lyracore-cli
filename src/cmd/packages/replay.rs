@@ -411,8 +411,6 @@ pub fn run(
         }
     }
 
-    let client_data = import::resolve_client_data(project, prompt, options.client_data.as_deref())?;
-
     // ---- preflight: every target, before the first write ----
     println!();
     println!("=== targets ===");
@@ -446,20 +444,46 @@ pub fn run(
         .filter(|t| !t.wanted())
         .map(|t| t.database.clone())
         .collect();
+    let spell_wanted = targets.iter().any(|target| target.spell.is_none());
+    // A check still renders an enabled spell plan on every Shard, even where it is already
+    // complete. With no Package Deltas and no stale spell provenance, there is no spell plan to
+    // execute and the script family's check must not acquire an unrelated DBC prerequisite.
+    let spell_check_wanted = options.check && (spell_wanted || !artifacts.is_empty());
+    let client_data = if spell_wanted || spell_check_wanted {
+        Some(import::resolve_client_data(
+            project,
+            prompt,
+            options.client_data.as_deref(),
+        )?)
+    } else {
+        None
+    };
 
     if options.check {
         println!();
         println!("=== check: the plan, per Shard, writing nothing ===");
-        runner.run_streaming(&import::build_importer_command(project))?;
+        if spell_check_wanted {
+            runner.run_streaming(&import::build_importer_command(project))?;
+        }
         for target in &targets {
             println!();
             println!("==> checking {}", target.database);
-            runner.run_streaming(&replay_command(
-                project,
-                &target.database,
-                &client_data,
-                false,
-            )?)?;
+            if spell_check_wanted {
+                let client_data = client_data.as_deref().ok_or_else(|| {
+                    Error::Process(
+                        "the spell family needs client data, but preflight did not resolve it"
+                            .to_string(),
+                    )
+                })?;
+                runner.run_streaming(&replay_command(
+                    project,
+                    &target.database,
+                    client_data,
+                    false,
+                )?)?;
+            } else if let Some(reason) = &target.spell {
+                println!("  {SPELL_FAMILY}: already complete — {reason}");
+            }
             println!(
                 "  {SCRIPT_FAMILY}: {} Package(s), {} Runtime Script(s) would be applied",
                 scripts.len(),
@@ -499,30 +523,12 @@ pub fn run(
         runner.run_streaming(&import::build_importer_command(project))?;
     }
 
-    // The fail-fast report, from inside the loop: which Shards finished, which one refused and in
-    // which family, and which were never touched.
-    let stopped = |failed: &str, family: &str, index: usize, cause: &str| {
-        Error::Process(format!(
-            "{cause}\n  replay stopped at: {failed} ({family} family)\n  completed: {completed}\n  \
-             already complete (skipped): {skipped}\n  untouched: {untouched}\n\n  The failed Shard \
-             wrote nothing for that family: the apply is one transaction, so it lands whole or not \
-             at all. Fix the cause and re-run the SAME command — the Shards above verify their \
-             provenance and skip:\n    {resume}",
-            completed = shard_list(
-                &wanted[..index]
-                    .iter()
-                    .map(|t| t.database.clone())
-                    .collect::<Vec<_>>()
-            ),
-            skipped = shard_list(&skipped),
-            untouched = shard_list(
-                &wanted[index + 1..]
-                    .iter()
-                    .map(|t| t.database.clone())
-                    .collect::<Vec<_>>()
-            ),
-            resume = resume_command(&shards, options),
-        ))
+    let mut completed = Vec::new();
+    let stop_context = StopContext {
+        targets: &targets,
+        wanted: &wanted,
+        shards: &shards,
+        options,
     };
 
     for (index, target) in wanted.iter().enumerate() {
@@ -532,15 +538,24 @@ pub fn run(
         match &target.spell {
             Some(reason) => println!("  {SPELL_FAMILY}: already complete — {reason}"),
             None => {
-                let command = replay_command(project, &target.database, &client_data, true)?;
+                let client_data = client_data.as_deref().ok_or_else(|| {
+                    Error::Process(
+                        "the spell family needs client data, but preflight did not resolve it"
+                            .to_string(),
+                    )
+                })?;
+                let command = replay_command(project, &target.database, client_data, true)?;
                 if let Err(error) = runner.run_streaming(&command) {
                     return Err(stopped(
                         &target.database,
                         SPELL_FAMILY,
                         index,
                         &error.to_string(),
+                        &completed,
+                        &stop_context,
                     ));
                 }
+                completed.push((target.database.clone(), SPELL_FAMILY));
             }
         }
 
@@ -559,8 +574,11 @@ pub fn run(
                         SCRIPT_FAMILY,
                         index,
                         &refusal(&error),
+                        &completed,
+                        &stop_context,
                     ));
                 }
+                completed.push((target.database.clone(), SCRIPT_FAMILY));
             }
         }
     }
@@ -594,6 +612,65 @@ pub fn run(
         );
     }
     Ok(())
+}
+
+struct StopContext<'a, 'target> {
+    targets: &'a [Target],
+    wanted: &'a [&'target Target],
+    shards: &'a [String],
+    options: &'a ReplayOptions,
+}
+
+/// Report a stopped replay by Import Family, including a family that completed on the Shard where
+/// a later family refused its plan.
+fn stopped(
+    failed: &str,
+    family: &str,
+    index: usize,
+    cause: &str,
+    completed: &[(String, &'static str)],
+    context: &StopContext<'_, '_>,
+) -> Error {
+    let completed_spell = completed_in(completed, SPELL_FAMILY);
+    let completed_script = completed_in(completed, SCRIPT_FAMILY);
+    let skipped_spell = already_complete_in(context.targets, |target| target.spell.is_some());
+    let skipped_script = already_complete_in(context.targets, |target| target.script.is_some());
+    let untouched = context.wanted[index + 1..]
+        .iter()
+        .map(|target| target.database.clone())
+        .collect::<Vec<_>>();
+
+    Error::Process(format!(
+        "{cause}\n  replay stopped at: {failed} ({family} family)\n  completed this run:\n    \
+         {SPELL_FAMILY}: {completed_spell}\n    {SCRIPT_FAMILY}: {completed_script}\n  already complete \
+         before this run:\n    {SPELL_FAMILY}: {skipped_spell}\n    {SCRIPT_FAMILY}: \
+         {skipped_script}\n  untouched Shards: {untouched}\n\n  The failed Shard wrote nothing \
+         for the {family} family. That apply is one transaction, so it lands whole or not at all. \
+         Any family that completed earlier stays applied. Fix the cause and re-run the SAME command. \
+         Provenance makes completed families skip:\n    {resume}",
+        completed_spell = shard_list(&completed_spell),
+        completed_script = shard_list(&completed_script),
+        skipped_spell = shard_list(&skipped_spell),
+        skipped_script = shard_list(&skipped_script),
+        untouched = shard_list(&untouched),
+        resume = resume_command(context.shards, context.options),
+    ))
+}
+
+fn completed_in(completed: &[(String, &'static str)], family: &str) -> Vec<String> {
+    completed
+        .iter()
+        .filter(|(_, completed_family)| *completed_family == family)
+        .map(|(shard, _)| shard.clone())
+        .collect()
+}
+
+fn already_complete_in(targets: &[Target], complete: impl Fn(&Target) -> bool) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|target| complete(target))
+        .map(|target| target.database.clone())
+        .collect()
 }
 
 /// The Shards a family actually wrote to.
@@ -789,6 +866,18 @@ mod tests {
                 ..Default::default()
             }
         }
+
+        fn options_without_client_data(&self, shards: &[&str]) -> ReplayOptions {
+            ReplayOptions {
+                databases: shards.iter().map(|s| (*s).to_string()).collect(),
+                yes: true,
+                ..Default::default()
+            }
+        }
+
+        fn remove_client_data(&self) {
+            std::fs::remove_dir_all(self.tmp.path().join("client-data")).unwrap();
+        }
     }
 
     /// A `spacetime sql` answer in the tabular shape the real CLI prints.
@@ -952,9 +1041,12 @@ mod tests {
             message.contains("replay stopped at: lyracore-kalimdor"),
             "{message}"
         );
-        assert!(message.contains("completed: lyracore\n"), "{message}");
         assert!(
-            message.contains("untouched: lyracore-instances"),
+            message.contains("spell: lyracore\n    script: (none)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("untouched Shards: lyracore-instances"),
             "{message}"
         );
         assert!(
@@ -1127,8 +1219,8 @@ mod tests {
         assert_eq!(checks.len(), 2, "{checks:?}");
     }
 
-    /// A check still visits a Shard the run would have skipped: the operator asked what the plan is,
-    /// not what the shortest path to it would be.
+    /// An enabled spell plan is still checked on a complete Shard. This is an explicit check, not
+    /// the shortest apply path.
     #[test]
     fn check_reports_every_named_shard_including_the_complete_ones() {
         let checkout = Checkout::new();
@@ -1527,9 +1619,12 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("nothing applied"), "{message}");
-        assert!(message.contains("completed: lyracore\n"), "{message}");
         assert!(
-            message.contains("untouched: lyracore-instances"),
+            message.contains("script: lyracore\n  already complete"),
+            "{message}"
+        );
+        assert!(
+            message.contains("untouched Shards: lyracore-instances"),
             "{message}"
         );
         assert!(
@@ -1594,14 +1689,15 @@ mod tests {
     }
 
     #[test]
-    fn check_prints_the_script_plan_and_calls_no_reducer() {
+    fn a_script_only_check_needs_no_client_data_and_calls_no_reducer() {
         let checkout = Checkout::new();
         checkout.with_script("bolt", 100_001, "bolt.greet");
+        checkout.remove_client_data();
         let stack = fresh_shard(FakeStack::new(), "lyracore");
         let options = ReplayOptions {
             check: true,
             yes: false,
-            ..checkout.options(&["lyracore"])
+            ..checkout.options_without_client_data(&["lyracore"])
         };
 
         run(
@@ -1613,21 +1709,30 @@ mod tests {
         .unwrap();
 
         assert!(script_applies(&stack).is_empty(), "{:?}", stack.rendered());
+        assert!(
+            !stack
+                .rendered()
+                .iter()
+                .any(|call| call.contains("lyracore-importer")),
+            "{:?}",
+            stack.rendered()
+        );
     }
 
     /// Only the spell family runs through the importer, so a run carrying nothing but Runtime
-    /// Scripts must not pay for building it.
+    /// Scripts neither needs client data nor pays for building it.
     #[test]
-    fn a_script_only_run_never_builds_the_importer() {
+    fn a_script_only_run_needs_no_client_data_and_never_builds_the_importer() {
         let checkout = Checkout::new();
         checkout.with_script("bolt", 100_001, "bolt.greet");
+        checkout.remove_client_data();
         let stack = fresh_shard(FakeStack::new(), "lyracore");
 
         run(
             &checkout.project,
             &stack.runner(),
-            &ScriptedPrompt::new(&["yes"]),
-            &checkout.options(&["lyracore"]),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["lyracore"]),
         )
         .unwrap();
 
@@ -1640,6 +1745,69 @@ mod tests {
             stack.rendered()
         );
         assert_eq!(script_applies(&stack).len(), 1, "{:?}", stack.rendered());
+    }
+
+    #[test]
+    fn a_script_only_no_op_needs_no_client_data() {
+        let checkout = Checkout::new();
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let hash = checkout.script_hash("bolt");
+        checkout.remove_client_data();
+        let stack = scripted_shard(
+            fresh_shard(FakeStack::new(), "lyracore"),
+            "lyracore",
+            "bolt",
+            &hash,
+        );
+
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &ReplayOptions {
+                yes: false,
+                ..checkout.options_without_client_data(&["lyracore"])
+            },
+        )
+        .unwrap();
+
+        assert!(script_applies(&stack).is_empty(), "{:?}", stack.rendered());
+        assert!(
+            !stack
+                .rendered()
+                .iter()
+                .any(|call| call.contains("lyracore-importer")),
+            "{:?}",
+            stack.rendered()
+        );
+    }
+
+    #[test]
+    fn a_script_refusal_reports_the_spell_family_that_completed_on_the_same_shard() {
+        let checkout = Checkout::new();
+        checkout.with_package("bolt", 133, 1500);
+        checkout.with_script("bolt", 100_001, "bolt.greet");
+        let stack = fresh_shard(FakeStack::new(), "lyracore")
+            .fail_on(APPLY_REDUCER, "the script plan was refused");
+
+        let error = run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options(&["lyracore"]),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert_eq!(applies(&stack).len(), 1, "{:?}", stack.rendered());
+        assert!(
+            message.contains("completed this run:\n    spell: lyracore\n    script: (none)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Any family that completed earlier stays applied."),
+            "{message}"
+        );
     }
 
     /// The two families are decided independently: a Shard can hold this checkout's Package Deltas
