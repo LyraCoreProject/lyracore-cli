@@ -379,6 +379,15 @@ impl ProjectLayout {
     /// see. It rides `generated/`'s own git-ignore rule for a second reason — it is the OPERATOR's
     /// own client-derived data, not something to commit.
     pub const BASE_SNAPSHOT_FILE: &'static str = "base-snapshot.json";
+    /// The pinned Runtime Script toolchain: the `typescript-to-lua` config, the Host API typings,
+    /// the emitter plugin and the builder `packages build` runs once per Package that ships
+    /// scripts. It sits inside `datascripts/` as a Bun workspace, so one `bun install` covers both.
+    pub const RUNTIME_SCRIPTS_DIR: &'static str = "runtime-scripts";
+    /// The builder entry point inside [`Self::RUNTIME_SCRIPTS_DIR`].
+    pub const SCRIPT_BUILDER_FILE: &'static str = "build-scripts.ts";
+    /// Where a Package keeps its Runtime Script sources, relative to the Package folder. The
+    /// sources are Package-authored, so unlike a Datascript they live inside the Package.
+    pub const PACKAGE_SCRIPTS_DIR: &'static str = "scripts";
 
     /// The pinned wire-harness release this checkout consumes (#246).
     pub const WIRE_HARNESS_PIN: &'static str = ".wire-harness-rev";
@@ -528,6 +537,24 @@ impl ProjectLayout {
     /// builds it once with `lyracore-importer --spell-snapshot`.
     pub fn base_snapshot_file(&self) -> PathBuf {
         self.datascript_types_dir().join(Self::BASE_SNAPSHOT_FILE)
+    }
+
+    /// The pinned Runtime Script toolchain, e.g. `datascripts/runtime-scripts/`.
+    pub fn runtime_scripts_dir(&self) -> PathBuf {
+        self.datascripts_dir().join(Self::RUNTIME_SCRIPTS_DIR)
+    }
+
+    /// The Runtime Script builder `packages build` runs, e.g.
+    /// `datascripts/runtime-scripts/build-scripts.ts`.
+    pub fn script_builder_file(&self) -> PathBuf {
+        self.runtime_scripts_dir().join(Self::SCRIPT_BUILDER_FILE)
+    }
+
+    /// One Package's Runtime Script sources, e.g. `packages/fire_nova/scripts/`.
+    pub fn package_scripts_dir(&self, package: &str) -> PathBuf {
+        self.packages_dir()
+            .join(package)
+            .join(Self::PACKAGE_SCRIPTS_DIR)
     }
 
     pub fn standalone_unit(&self) -> PathBuf {

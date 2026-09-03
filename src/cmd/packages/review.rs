@@ -14,9 +14,11 @@
 //! Everything else in the Rust is code that runs inside the module with full database access, and
 //! the report says so.
 //!
-//! Datascripts and Runtime Scripts have no tooling in this checkout yet. They are reported as an
-//! explicit "none detected" row rather than omitted, so the review's silence about them is a
-//! deliberate statement and not an oversight the reader has to notice.
+//! Runtime Scripts ARE counted: a Package ships its `scripts/` sources inside its own folder, and
+//! that Lua runs on the realm once the Package is built. Datascripts are not — they live in
+//! `datascripts/`, outside any Package folder, so a candidate cannot carry one. That row still
+//! prints, as an explicit "none detected", so the review's silence about them is a deliberate
+//! statement and not an oversight the reader has to notice.
 //!
 //! DUPLICATION, ON PURPOSE: `strip_comments_and_strings` and the three marker matchers are a port
 //! of `module/build.rs`, which lives in the server repository and is not a dependency of this CLI.
@@ -66,6 +68,8 @@ pub struct TrustReview {
     pub addons: Vec<String>,
     /// Files under `client/mpq/` — each one shadows a stock client file.
     pub client_overrides: usize,
+    /// Runtime Script sources under `scripts/` — Lua this Package would run on the realm.
+    pub runtime_scripts: Vec<String>,
     pub rust_files: usize,
     pub rust_lines: usize,
 }
@@ -118,6 +122,27 @@ impl TrustReview {
                 entry.kind == EntryKind::File && entry.relative.starts_with("client/mpq")
             })
             .count();
+
+        review.runtime_scripts = entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::File
+                    && entry.relative.parent() == Some(Path::new("scripts"))
+                    && entry
+                        .relative
+                        .extension()
+                        .is_some_and(|ext| ext == "ts" || ext == "lua")
+            })
+            .map(|entry| {
+                entry
+                    .relative
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        review.runtime_scripts.sort();
 
         Ok(review)
     }
@@ -172,6 +197,7 @@ impl TrustReview {
             && self.character_owned.is_empty()
             && self.addons.is_empty()
             && self.client_overrides == 0
+            && self.runtime_scripts.is_empty()
     }
 
     /// The full block `packages add` prints before it asks.
@@ -203,9 +229,11 @@ impl TrustReview {
         out.push_str(
             "  datascripts        none detected (nothing in this checkout reads them yet)\n",
         );
-        out.push_str(
-            "  runtime scripts    none detected (nothing in this checkout reads them yet)\n",
-        );
+        out.push_str(&row(
+            "runtime scripts",
+            self.runtime_scripts.len(),
+            &self.runtime_scripts,
+        ));
         out.push_str(&format!(
             "  trusted Rust       {} file(s), {} line(s)\n",
             self.rust_files, self.rust_lines
@@ -230,6 +258,7 @@ impl TrustReview {
             ("character-owned", self.character_owned.len()),
             ("addons", self.addons.len()),
             ("client overrides", self.client_overrides),
+            ("runtime scripts", self.runtime_scripts.len()),
         ] {
             if count > 0 {
                 parts.push(format!("{count} {label}"));
@@ -688,11 +717,33 @@ mod tests {
 
         assert!(text.contains("TRUSTED"), "{text}");
         assert!(text.contains("not a security guarantee"), "{text}");
-        // The two kinds with no tooling are stated, not omitted.
+        // Datascripts, the one kind a candidate cannot carry, are stated rather than omitted.
         assert!(text.contains("datascripts"), "{text}");
-        assert!(text.contains("runtime scripts"), "{text}");
         assert!(text.contains("none detected"), "{text}");
+        assert!(text.contains("runtime scripts"), "{text}");
         assert!(review.registers_nothing(), "{review:?}");
+    }
+
+    /// Runtime Scripts run ON THE REALM once the Package is built, so a candidate carrying them
+    /// must never be reviewed as if it carried none.
+    #[test]
+    fn runtime_script_sources_are_named_in_the_review() {
+        let tmp = package(&[
+            ("scripts/ember_echo.ts", "// @event on_login\n"),
+            ("scripts/bonus.lua", "-- @event on_login\n"),
+            ("scripts/README.md", "not a script\n"),
+        ]);
+
+        let review = TrustReview::scan(tmp.path()).unwrap();
+
+        assert_eq!(review.runtime_scripts, ["bonus.lua", "ember_echo.ts"]);
+        assert!(!review.registers_nothing(), "{review:?}");
+        let text = review.render(tmp.path());
+        assert!(text.contains("ember_echo.ts"), "{text}");
+        assert!(
+            review.kinds_summary().contains("2 runtime scripts"),
+            "{review:?}"
+        );
     }
 
     #[test]

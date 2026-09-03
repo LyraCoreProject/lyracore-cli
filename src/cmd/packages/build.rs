@@ -1,7 +1,7 @@
 //! `lyracore packages build` — regenerate the Datascript typings, typecheck against them, then run
-//! and validate every enabled Package's Datascripts.
+//! every enabled Package's Datascripts, compile its Runtime Scripts, and validate what came out.
 //!
-//! A version gate, then up to seven steps, in this order, and the order is the contract:
+//! A version gate, then up to eight steps, in this order, and the order is the contract:
 //!
 //! 0. `bun --version` must match the checkout's exact pin. A hard failure, unlike `doctor`'s Bun
 //!    check: `doctor` only reports drift on a machine that may never run Bun at all, but this
@@ -26,22 +26,26 @@
 //!    `Bun.main`, the running process's own entry script, into the artifact's `source_hash`;
 //!    importing the script into one host process instead would hash the host, not the script. The
 //!    first script to fail stops the build: later scripts, and later Packages, never run.
-//! 6. `cargo run -p lyracore-package-delta --bin lyracore-delta-check` traces every enabled
-//!    Package's generated artifacts TOGETHER, in one invocation. A Claim Conflict is between two
-//!    Packages, so checking one artifact at a time could only ever prove that one artifact parses.
-//!    This is the authoritative Rust-side check — the same trace `packages replay` runs before it
-//!    writes to a Shard — so a Package Delta a Datascript just emitted is validated by the code that
-//!    also decides whether it may apply, not by a second, looser implementation of the same rules.
-//! 7. A Build Identity sidecar (`packages::identity`) is written next to each artifact that just
+//! 6. Every enabled Package with a `packages/<package>/scripts/` folder compiles its Runtime
+//!    Scripts into one Script Artifact, again one `bun run` subprocess per Package. See
+//!    [`super::script`] for what the builder is handed and why.
+//! 7. `cargo run -p lyracore-package-delta --bin lyracore-delta-check` traces every enabled
+//!    Package's generated artifacts TOGETHER, in one invocation, Package Deltas and Script
+//!    Artifacts alike. A Claim Conflict and a Runtime Script collision are both BETWEEN Packages,
+//!    so checking one artifact at a time could only ever prove that one artifact parses. This is
+//!    the authoritative Rust-side check — the same trace `packages replay` runs before it writes to
+//!    a Shard — so what a build just emitted is validated by the code that also decides whether it
+//!    may apply, not by a second, looser implementation of the same rules.
+//! 8. A Build Identity sidecar (`packages::identity`) is written next to each artifact that just
 //!    validated: every input the artifact was built from, so `packages check`, `preflight` and CI
-//!    can tell later whether it is still current. Writing it only after step 6 succeeds means a
+//!    can tell later whether it is still current. Writing it only after step 7 succeeds means a
 //!    sidecar never describes an artifact this build itself would have refused.
 //!
-//! Steps 1-3, 5 and 6 STREAM to the terminal rather than being captured. `tsc` writes its
+//! Steps 1-3 and 5-7 STREAM to the terminal rather than being captured. `tsc` writes its
 //! diagnostics to stdout, so a captured run surfaced an empty error and lost the file and line this
 //! command promises; a Datascript's own thrown error and the validator's own conflict report are the
 //! same kind of thing. Step 0 captures instead: a `--version` banner is one line, and the gate needs
-//! to read it, not relay it.
+//! to read it, not relay it. So does step 6's first call, which reads the Event Binding catalogue.
 //!
 //! Generating FIRST among the streamed steps is what gives the gate teeth. The typings are derived
 //! from the Module every run, so a Datascript naming a column the Module renamed fails here, at
@@ -64,7 +68,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cmd::doctor::{self, BunVersionCheck};
-use crate::cmd::packages::{artifact, identity};
+use crate::cmd::packages::{artifact, identity, script};
 use crate::cmd::preflight;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::ProjectLayout;
@@ -225,26 +229,27 @@ fn run_datascripts(
     Ok(())
 }
 
-/// The Rust-side authoritative check: every enabled Package's generated artifacts, traced together
-/// in one `lyracore-delta-check` invocation. Discovered the same way `packages replay` discovers
-/// them — a folder listing, not a re-parse by this command — so build-time validation and
-/// replay-time preflight can never disagree about which files are in play.
+/// The Rust-side authoritative check: every enabled Package's generated artifacts, of both kinds,
+/// traced together in one `lyracore-delta-check` invocation. Discovered the same way `packages
+/// replay` discovers them — a folder listing, not a re-parse by this command — so build-time
+/// validation and replay-time preflight can never disagree about which files are in play.
 ///
-/// Returns what it discovered and validated, so step 7 can write each artifact's Build Identity
+/// Returns what it discovered and validated, so step 8 can write each artifact's Build Identity
 /// without re-reading a tree this step just finished checking.
-fn validate_generated_deltas(
+fn validate_generated_artifacts(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
-) -> Result<Vec<artifact::Artifact>> {
-    let artifacts = artifact::read_enabled(&project.packages_dir())?.deltas;
-    if artifacts.is_empty() {
-        return Ok(artifacts);
+) -> Result<artifact::Enabled> {
+    let enabled = artifact::read_enabled(&project.packages_dir())?;
+    if enabled.deltas.is_empty() && enabled.scripts.is_empty() {
+        return Ok(enabled);
     }
 
     println!();
     println!(
-        "checking {} generated Package Delta artifact(s)",
-        artifacts.len()
+        "checking {} generated Package Delta artifact(s) and {} Script Artifact(s)",
+        enabled.deltas.len(),
+        enabled.scripts.len()
     );
     let mut command = CommandSpec::new("cargo")
         .arg("run")
@@ -254,17 +259,20 @@ fn validate_generated_deltas(
         .arg("lyracore-delta-check")
         .cwd(project.root.clone())
         .arg("--");
-    for artifact in &artifacts {
+    for artifact in &enabled.deltas {
+        command = command.arg(artifact.path.to_string_lossy().to_string());
+    }
+    for artifact in &enabled.scripts {
         command = command.arg(artifact.path.to_string_lossy().to_string());
     }
 
     runner.run_streaming(&command).map_err(|e| {
         Error::Process(format!(
-            "the generated Package Delta artifacts do not check out. The validator's own report is \
-             above, naming the file and the exact claim to fix.\n  ({e})"
+            "the generated Package artifacts do not check out. The validator's own report is \
+             above, naming the file and the exact claim or Runtime Script to fix.\n  ({e})"
         ))
     })?;
-    Ok(artifacts)
+    Ok(enabled)
 }
 
 pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
@@ -325,25 +333,39 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     println!("Datascripts typecheck against the current Module schema.");
 
     let datascript_packages = packages_with_datascripts(project)?;
-    if datascript_packages.is_empty() {
+    let script_packages = script::packages_with_scripts(project)?;
+    if datascript_packages.is_empty() && script_packages.is_empty() {
         return Ok(());
     }
 
-    verify_base_snapshot(project, &datascript_packages)?;
+    if !datascript_packages.is_empty() {
+        verify_base_snapshot(project, &datascript_packages)?;
+
+        println!();
+        println!(
+            "running Datascripts for {} enabled Package(s): {}",
+            datascript_packages.len(),
+            datascript_packages.join(", ")
+        );
+        run_datascripts(project, runner, &datascript_packages)?;
+    }
+
+    if !script_packages.is_empty() {
+        println!();
+        println!(
+            "compiling Runtime Scripts for {} enabled Package(s): {}",
+            script_packages.len(),
+            script_packages.join(", ")
+        );
+        script::run_builds(project, runner, &script_packages)?;
+    }
+
+    let enabled = validate_generated_artifacts(project, runner)?;
+    identity::write_all(project, &enabled.deltas)?;
+    identity::write_script_identities(project, &enabled.script_paths())?;
 
     println!();
-    println!(
-        "running Datascripts for {} enabled Package(s): {}",
-        datascript_packages.len(),
-        datascript_packages.join(", ")
-    );
-    run_datascripts(project, runner, &datascript_packages)?;
-
-    let artifacts = validate_generated_deltas(project, runner)?;
-    identity::write_all(project, &artifacts)?;
-
-    println!();
-    println!("Package Deltas emitted and validated.");
+    println!("Package artifacts emitted and validated.");
     Ok(())
 }
 
@@ -740,6 +762,97 @@ mod tests {
         assert_eq!(
             run_call.env_value("LYRACORE_PACKAGES_ROOT"),
             Some(project.packages_dir().to_string_lossy().as_ref())
+        );
+    }
+
+    // ---- Runtime Scripts ----
+
+    /// An enabled Package carrying one Runtime Script source, and the Script Artifact its build
+    /// writes. `FakeStack` records the `bun run` but does not execute Bun, so the artifact is put
+    /// on disk directly — the same way the Datascript tests supply theirs.
+    fn with_runtime_script(project: &ProjectLayout, package: &str) {
+        with_package(project, package);
+        let scripts = project.package_scripts_dir(package);
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("greet.ts"),
+            "// @event on_login\n// @id 100200\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.runtime_scripts_dir()).unwrap();
+        std::fs::write(project.script_builder_file(), "// the builder\n").unwrap();
+
+        let dir = project.packages_dir().join(package).join("data/.generated");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{package}.script.json")),
+            concat!(
+                r#"{"kind":"script","version":1,"package":"fire_nova","#,
+                r#""source_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","#,
+                r#""scripts":[]}"#,
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_package_shipping_only_runtime_scripts_still_compiles_and_validates_them() {
+        // No Datascript anywhere, so no Base Snapshot and no `datascripts/src/` folder: the
+        // Runtime Script half must not be gated on the Datascript half.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_runtime_script(&project, "fire_nova");
+        let stack = FakeStack::new().with_stdout("--print-events", "on_login\n");
+
+        run(&project, &stack.runner()).unwrap();
+
+        let calls = stack.rendered();
+        assert_eq!(calls.len(), 7, "{calls:?}");
+        assert!(calls[4].contains("--print-events"), "{calls:?}");
+        assert!(calls[5].contains("build-scripts.ts"), "{calls:?}");
+        assert!(calls[5].ends_with("fire_nova"), "{calls:?}");
+        assert!(calls[6].contains("lyracore-delta-check"), "{calls:?}");
+        assert!(
+            calls[6].contains("fire_nova/data/.generated/fire_nova.script.json"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_validated_script_artifact_gets_its_own_build_identity_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_runtime_script(&project, "fire_nova");
+        let stack = FakeStack::new().with_stdout("--print-events", "on_login\n");
+
+        run(&project, &stack.runner()).unwrap();
+
+        let sidecar = project
+            .packages_dir()
+            .join("fire_nova/data/.generated")
+            .join(identity::SCRIPT_IDENTITY_FILE);
+        assert!(sidecar.is_file(), "no Script Artifact sidecar was written");
+    }
+
+    #[test]
+    fn a_refused_runtime_script_stops_the_build_and_writes_no_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_runtime_script(&project, "fire_nova");
+        let stack = FakeStack::new()
+            .with_stdout("--print-events", "on_login\n")
+            .fail_on("build-scripts.ts", "unknown @event");
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("fire_nova"), "{error}");
+        assert!(
+            !project
+                .packages_dir()
+                .join("fire_nova/data/.generated")
+                .join(identity::SCRIPT_IDENTITY_FILE)
+                .exists(),
+            "a refused build must write no sidecar"
         );
     }
 

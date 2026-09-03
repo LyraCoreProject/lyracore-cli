@@ -1,5 +1,7 @@
 //! The enabled Packages' Script Artifacts: the Runtime Scripts they ship, the digest a Shard
 //! records for each one, and the payload `apply_package_deltas` reads for the script Import Family.
+//! The same module builds them: `packages build` compiles a Package's `scripts/` sources into the
+//! artifact this parser then reads back.
 //!
 //! A Runtime Script has no base import and no other owner, so two Packages meeting on one
 //! `script_id` or name is always a collision, never the row merge [`super::artifact`] does.
@@ -11,10 +13,26 @@
 //! This parser refuses only what would corrupt the bytes or the plan — unknown version, an
 //! undeclared member, an in-Package id/name clash — and leaves the event catalogue, identifier
 //! bands, and name rules to the Module, which refuses an over-permissive plan on the first Shard.
+//!
+//! The build half is the Datascript step's sibling and deliberately shaped like it: one `bun run`
+//! subprocess per Package, streamed so the toolchain's own diagnostics reach the author, fail-fast,
+//! and the artifact validated afterwards by the same `lyracore-delta-check` that traces Package
+//! Deltas. Two things differ, both because a Runtime Script is Package-authored rather than
+//! schema-derived:
+//!
+//!  * The sources live INSIDE the Package (`packages/<name>/scripts/`), not under `datascripts/src/`.
+//!    A Datascript sits outside a Package folder because only artifacts belong in one; a Runtime
+//!    Script is a Package's own content, and the Official Package Collection ships both halves.
+//!  * The builder is handed the hook Event Binding catalogue, read from `lyracore-delta-check
+//!    --print-events`, so a `@event` typo fails while the author can still see which file it is in.
+//!    The catalogue is never copied into the toolchain: the Module owns it, and a copy would drift.
 
 use std::path::{Path, PathBuf};
 
 use super::artifact::write_string;
+use crate::cmd::packages::identity;
+use crate::proc::{CommandSpec, ProcessRunner};
+use crate::project::ProjectLayout;
 use crate::{Error, Result};
 
 /// The Import Family a Script Artifact belongs to — the name `apply_package_deltas` takes and
@@ -318,9 +336,123 @@ pub fn pack(artifacts: &[ScriptArtifact]) -> String {
         .join("\n")
 }
 
+// ---- building a Script Artifact ----
+
+/// The environment variable the builder reads its Event Binding catalogue from, one event per line.
+const HOOK_EVENTS_ENV: &str = "LYRACORE_HOOK_EVENTS";
+
+/// Enabled Packages carrying Runtime Script sources, in folder-name order — the same listing that
+/// already means "enabled", so a disabled Package's scripts simply are not there to find.
+pub fn packages_with_scripts(project: &ProjectLayout) -> Result<Vec<String>> {
+    let packages_dir = project.packages_dir();
+    if !packages_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&packages_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| project.package_scripts_dir(name).is_dir())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Print the Module's Event Binding catalogue. Captured, not streamed: the answer is the output.
+pub fn hook_events_command(project: &ProjectLayout) -> CommandSpec {
+    CommandSpec::new("cargo")
+        .arg("run")
+        .arg("-p")
+        .arg("lyracore-package-delta")
+        .arg("--bin")
+        .arg("lyracore-delta-check")
+        .arg("--")
+        .arg("--print-events")
+        .cwd(project.root.clone())
+}
+
+/// One Package's Runtime Script build, as a subprocess.
+pub fn build_command(project: &ProjectLayout, package: &str, events: &str) -> CommandSpec {
+    CommandSpec::new("bun")
+        .arg("run")
+        .arg(project.script_builder_file().to_string_lossy().to_string())
+        .arg(package.to_string())
+        .env(
+            "LYRACORE_PACKAGES_ROOT",
+            project.packages_dir().to_string_lossy().to_string(),
+        )
+        .env(HOOK_EVENTS_ENV, events.to_string())
+        .cwd(project.root.clone())
+}
+
+/// Read the Event Binding catalogue once, then compile each Package's scripts in folder-name order.
+/// The first Package to fail stops the build; later Packages never run.
+pub fn run_builds(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    packages: &[String],
+) -> Result<()> {
+    let events = runner
+        .run_and_wait(&hook_events_command(project))
+        .map_err(|e| {
+            Error::Process(format!(
+                "could not read the Event Binding catalogue from `lyracore-delta-check \
+                 --print-events`, so a script's `@event` could not be checked against the Module. \
+                 Nothing was compiled.\n  ({e})"
+            ))
+        })?;
+
+    for package in packages {
+        println!(
+            "compiling Runtime Scripts in {} ({package})",
+            project.package_scripts_dir(package).display()
+        );
+        runner
+            .run_streaming(&build_command(project, package, &events))
+            .map_err(|e| {
+                Error::Process(format!(
+                    "the Runtime Scripts of `{package}` did not compile into a Script Artifact. \
+                     The toolchain's own diagnostic is above, naming the file and the directive or \
+                     line to fix. A refused build writes nothing, so the Package's artifact is \
+                     exactly what it was before this run.\n  ({e})"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+/// Verify every Script Artifact against its recorded Build Identity, the way `packages check` does
+/// for Package Deltas. Returns one problem line per stale artifact.
+pub fn stale(project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<Vec<String>> {
+    let mut problems = Vec::new();
+    for path in artifacts {
+        let sidecar = path.with_file_name(identity::SCRIPT_IDENTITY_FILE);
+        let Ok(text) = std::fs::read_to_string(&sidecar) else {
+            problems.push(format!(
+                "{}: no Build Identity sidecar (predates identity tracking, or was removed). \
+                 Rebuild with `lyracore packages build`.",
+                path.display()
+            ));
+            continue;
+        };
+        let recorded = identity::ScriptIdentity::parse(&text, &sidecar)?;
+        let current = identity::compute_script(project, path)?;
+        for input in recorded.changed_against(&current) {
+            problems.push(format!(
+                "{}: {} changed. Rebuild with `lyracore packages build`.",
+                path.display(),
+                input.description()
+            ));
+        }
+    }
+    Ok(problems)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proc::fake::FakeStack;
+    use tempfile::TempDir;
 
     const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -616,5 +748,194 @@ mod tests {
         assert!(!is_script_artifact(r#"{"version":1,"claims":[]}"#));
         assert!(!is_script_artifact(r#"{"kind":"weather","version":1}"#));
         assert!(!is_script_artifact("{ not even valid }"));
+    }
+
+    // ---- the build half ----
+
+    fn checkout(tmp: &TempDir) -> ProjectLayout {
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        std::fs::create_dir_all(project.runtime_scripts_dir()).unwrap();
+        std::fs::write(project.script_builder_file(), "// the builder\n").unwrap();
+        std::fs::write(project.datascripts_dir().join("bun.lock"), "{}\n").unwrap();
+        project
+    }
+
+    fn with_scripts(project: &ProjectLayout, package: &str, file: &str) {
+        let dir = project.package_scripts_dir(package);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), "// @event on_login\n// @id 100200\n").unwrap();
+    }
+
+    /// The Script Artifact a build would have written, plus its sidecar.
+    fn with_built_artifact(project: &ProjectLayout, package: &str) -> PathBuf {
+        let dir = project.packages_dir().join(package).join("data/.generated");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{package}.script.json"));
+        std::fs::write(&path, "{\"kind\":\"script\"}\n").unwrap();
+        identity::write_script_identities(project, std::slice::from_ref(&path)).unwrap();
+        path
+    }
+
+    #[test]
+    fn only_enabled_packages_carrying_a_scripts_folder_are_built() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "zeta", "a.ts");
+        with_scripts(&project, "alpha", "a.ts");
+        std::fs::create_dir_all(project.packages_dir().join("rust_only")).unwrap();
+
+        assert_eq!(packages_with_scripts(&project).unwrap(), ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn the_builder_subprocess_carries_the_packages_root_and_the_event_catalogue() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let stack = FakeStack::new().with_stdout("--print-events", "on_login\non_death\n");
+
+        run_builds(&project, &stack.runner(), &["fire_nova".to_string()]).unwrap();
+
+        let spec = stack
+            .calls()
+            .into_iter()
+            .find_map(|call| match call {
+                crate::proc::fake::Call::Stream(spec) if spec.render().starts_with("bun run") => {
+                    Some(spec)
+                }
+                _ => None,
+            })
+            .expect("the builder ran");
+        assert!(spec.render().ends_with("fire_nova"), "{}", spec.render());
+        assert_eq!(
+            spec.env_value("LYRACORE_PACKAGES_ROOT"),
+            Some(project.packages_dir().to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            spec.env_value(HOOK_EVENTS_ENV),
+            Some("on_login\non_death\n")
+        );
+    }
+
+    #[test]
+    fn a_catalogue_that_cannot_be_read_stops_the_build_before_any_package_compiles() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new().fail_on("--print-events", "the delta crate does not compile");
+
+        let error = run_builds(&project, &stack.runner(), &["fire_nova".to_string()]).unwrap_err();
+
+        assert!(error.to_string().contains("Event Binding"), "{error}");
+        for call in stack.rendered() {
+            assert!(!call.contains("bun run"), "{call}");
+        }
+    }
+
+    #[test]
+    fn a_mid_loop_failure_stops_the_build_and_a_later_package_never_compiles() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new()
+            .with_stdout("--print-events", "on_login\n")
+            .fail_on("build-scripts.ts alpha", "the script does not compile");
+
+        let error = run_builds(
+            &project,
+            &stack.runner(),
+            &["alpha".to_string(), "zeta".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("alpha"), "{error}");
+        for call in stack.rendered() {
+            assert!(!call.contains("zeta"), "{call}");
+        }
+    }
+
+    // ---- staleness ----
+
+    #[test]
+    fn a_freshly_built_script_artifact_is_current() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+
+        assert!(stale(&project, &[path]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_edited_script_source_is_stale_and_names_that_input() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+
+        std::fs::write(
+            project
+                .package_scripts_dir("fire_nova")
+                .join("ember_echo.ts"),
+            "// @event on_death\n// @id 100200\n",
+        )
+        .unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("Runtime Script sources"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_edited_toolchain_is_stale_and_an_installed_node_modules_is_not() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+
+        // An install under the toolchain is not an input: `bun.lock` is the pin for what it holds.
+        let modules = project.runtime_scripts_dir().join("node_modules/whatever");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(modules.join("index.js"), "module.exports = {};\n").unwrap();
+        assert!(stale(&project, std::slice::from_ref(&path))
+            .unwrap()
+            .is_empty());
+
+        std::fs::write(project.script_builder_file(), "// a different builder\n").unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("toolchain"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_hand_edited_artifact_is_stale() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+        std::fs::write(&path, "{\"kind\":\"script\",\"edited\":true}\n").unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("hand-edited"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_missing_sidecar_is_stale_and_names_the_rebuild_command() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "ember_echo.ts");
+        let path = with_built_artifact(&project, "fire_nova");
+        std::fs::remove_file(path.with_file_name(identity::SCRIPT_IDENTITY_FILE)).unwrap();
+
+        let problems = stale(&project, &[path]).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("lyracore packages build"),
+            "{problems:?}"
+        );
     }
 }

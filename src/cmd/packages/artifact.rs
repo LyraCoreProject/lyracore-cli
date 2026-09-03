@@ -141,6 +141,18 @@ pub struct Enabled {
     pub scripts: Vec<ScriptArtifact>,
 }
 
+impl Enabled {
+    /// The Script Artifact files, for the steps that hand a path to a subprocess or a sidecar
+    /// rather than reading the parsed artifact.
+    #[must_use]
+    pub fn script_paths(&self) -> Vec<PathBuf> {
+        self.scripts
+            .iter()
+            .map(|artifact| artifact.path.clone())
+            .collect()
+    }
+}
+
 /// Every enabled Package's artifacts, ordered by Package folder then file name so the same tree
 /// always produces the same plan.
 ///
