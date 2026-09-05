@@ -162,6 +162,23 @@ pub fn read_enabled(root: &Path) -> Result<Enabled> {
     read_enabled_except(root, &[])
 }
 
+/// One candidate Package's generated artifacts.
+///
+/// Trust review has a Package directory rather than an enabled Package Inventory. It still uses
+/// this reader so review, check, and replay classify and validate generated artifacts alike.
+pub fn read_package(package: &Path) -> Result<Enabled> {
+    if !package.is_dir() {
+        return Err(Error::Usage(format!(
+            "Package `{}` is not a directory.",
+            package.display()
+        )));
+    }
+
+    let mut enabled = Enabled::default();
+    read_package_into(package, &[], &mut enabled)?;
+    Ok(enabled)
+}
+
 /// The same walk, passing over files the caller is about to retire.
 ///
 /// `packages build` holds a Package's prebuilt Script Artifact on disk until its compiled
@@ -184,43 +201,48 @@ pub fn read_enabled_except(root: &Path, retiring: &[PathBuf]) -> Result<Enabled>
 
     let mut enabled = Enabled::default();
     for package in packages {
-        let generated = package.join(GENERATED_DIR);
-        if !generated.is_dir() {
-            continue;
-        }
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&generated)?
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-            .filter(|path| !retiring.contains(path))
-            .collect();
-        files.sort();
+        read_package_into(&package, retiring, &mut enabled)?;
+    }
+    Ok(enabled)
+}
 
-        for path in files {
-            let text = std::fs::read_to_string(&path)?;
-            if script::is_script_artifact(&text) {
-                let artifact = script::parse(&text, &path)?;
-                if let Some(seen) = enabled
-                    .scripts
-                    .iter()
-                    .find(|a| a.package == artifact.package)
-                {
-                    return Err(named_twice(&artifact.package, &seen.path, &path));
-                }
-                enabled.scripts.push(artifact);
-                continue;
-            }
-            let artifact = parse(&text, &path)?;
+fn read_package_into(package: &Path, retiring: &[PathBuf], enabled: &mut Enabled) -> Result<()> {
+    let generated = package.join(GENERATED_DIR);
+    if !generated.is_dir() {
+        return Ok(());
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&generated)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| !retiring.contains(path))
+        .collect();
+    files.sort();
+
+    for path in files {
+        let text = std::fs::read_to_string(&path)?;
+        if script::is_script_artifact(&text) {
+            let artifact = script::parse(&text, &path)?;
             if let Some(seen) = enabled
-                .deltas
+                .scripts
                 .iter()
                 .find(|a| a.package == artifact.package)
             {
                 return Err(named_twice(&artifact.package, &seen.path, &path));
             }
-            enabled.deltas.push(artifact);
+            enabled.scripts.push(artifact);
+            continue;
         }
+        let artifact = parse(&text, &path)?;
+        if let Some(seen) = enabled
+            .deltas
+            .iter()
+            .find(|a| a.package == artifact.package)
+        {
+            return Err(named_twice(&artifact.package, &seen.path, &path));
+        }
+        enabled.deltas.push(artifact);
     }
-    Ok(enabled)
+    Ok(())
 }
 
 /// The refusal for a Package that two artifacts of one kind both name. The module refuses a plan
