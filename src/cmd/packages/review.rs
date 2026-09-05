@@ -15,17 +15,18 @@
 //! the report says so.
 //!
 //! Runtime Scripts ARE counted: a Package ships its `scripts/` sources inside its own folder, and
-//! that Lua runs on the realm once the Package is built. Datascripts are not — they live in
-//! `datascripts/`, outside any Package folder, so a candidate cannot carry one. That row still
-//! prints, as an explicit "none detected", so the review's silence about them is a deliberate
-//! statement and not an oversight the reader has to notice.
+//! that Lua runs on the realm once the Package is built. Package Deltas are counted from
+//! `data/.generated/` with the same reader that validates them for replay.
 //!
 //! DUPLICATION, ON PURPOSE: `strip_comments_and_strings` and the three marker matchers are a port
 //! of `module/build.rs`, which lives in the server repository and is not a dependency of this CLI.
 //! The tests below pin the behaviour the port exists for — an inert commented-out marker, and
 //! marker syntax quoted inside a doc example.
 
-use super::tree::{self, EntryKind};
+use super::{
+    artifact,
+    tree::{self, EntryKind},
+};
 use crate::{Error, Result};
 use std::path::Path;
 
@@ -70,6 +71,8 @@ pub struct TrustReview {
     pub client_overrides: usize,
     /// Runtime Script sources under `scripts/` — Lua this Package would run on the realm.
     pub runtime_scripts: Vec<String>,
+    /// Generated Package Deltas grouped by Import Family.
+    pub package_deltas: Vec<(String, usize)>,
     pub rust_files: usize,
     pub rust_lines: usize,
 }
@@ -144,6 +147,13 @@ impl TrustReview {
             .collect();
         review.runtime_scripts.sort();
 
+        let generated = artifact::read_package(package_dir)?;
+        if !generated.deltas.is_empty() {
+            review
+                .package_deltas
+                .push((artifact::SPELL_FAMILY.to_string(), generated.deltas.len()));
+        }
+
         Ok(review)
     }
 
@@ -198,6 +208,7 @@ impl TrustReview {
             && self.addons.is_empty()
             && self.client_overrides == 0
             && self.runtime_scripts.is_empty()
+            && self.package_deltas.is_empty()
     }
 
     /// The full block `packages add` prints before it asks.
@@ -226,9 +237,7 @@ impl TrustReview {
         ));
         out.push_str(&row("addons", self.addons.len(), &self.addons));
         out.push_str(&row("client overrides", self.client_overrides, &[]));
-        out.push_str(
-            "  datascripts        none detected (nothing in this checkout reads them yet)\n",
-        );
+        out.push_str(&package_delta_row(&self.package_deltas));
         out.push_str(&row(
             "runtime scripts",
             self.runtime_scripts.len(),
@@ -250,6 +259,11 @@ impl TrustReview {
     /// The one-line content-kind summary `packages list` shows per Package.
     pub fn kinds_summary(&self) -> String {
         let mut parts = Vec::new();
+        let package_delta_count: usize = self.package_deltas.iter().map(|(_, count)| count).sum();
+        if package_delta_count > 0 {
+            let suffix = if package_delta_count == 1 { "" } else { "s" };
+            parts.push(format!("{package_delta_count} package delta{suffix}"));
+        }
         for (label, count) in [
             ("tables", self.tables.len()),
             ("reducers", self.reducers.len()),
@@ -273,6 +287,18 @@ impl TrustReview {
             parts.join(", ")
         }
     }
+}
+
+fn package_delta_row(families: &[(String, usize)]) -> String {
+    if families.is_empty() {
+        return "  package deltas     none\n".to_string();
+    }
+    let count = families.iter().map(|(_, count)| count).sum();
+    let details: Vec<String> = families
+        .iter()
+        .map(|(family, count)| format!("{family}: {count}"))
+        .collect();
+    row("package deltas", count, &details)
 }
 
 fn row(label: &str, count: usize, names: &[String]) -> String {
@@ -581,6 +607,12 @@ mod tests {
         tmp
     }
 
+    fn spell_delta(package: &str) -> String {
+        format!(
+            r#"{{"version":1,"package":"{package}","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","claims":[{{"table":"game_spell","key":{{"spell_id":133}},"operation":"update","fields":{{"cooldown_ms":{{"type":"u32","value":1500}}}}}}]}}"#
+        )
+    }
+
     #[test]
     fn the_review_names_what_the_build_would_register() {
         let tmp = package(&[(
@@ -717,9 +749,8 @@ mod tests {
 
         assert!(text.contains("TRUSTED"), "{text}");
         assert!(text.contains("not a security guarantee"), "{text}");
-        // Datascripts, the one kind a candidate cannot carry, are stated rather than omitted.
-        assert!(text.contains("datascripts"), "{text}");
-        assert!(text.contains("none detected"), "{text}");
+        assert!(text.contains("package deltas     none"), "{text}");
+        assert!(!text.contains("nothing in this checkout reads"), "{text}");
         assert!(text.contains("runtime scripts"), "{text}");
         assert!(review.registers_nothing(), "{review:?}");
     }
@@ -744,6 +775,57 @@ mod tests {
             review.kinds_summary().contains("2 runtime scripts"),
             "{review:?}"
         );
+    }
+
+    #[test]
+    fn generated_package_deltas_are_counted_by_import_family() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("candidate");
+        let delta_path = candidate.join("data/.generated/spell.json");
+        std::fs::create_dir_all(delta_path.parent().unwrap()).unwrap();
+        std::fs::write(delta_path, spell_delta("example.fire_nova")).unwrap();
+        std::fs::write(
+            candidate.join("data/.generated/README.md"),
+            "generated artifacts live here\n",
+        )
+        .unwrap();
+        let sibling = tmp.path().join("unrelated/data/.generated");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("broken.json"), r#"{"version":9}"#).unwrap();
+
+        let review = TrustReview::scan(&candidate).unwrap();
+
+        assert_eq!(review.package_deltas, [("spell".to_string(), 1)]);
+        assert!(!review.registers_nothing(), "{review:?}");
+        let text = review.render(&candidate);
+        assert!(text.contains("package deltas"), "{text}");
+        assert!(text.contains("1  spell: 1"), "{text}");
+        assert!(
+            review.kinds_summary().contains("1 package delta"),
+            "{review:?}"
+        );
+    }
+
+    #[test]
+    fn package_delta_counts_name_each_import_family() {
+        let review = TrustReview {
+            package_deltas: vec![("creature".to_string(), 2), ("spell".to_string(), 1)],
+            ..TrustReview::default()
+        };
+
+        let text = review.render(Path::new("candidate"));
+
+        assert!(text.contains("package deltas     3"), "{text}");
+        assert!(text.contains("creature: 2, spell: 1"), "{text}");
+    }
+
+    #[test]
+    fn a_malformed_generated_artifact_is_refused_by_the_package_delta_reader() {
+        let tmp = package(&[("data/.generated/broken.json", r#"{"version":9}"#)]);
+
+        let error = TrustReview::scan(tmp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("broken.json"), "{error}");
     }
 
     #[test]
