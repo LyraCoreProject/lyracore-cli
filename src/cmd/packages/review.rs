@@ -16,7 +16,7 @@
 //!
 //! Runtime Scripts ARE counted: a Package ships its `scripts/` sources inside its own folder, and
 //! that Lua runs on the realm once the Package is built. Package Deltas are counted from
-//! `data/.generated/` with the same reader that validates them for replay.
+//! `data/.generated/`; their claim tables decide which Import Families the review names.
 //!
 //! DUPLICATION, ON PURPOSE: `strip_comments_and_strings` and the three marker matchers are a port
 //! of `module/build.rs`, which lives in the server repository and is not a dependency of this CLI.
@@ -147,12 +147,7 @@ impl TrustReview {
             .collect();
         review.runtime_scripts.sort();
 
-        let generated = artifact::read_package(package_dir)?;
-        if !generated.deltas.is_empty() {
-            review
-                .package_deltas
-                .push((artifact::SPELL_FAMILY.to_string(), generated.deltas.len()));
-        }
+        review.package_deltas = artifact::summarize_package_deltas(package_dir)?;
 
         Ok(review)
     }
@@ -613,6 +608,12 @@ mod tests {
         )
     }
 
+    fn mixed_family_delta(package: &str) -> String {
+        format!(
+            r#"{{"version":1,"package":"{package}","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","claims":[{{"table":"game_spell","key":{{"spell_id":133}},"operation":"update","fields":{{"cooldown_ms":{{"type":"u32","value":1500}}}}}},{{"table":"game_item_template","key":{{"entry":25}},"operation":"update","fields":{{"name":{{"type":"string","value":"Worn Shortsword"}}}}}}]}}"#
+        )
+    }
+
     #[test]
     fn the_review_names_what_the_build_would_register() {
         let tmp = package(&[(
@@ -807,16 +808,22 @@ mod tests {
     }
 
     #[test]
-    fn package_delta_counts_name_each_import_family() {
-        let review = TrustReview {
-            package_deltas: vec![("creature".to_string(), 2), ("spell".to_string(), 1)],
-            ..TrustReview::default()
-        };
+    fn a_mixed_package_delta_is_counted_in_each_import_family() {
+        let tmp = package(&[(
+            "data/.generated/catalogues.json",
+            &mixed_family_delta("example.mixed"),
+        )]);
 
-        let text = review.render(Path::new("candidate"));
+        let review = TrustReview::scan(tmp.path()).unwrap();
 
-        assert!(text.contains("package deltas     3"), "{text}");
-        assert!(text.contains("creature: 2, spell: 1"), "{text}");
+        let text = review.render(tmp.path());
+
+        assert_eq!(
+            review.package_deltas,
+            [("items".to_string(), 1), ("spell".to_string(), 1)]
+        );
+        assert!(text.contains("package deltas     2"), "{text}");
+        assert!(text.contains("items: 1, spell: 1"), "{text}");
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //! tests are taken verbatim from the engine crate's own canonical-form tests, so a drift shows up
 //! as a failing test rather than as a resume that silently never skips.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -162,11 +162,11 @@ pub fn read_enabled(root: &Path) -> Result<Enabled> {
     read_enabled_except(root, &[])
 }
 
-/// One candidate Package's generated artifacts.
+/// Count one candidate Package's Deltas in every Import Family their claims name.
 ///
-/// Trust review has a Package directory rather than an enabled Package Inventory. It still uses
-/// this reader so review, check, and replay classify and validate generated artifacts alike.
-pub fn read_package(package: &Path) -> Result<Enabled> {
+/// This is an inventory for the trust review. It reads the Package Delta envelope and table names,
+/// while the core parser remains the authority for keys, columns, types, and claim policy.
+pub fn summarize_package_deltas(package: &Path) -> Result<Vec<(String, usize)>> {
     if !package.is_dir() {
         return Err(Error::Usage(format!(
             "Package `{}` is not a directory.",
@@ -174,9 +174,26 @@ pub fn read_package(package: &Path) -> Result<Enabled> {
         )));
     }
 
-    let mut enabled = Enabled::default();
-    read_package_into(package, &[], &mut enabled)?;
-    Ok(enabled)
+    let mut counts = BTreeMap::<&'static str, usize>::new();
+    let mut seen = BTreeMap::<String, PathBuf>::new();
+    for path in generated_artifact_paths(package, &[])? {
+        let text = std::fs::read_to_string(&path)?;
+        if script::is_script_artifact(&text) {
+            continue;
+        }
+        let (package_name, families) = summarize_delta(&text, &path)?;
+        if let Some(first) = seen.insert(package_name.clone(), path.clone()) {
+            return Err(named_twice(&package_name, &first, &path));
+        }
+        for family in families {
+            *counts.entry(family).or_default() += 1;
+        }
+    }
+
+    Ok(counts
+        .into_iter()
+        .map(|(family, count)| (family.to_string(), count))
+        .collect())
 }
 
 /// The same walk, passing over files the caller is about to retire.
@@ -207,18 +224,7 @@ pub fn read_enabled_except(root: &Path, retiring: &[PathBuf]) -> Result<Enabled>
 }
 
 fn read_package_into(package: &Path, retiring: &[PathBuf], enabled: &mut Enabled) -> Result<()> {
-    let generated = package.join(GENERATED_DIR);
-    if !generated.is_dir() {
-        return Ok(());
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&generated)?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .filter(|path| !retiring.contains(path))
-        .collect();
-    files.sort();
-
-    for path in files {
+    for path in generated_artifact_paths(package, retiring)? {
         let text = std::fs::read_to_string(&path)?;
         if script::is_script_artifact(&text) {
             let artifact = script::parse(&text, &path)?;
@@ -245,15 +251,92 @@ fn read_package_into(package: &Path, retiring: &[PathBuf], enabled: &mut Enabled
     Ok(())
 }
 
+fn generated_artifact_paths(package: &Path, retiring: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let generated = package.join(GENERATED_DIR);
+    if !generated.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&generated)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()?;
+    files.retain(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "json")
+            && !retiring.contains(path)
+    });
+    files.sort();
+    Ok(files)
+}
+
 /// The refusal for a Package that two artifacts of one kind both name. The module refuses a plan
 /// naming one Package twice; refusing here names the two files.
 fn named_twice(package: &str, first: &Path, second: &Path) -> Error {
     Error::Usage(format!(
-        "package `{package}` appears twice in the enabled Package Inventory:\n  {}\n  {}\nThe \
+        "package `{package}` appears twice in the generated Package artifacts:\n  {}\n  {}\nThe \
          module refuses a plan that names one Package twice, so nothing was applied.",
         first.display(),
         second.display()
     ))
+}
+
+fn summarize_delta(text: &str, path: &Path) -> Result<(String, BTreeSet<&'static str>)> {
+    let refuse = |what: String| Error::Usage(format!("{}: {what}", path.display()));
+    let (package, _, claims) = parse_envelope(text, path)?;
+
+    let mut families = BTreeSet::new();
+    for claim in &claims {
+        let table = claim
+            .as_object()
+            .and_then(|claim| claim.get("table"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| refuse("a claim needs a `table`".to_string()))?;
+        let family = family_for_table(table)
+            .ok_or_else(|| refuse(format!("unknown claim table `{table}`")))?;
+        families.insert(family);
+    }
+    Ok((package, families))
+}
+
+/// The core Package Delta schema's table ownership, reduced to the family name this review needs.
+fn family_for_table(table: &str) -> Option<&'static str> {
+    match table {
+        "game_spell" | "game_spell_effect" => Some("spell"),
+        "game_item_template" => Some("items"),
+        "game_quest_template"
+        | "game_quest_text"
+        | "game_quest_objective"
+        | "game_quest_cast_objective"
+        | "game_quest_reward_item"
+        | "game_quest_reward_choice" => Some("quests"),
+        "game_pickpocket_loot"
+        | "game_gameobject_loot"
+        | "game_skinning_loot"
+        | "game_fishing_loot" => Some("loot"),
+        "game_creature_cast" | "game_creature_spell" => Some("casts"),
+        "game_trainer_spell" => Some("trainers"),
+        "game_gossip_menu"
+        | "game_gossip_menu_profile"
+        | "game_gossip_menu_profile_option"
+        | "game_gossip_option"
+        | "game_npc_text"
+        | "game_npc_text_slot" => Some("gossip"),
+        "game_class_level_stats"
+        | "game_level_stats"
+        | "game_start_position"
+        | "game_graveyard_zone"
+        | "game_areatrigger_teleport"
+        | "game_createinfo_spell"
+        | "game_createinfo_action" => Some("globals"),
+        "game_spell_chain" | "game_spell_learn" | "game_spell_proc_event" => Some("spellmeta"),
+        "game_creature_template" | "game_creature_spawn" => Some("creatures"),
+        "game_gameobject_template" | "game_gameobject_trap" | "game_gameobject" => {
+            Some("gameobjects")
+        }
+        "game_creature_ai_broadcast_text"
+        | "game_creature_ai_summon"
+        | "game_quest_event_requirement" => Some("creature-ai"),
+        _ => None,
+    }
 }
 
 /// Every disagreement between these Packages, in canonical order.
@@ -309,7 +392,33 @@ pub fn conflicts(artifacts: &[Artifact]) -> Vec<String> {
 /// is to open it.
 fn parse(text: &str, path: &Path) -> Result<Artifact> {
     let refuse = |what: String| Error::Usage(format!("{}: {what}", path.display()));
+    let (package, source_hash, raw_claims) = parse_envelope(text, path)?;
 
+    let mut claims: Vec<Claim> = Vec::with_capacity(raw_claims.len());
+    for claim in &raw_claims {
+        claims.push(parse_claim(claim).map_err(refuse)?);
+    }
+    // The canonical form orders claims by key alone, and stably: two claims on one row keep the
+    // order they were written in.
+    claims.sort_by_key(|claim| claim.key);
+
+    let inserted_rows = claims.iter().filter(|c| c.inserts).count() as u64;
+    let artifact = Artifact {
+        artifact_hash: blake3::hash(canonical(&package, &source_hash, &claims).as_bytes())
+            .to_hex()
+            .to_string(),
+        package,
+        path: path.to_path_buf(),
+        source_hash,
+        updated_rows: claims.len() as u64 - inserted_rows,
+        inserted_rows,
+        claims,
+    };
+    Ok(artifact)
+}
+
+fn parse_envelope(text: &str, path: &Path) -> Result<(String, String, Vec<serde_json::Value>)> {
+    let refuse = |what: String| Error::Usage(format!("{}: {what}", path.display()));
     let root: serde_json::Value =
         serde_json::from_str(text).map_err(|e| refuse(format!("not valid JSON ({e})")))?;
     let object = root
@@ -335,28 +444,7 @@ fn parse(text: &str, path: &Path) -> Result<Artifact> {
         .get("claims")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| refuse("no `claims` array".to_string()))?;
-
-    let mut claims: Vec<Claim> = Vec::with_capacity(raw_claims.len());
-    for claim in raw_claims {
-        claims.push(parse_claim(claim).map_err(refuse)?);
-    }
-    // The canonical form orders claims by key alone, and stably: two claims on one row keep the
-    // order they were written in.
-    claims.sort_by_key(|claim| claim.key);
-
-    let inserted_rows = claims.iter().filter(|c| c.inserts).count() as u64;
-    let artifact = Artifact {
-        artifact_hash: blake3::hash(canonical(&package, &source_hash, &claims).as_bytes())
-            .to_hex()
-            .to_string(),
-        package,
-        path: path.to_path_buf(),
-        source_hash,
-        updated_rows: claims.len() as u64 - inserted_rows,
-        inserted_rows,
-        claims,
-    };
-    Ok(artifact)
+    Ok((package, source_hash, raw_claims.clone()))
 }
 
 fn parse_claim(value: &serde_json::Value) -> std::result::Result<Claim, String> {
@@ -820,6 +908,29 @@ mod tests {
 
         assert!(found.deltas.is_empty());
         assert_eq!(found.scripts.len(), 1);
+        assert!(summarize_package_deltas(&tree.root().join("bolt"))
+            .expect("the review summary succeeds")
+            .is_empty());
+    }
+
+    #[test]
+    fn every_current_import_family_has_a_review_classification() {
+        for (table, family) in [
+            ("game_spell", "spell"),
+            ("game_item_template", "items"),
+            ("game_quest_template", "quests"),
+            ("game_pickpocket_loot", "loot"),
+            ("game_creature_cast", "casts"),
+            ("game_trainer_spell", "trainers"),
+            ("game_gossip_menu", "gossip"),
+            ("game_class_level_stats", "globals"),
+            ("game_spell_chain", "spellmeta"),
+            ("game_creature_template", "creatures"),
+            ("game_gameobject_template", "gameobjects"),
+            ("game_creature_ai_broadcast_text", "creature-ai"),
+        ] {
+            assert_eq!(family_for_table(table), Some(family), "{table}");
+        }
     }
 
     #[test]

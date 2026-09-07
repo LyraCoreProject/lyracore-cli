@@ -1008,6 +1008,7 @@ fn blank_as_unrecorded(value: &str) -> &str {
 pub(super) mod tests {
     use super::*;
     use crate::proc::fake::{FakeStack, FAKE_RUST_VERSION, FAKE_SPACETIME_VERSION};
+    use std::cell::Cell;
     use tempfile::TempDir;
 
     /// A checkout `preflight` passes in: the same fixture its own tests use, so an `add` test
@@ -1056,6 +1057,17 @@ pub(super) mod tests {
     impl Prompt for Answer {
         fn ask(&self, _question: &str) -> Result<String> {
             Ok(self.0.to_string())
+        }
+    }
+
+    struct RecordingAnswer {
+        asked: Cell<bool>,
+    }
+
+    impl Prompt for RecordingAnswer {
+        fn ask(&self, _question: &str) -> Result<String> {
+            self.asked.set(true);
+            Ok("no".to_string())
         }
     }
 
@@ -1186,6 +1198,38 @@ pub(super) mod tests {
             assert!(!call.contains("spacetime publish"), "{call}");
             assert!(!call.contains("--pack-client"), "{call}");
         }
+    }
+
+    #[test]
+    fn a_mixed_family_package_delta_reaches_consent_after_the_trust_review() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+        let generated = source.join("data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(
+            generated.join("catalogues.json"),
+            r#"{"version":1,"package":"greeter","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","claims":[{"table":"game_spell","key":{"spell_id":133},"operation":"update","fields":{"cooldown_ms":{"type":"u32","value":1500}}},{"table":"game_item_template","key":{"entry":25},"operation":"update","fields":{"name":{"type":"string","value":"Worn Shortsword"}}}]}"#,
+        )
+        .unwrap();
+        let prompt = RecordingAnswer {
+            asked: Cell::new(false),
+        };
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &prompt,
+            source.to_str().unwrap(),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            prompt.asked.get(),
+            "the mixed Package Delta must reach consent: {error}"
+        );
+        assert!(!project.packages_dir().join("greeter").exists());
     }
 
     #[test]
