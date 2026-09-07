@@ -193,7 +193,12 @@ pub fn summarize_package_artifacts(package: &Path) -> Result<ReviewArtifacts> {
     let mut seen_deltas = BTreeMap::<String, PathBuf>::new();
     let mut seen_scripts = BTreeMap::<String, PathBuf>::new();
     for path in generated_artifact_paths(package, &[])? {
-        let text = std::fs::read_to_string(&path)?;
+        let text = std::fs::read_to_string(&path).map_err(|error| {
+            Error::Usage(format!(
+                "{}: cannot read generated artifact as UTF-8 ({error})",
+                path.display()
+            ))
+        })?;
         if script::is_script_artifact(&text) {
             let artifact = script::parse(&text, &path)?;
             if let Some(first) = seen_scripts.insert(artifact.package.clone(), path.clone()) {

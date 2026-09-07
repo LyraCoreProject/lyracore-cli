@@ -885,6 +885,20 @@ mod tests {
     }
 
     #[test]
+    fn a_non_utf8_generated_artifact_refusal_names_its_file() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("candidate");
+        let artifact = candidate.join("data/.generated/non-utf8.json");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, [0xff]).unwrap();
+
+        let error = TrustReview::scan(&candidate).unwrap_err();
+
+        assert!(error.to_string().contains("non-utf8.json"), "{error}");
+        assert!(error.to_string().contains("UTF-8"), "{error}");
+    }
+
+    #[test]
     fn the_scan_is_deterministic_over_the_same_tree() {
         let tmp = package(&[
             ("src/mod.rs", "pub mod a;\npub mod b;\n"),
