@@ -333,18 +333,20 @@ reconciliation is one job, so the verb owns the git steps too. In order:
 2. **The same checkout update `update` does.** Fetch `origin`, refuse over tracked local edits, and
    move to `origin/main` with `git reset --hard`. Tracked local edits refuse *everything*, the
    service change included.
-3. **Host prerequisites.** The unit's `User=` account, its `ExecStart` binary, its `--data-dir`, and
-   the directory holding its `StandardError=append:` log. Each missing one is a refusal naming the
-   command that fixes it. None of them is created for you.
+3. **Host prerequisites.** `busctl` with JSON output, the unit's `User=` account, its `ExecStart`
+   binary, its `--data-dir`, and the directory holding its `StandardError=append:` log. Each missing
+   one is a refusal before the host changes. None of them is created for you.
 4. **A conflicting service.** Every active unit whose `ExecStart` or `WorkingDirectory` claims the
    same data directory or listen address. A hand-rolled legacy `spacetimedb.service` is named and
    refused, never migrated and never stopped on your behalf, so two nodes cannot race for one port
    and one data directory.
 5. **The install.** `install -o root -g root -m 0644` into `/etc/systemd/system/`, then
    `systemctl daemon-reload`, `enable`, `restart`.
-6. **The verification.** `systemctl show` must report `ActiveState=active` plus the `LimitNOFILE`
-   and `StandardError` the tracked unit declares. A node that came back with the inherited
-   1024-descriptor ceiling fails here instead of passing as reconciled.
+6. **The verification.** `systemctl show` must report `ActiveState=active` plus the `LimitNOFILE` and
+   `StandardError` the tracked unit declares. The typed `ExecStart` D-Bus property must match the
+   tracked command, including each argument boundary. If the command differs, the refusal also names
+   the applicable systemd drop-ins. A node that came back with the inherited 1024-descriptor ceiling
+   fails here instead of passing as reconciled.
 
 Every expected value is read out of the tracked unit rather than duplicated in this CLI, so it
 cannot certify a host against a contract the checkout no longer ships. The node's persistent data

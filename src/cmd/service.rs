@@ -13,9 +13,9 @@
 //!
 //! Two rules shape everything below. Every step goes through [`ProcessRunner`], so the whole plan
 //! is an ordered, assertable list of commands rather than side effects on a machine. And the
-//! service contract it verifies — descriptor limit, stderr destination, data directory, listen
-//! address — is READ OUT of the tracked unit, never duplicated here, so this CLI cannot claim a
-//! host is reconciled against a contract the checkout no longer ships.
+//! service contract it verifies — start command, descriptor limit, stderr destination, data
+//! directory, listen address — is READ OUT of the tracked unit, never duplicated here, so this CLI
+//! cannot claim a host is reconciled against a contract the checkout no longer ships.
 //!
 //! It manages the supervisor only. The persistent database directory is checked for existence and
 //! otherwise never touched: no create, no move, no delete.
@@ -127,18 +127,42 @@ fn reconcile_unit(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result
         })?;
 
     verify(&unit, &contract, runner)?;
-    // Names the three properties `verify` actually read back, rather than claiming the whole
-    // contract: a drop-in under /etc/systemd/system/<unit>.d/ can still override ExecStart, and
-    // this command does not read that back today.
     println!(
-        "{unit} is active, with the descriptor limit and stderr destination the tracked unit \
-         declares."
+        "{unit} is active, with the start command, descriptor limit and stderr destination the \
+         tracked unit declares."
     );
     Ok(())
 }
 
 fn systemctl() -> CommandSpec {
     CommandSpec::new("systemctl").arg("--no-pager")
+}
+
+fn busctl_exec_start(unit: &str) -> CommandSpec {
+    CommandSpec::new("busctl")
+        .arg("--json=short")
+        .arg("get-property")
+        .arg("org.freedesktop.systemd1")
+        .arg(systemd_unit_object_path(unit))
+        .arg("org.freedesktop.systemd1.Service")
+        .arg("ExecStart")
+}
+
+/// systemd maps a unit name to its D-Bus object with `bus_label_escape`: ASCII letters and
+/// non-leading digits stay as-is, and every other byte becomes an underscore plus two hex digits.
+fn systemd_unit_object_path(unit: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut path = String::from("/org/freedesktop/systemd1/unit/");
+    for (index, byte) in unit.bytes().enumerate() {
+        if byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit()) {
+            path.push(char::from(byte));
+        } else {
+            path.push('_');
+            path.push(char::from(HEX[usize::from(byte >> 4)]));
+            path.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    path
 }
 
 /// The service contract, as the tracked unit states it.
@@ -154,9 +178,13 @@ struct UnitContract {
 impl UnitContract {
     fn parse(text: &str) -> Result<Self> {
         let mut contract = UnitContract::default();
-        for line in text.lines() {
+        for line in logical_lines(text) {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with(';')
+                || line.starts_with('[')
+            {
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else {
@@ -179,6 +207,7 @@ impl UnitContract {
                 ProjectLayout::STANDALONE_UNIT
             )));
         }
+        tracked_exec_start(&contract.exec_start)?;
         Ok(contract)
     }
 
@@ -215,12 +244,116 @@ impl UnitContract {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ExecCommand {
+    path: String,
+    argv: Vec<String>,
+    ignore_errors: bool,
+}
+
+impl ExecCommand {
+    fn describe(&self) -> String {
+        format!(
+            "path={} argv[]={:?}; ignore_errors={}",
+            self.path,
+            self.argv,
+            if self.ignore_errors { "yes" } else { "no" }
+        )
+    }
+}
+
+/// Parse the subset of ExecStart syntax used by the tracked service: plain whitespace-separated
+/// words. Refusing quoted, escaped, expanded, or prefixed commands avoids implementing systemd's
+/// full command-line grammar here.
+fn tracked_exec_start(value: &str) -> Result<ExecCommand> {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\'' | '"' | '\\' | '$' | '%' | ';'))
+    {
+        return Err(Error::PrerequisiteMissing(format!(
+            "the tracked {} uses ExecStart quoting, escaping, expansion, or multiple commands that \
+             `service reconcile` cannot compare safely. Use plain arguments in the tracked unit.",
+            ProjectLayout::STANDALONE_UNIT
+        )));
+    }
+    let argv: Vec<String> = value.split_whitespace().map(str::to_string).collect();
+    let Some(path) = argv.first() else {
+        return Err(Error::PrerequisiteMissing(format!(
+            "the tracked {} declares no ExecStart, so there is no standalone binary, data \
+             directory or listen address to reconcile against.",
+            ProjectLayout::STANDALONE_UNIT
+        )));
+    };
+    if !path.starts_with('/') {
+        return Err(Error::PrerequisiteMissing(format!(
+            "the tracked {} uses an ExecStart command prefix or non-absolute executable that \
+             `service reconcile` cannot compare safely. Use an absolute executable path.",
+            ProjectLayout::STANDALONE_UNIT
+        )));
+    }
+    Ok(ExecCommand {
+        path: path.clone(),
+        argv,
+        ignore_errors: false,
+    })
+}
+
+/// Join physical lines the way systemd's configuration parser does before it reads directives.
+/// An odd run of trailing backslashes continues the line; the last backslash becomes a space.
+/// Comment lines are discarded before continuation handling, so a continued value resumes after
+/// an intervening `#` or `;` comment.
+fn logical_lines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut continued = String::new();
+
+    for physical in text.lines() {
+        let leading_trimmed = physical.trim_start();
+        if leading_trimmed.starts_with('#') || leading_trimmed.starts_with(';') {
+            continue;
+        }
+
+        continued.push_str(physical);
+        let trailing_backslashes = physical
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        if trailing_backslashes % 2 == 1 {
+            continued.pop();
+            continued.push(' ');
+            continue;
+        }
+
+        lines.push(std::mem::take(&mut continued));
+    }
+
+    if !continued.is_empty() {
+        lines.push(continued);
+    }
+    lines
+}
+
 /// Everything the unit needs from the host before it can start: the service account, the
 /// standalone binary, the persistent data directory, and the stderr log's directory.
 ///
 /// Each is a refusal, not a repair. Creating a data directory or a service account here would
 /// silently give a node a home the operator never chose.
 fn check_prerequisites(contract: &UnitContract, runner: &dyn ProcessRunner) -> Result<()> {
+    runner
+        .run_and_wait(
+            &CommandSpec::new("busctl")
+                .arg("--json=short")
+                .arg("--version"),
+        )
+        .map_err(|error| {
+            Error::PrerequisiteMissing(format!(
+                "`service reconcile` needs `busctl --json=short` to verify the effective start \
+                 command without losing argument boundaries ({error}). Install a systemd busctl \
+                 build with JSON output support before reconciling the unit."
+            ))
+        })?;
+
     if let Some(user) = &contract.user {
         runner
             .run_and_wait(&CommandSpec::new("id").arg(user))
@@ -376,11 +509,11 @@ fn refuse_conflicting_service(
     Ok(())
 }
 
-/// Read the EFFECTIVE properties back after the restart — the same three the runbook checks.
+/// Read the effective properties back after the restart.
 ///
 /// A successful `systemctl restart` only means systemd accepted the job. A unit that starts and
-/// exits reports `failed` here, and a descriptor limit or stderr destination that did not take
-/// effect is exactly the drift #194 was filed over.
+/// exits reports `failed` here. The start command comes from the loaded unit plus its drop-ins, so
+/// comparing it here catches an override that survived installation and `daemon-reload`.
 fn verify(unit: &str, contract: &UnitContract, runner: &dyn ProcessRunner) -> Result<()> {
     println!("· verifying the effective service contract...");
     let shown = runner.run_and_wait(
@@ -388,6 +521,7 @@ fn verify(unit: &str, contract: &UnitContract, runner: &dyn ProcessRunner) -> Re
             .arg("show")
             .arg(unit)
             .arg("--property=ActiveState")
+            .arg("--property=DropInPaths")
             .arg("--property=LimitNOFILE")
             .arg("--property=StandardError"),
     )?;
@@ -406,6 +540,31 @@ fn verify(unit: &str, contract: &UnitContract, runner: &dyn ProcessRunner) -> Re
             "ActiveState is {} (expected active)",
             other.unwrap_or("unreported")
         )),
+    }
+    let expected_exec_start = tracked_exec_start(&contract.exec_start)
+        .expect("UnitContract::parse accepts only supported ExecStart syntax");
+    // `systemctl show` flattens argv into one string, so a one-argument `"two words"` override
+    // looks identical to two separate arguments. D-Bus keeps the argument array typed.
+    let exec_start_property = runner.run_and_wait(&busctl_exec_start(unit)).map_err(|error| {
+        Error::Process(format!(
+            "{unit} was installed and restarted, but its typed ExecStart property could not be \
+             read through busctl: {error}\nThis host is NOT reconciled. Inspect it with `systemctl status \
+             {unit}` and `journalctl -u {unit} --no-pager -n 100`."
+        ))
+    })?;
+    let actual_exec_start = effective_exec_start(&exec_start_property);
+    if actual_exec_start.as_ref() != Ok(&expected_exec_start) {
+        wrong.push(format!(
+            "ExecStart is {} (the tracked unit requires {})",
+            match &actual_exec_start {
+                Ok(actual) => actual.describe(),
+                Err(reason) => reason.clone(),
+            },
+            expected_exec_start.describe()
+        ));
+        if let Some(paths) = property("DropInPaths").filter(|paths| !paths.trim().is_empty()) {
+            wrong.push(format!("applicable drop-ins: {paths}"));
+        }
     }
     for (name, expected) in [
         ("LimitNOFILE", contract.limit_nofile.as_deref()),
@@ -433,6 +592,56 @@ fn verify(unit: &str, contract: &UnitContract, runner: &dyn ProcessRunner) -> Re
             .collect::<Vec<_>>()
             .join("\n")
     )))
+}
+
+/// Parse busctl's JSON representation of systemd's typed ExecStart D-Bus property. Only the path,
+/// argv array, and ignore flag affect the contract; the remaining fields are runtime status. One
+/// service command is the supported shape for this Type=simple unit.
+fn effective_exec_start(property: &str) -> std::result::Result<ExecCommand, String> {
+    let property: serde_json::Value = serde_json::from_str(property)
+        .map_err(|error| format!("unreadable from systemd D-Bus ({error})"))?;
+    let signature = property
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing a D-Bus type".to_string())?;
+    if signature != "a(sasbttttuii)" {
+        return Err(format!("in unsupported D-Bus type {signature}"));
+    }
+    let commands = property
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "missing the D-Bus command array".to_string())?;
+    if commands.len() != 1 {
+        return Err(format!("{} effective commands", commands.len()));
+    }
+    let command = commands[0]
+        .as_array()
+        .ok_or_else(|| "with an invalid D-Bus command record".to_string())?;
+    let path = command
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "without an executable path".to_string())?;
+    let argv = command
+        .get(1)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "without an argv[] array".to_string())?
+        .iter()
+        .map(|argument| {
+            argument
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "with a non-string argv[] entry".to_string())
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let ignore_errors = command
+        .get(2)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "without an ignore_errors flag".to_string())?;
+    Ok(ExecCommand {
+        path: path.to_string(),
+        argv,
+        ignore_errors,
+    })
 }
 
 #[cfg(test)]
@@ -466,6 +675,40 @@ StandardError=append:/var/log/lyracore/spacetimedb-standalone.log
 WantedBy=multi-user.target
 ";
 
+    const TRACKED_BINARY: &str = "/opt/lyracore/spacetimedb/spacetimedb-standalone";
+    const TRACKED_ARGV: &[&str] = &[
+        TRACKED_BINARY,
+        "start",
+        "--listen-addr",
+        "127.0.0.1:3000",
+        "--data-dir",
+        "/var/lib/lyracore/spacetimedb",
+        "--non-interactive",
+    ];
+    const TRACKED_STDERR: &str = "append:/var/log/lyracore/spacetimedb-standalone.log";
+
+    fn effective_properties(
+        active_state: &str,
+        drop_in_paths: &str,
+        limit_nofile: &str,
+        standard_error: &str,
+    ) -> String {
+        format!(
+            "ActiveState={active_state}\n\
+             DropInPaths={drop_in_paths}\n\
+             LimitNOFILE={limit_nofile}\n\
+             StandardError={standard_error}\n"
+        )
+    }
+
+    fn exec_start_property(path: &str, argv: &[&str]) -> String {
+        serde_json::json!({
+            "type": "a(sasbttttuii)",
+            "data": [[path, argv, false, 0, 0, 0, 0, 0, 0, 0]],
+        })
+        .to_string()
+    }
+
     /// A checkout that tracks the unit, at a root the fake git stacks agree with.
     fn project(tmp: &TempDir) -> ProjectLayout {
         std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
@@ -497,9 +740,11 @@ WantedBy=multi-user.target
             )
             .with_stdout(
                 "--property=ActiveState",
-                "ActiveState=active\n\
-                 LimitNOFILE=524288\n\
-                 StandardError=append:/var/log/lyracore/spacetimedb-standalone.log\n",
+                &effective_properties("active", "", "524288", TRACKED_STDERR),
+            )
+            .with_stdout(
+                "busctl --json=short get-property",
+                &exec_start_property(TRACKED_BINARY, TRACKED_ARGV),
             )
     }
 
@@ -531,6 +776,67 @@ WantedBy=multi-user.target
             contract.log_path(),
             Some("/var/log/lyracore/spacetimedb-standalone.log")
         );
+    }
+
+    #[test]
+    fn continued_directives_parse_like_their_single_line_form() {
+        let single = UnitContract::parse(UNIT_TEXT).unwrap();
+        let continued = UnitContract::parse(
+            r#"[Service]
+Environment=FIRST=one \
+    SECOND=two
+ExecStart=/opt/lyracore/spacetimedb/spacetimedb-standalone start \
+    --listen-addr 127.0.0.1:3000 \
+# Comments do not end the continuation.
+; Neither do semicolon comments.
+    --data-dir /var/lib/lyracore/spacetimedb --non-interactive
+WorkingDirectory=/var/lib/lyracore/spacetimedb
+LimitNOFILE=524288
+StandardError=append:/var/log/lyracore/spacetimedb-standalone.log
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(continued.binary(), single.binary());
+        assert_eq!(continued.data_dir(), single.data_dir());
+        assert_eq!(continued.listen_addr(), single.listen_addr());
+        assert_eq!(
+            tracked_exec_start(&continued.exec_start).unwrap(),
+            tracked_exec_start(&single.exec_start).unwrap()
+        );
+        assert_eq!(continued.limit_nofile, single.limit_nofile);
+        assert_eq!(continued.standard_error, single.standard_error);
+    }
+
+    #[test]
+    fn an_escaped_terminal_backslash_does_not_continue_the_directive() {
+        let contract = UnitContract::parse(
+            r#"[Service]
+Environment=WINDOWS_PATH=C:\\
+ExecStart=/usr/bin/standalone start
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(contract.binary(), "/usr/bin/standalone");
+    }
+
+    #[test]
+    fn an_exec_start_outside_the_supported_source_syntax_is_refused() {
+        for exec_start in [
+            "/usr/bin/standalone --label='two words'",
+            "/usr/bin/standalone $EXTRA",
+            "@/usr/bin/standalone custom-argv-zero",
+        ] {
+            let error = UnitContract::parse(&format!("[Service]\nExecStart={exec_start}\n"))
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("cannot compare safely"),
+                "{exec_start}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -676,6 +982,7 @@ WantedBy=multi-user.target
         expected.extend(git_steps());
         expected.extend([
             "git reset --hard origin/main".to_string(),
+            "busctl --json=short --version".to_string(),
             "id lyracore".to_string(),
             "test -x /opt/lyracore/spacetimedb/spacetimedb-standalone".to_string(),
             "test -d /var/lib/lyracore/spacetimedb".to_string(),
@@ -694,7 +1001,11 @@ WantedBy=multi-user.target
             "systemctl --no-pager enable spacetimedb-standalone.service".to_string(),
             "systemctl --no-pager restart spacetimedb-standalone.service".to_string(),
             "systemctl --no-pager show spacetimedb-standalone.service --property=ActiveState \
-             --property=LimitNOFILE --property=StandardError"
+             --property=DropInPaths --property=LimitNOFILE --property=StandardError"
+                .to_string(),
+            "busctl --json=short get-property org.freedesktop.systemd1 \
+             /org/freedesktop/systemd1/unit/spacetimedb_2dstandalone_2eservice \
+             org.freedesktop.systemd1.Service ExecStart"
                 .to_string(),
         ]);
         assert_eq!(stack.rendered(), expected);
@@ -735,6 +1046,20 @@ WantedBy=multi-user.target
                 stack.rendered()
             );
         }
+    }
+
+    #[test]
+    fn missing_busctl_json_support_is_refused_before_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack = reconcilable_host(ahead_stack())
+            .fail_on("busctl --json=short --version", "unknown option --json");
+
+        let error = reconcile(&project, &stack.runner())
+            .unwrap_err()
+            .to_string();
+
+        assert_refused_before_mutation(&stack, &error, "busctl --json=short");
     }
 
     #[test]
@@ -851,6 +1176,36 @@ WantedBy=multi-user.target
     }
 
     #[test]
+    fn a_continued_tracked_command_still_detects_a_conflicting_active_service() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let continued_exec = ["spacetimedb-standalone start \\", "    --listen-addr"].join("\n");
+        let continued = UNIT_TEXT.replace(
+            "spacetimedb-standalone start --listen-addr",
+            &continued_exec,
+        );
+        std::fs::write(project.standalone_unit(), continued).unwrap();
+        let stack = reconcilable_host(ahead_stack())
+            .with_stdout(
+                "list-units",
+                "stdb-old.service loaded active running node\n",
+            )
+            .with_stdout(
+                "--property=Id",
+                "Id=stdb-old.service\n\
+                 ExecStart={ path=/usr/bin/stdb ; argv[]=/usr/bin/stdb start --listen-addr \
+                 127.0.0.1:3000 --data-dir /srv/stdb ; }\n\
+                 WorkingDirectory=/srv/stdb\n",
+            );
+
+        let error = reconcile(&project, &stack.runner())
+            .unwrap_err()
+            .to_string();
+
+        assert_refused_before_mutation(&stack, &error, "listen address 127.0.0.1:3000");
+    }
+
+    #[test]
     fn an_unrelated_active_service_does_not_block_reconciliation() {
         let tmp = TempDir::new().unwrap();
         let project = project(&tmp);
@@ -905,9 +1260,7 @@ WantedBy=multi-user.target
         let project = project(&tmp);
         let stack = reconcilable_host(ahead_stack()).with_stdout(
             "--property=ActiveState",
-            "ActiveState=failed\n\
-             LimitNOFILE=524288\n\
-             StandardError=append:/var/log/lyracore/spacetimedb-standalone.log\n",
+            &effective_properties("failed", "", "524288", TRACKED_STDERR),
         );
 
         let error = reconcile(&project, &stack.runner())
@@ -919,14 +1272,179 @@ WantedBy=multi-user.target
     }
 
     #[test]
+    fn an_unreadable_typed_command_is_reported_as_unreconciled() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack = reconcilable_host(ahead_stack()).fail_on(
+            "busctl --json=short get-property",
+            "D-Bus property read failed",
+        );
+
+        let error = reconcile(&project, &stack.runner())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("typed ExecStart property"), "{error}");
+        assert!(error.contains("D-Bus property read failed"), "{error}");
+        assert!(error.contains("NOT reconciled"), "{error}");
+    }
+
+    #[test]
+    fn an_effective_command_changed_by_a_drop_in_is_reported_as_unreconciled() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack = reconcilable_host(ahead_stack())
+            .with_stdout(
+                "--property=ActiveState",
+                &effective_properties(
+                    "active",
+                    "/etc/systemd/system/spacetimedb-standalone.service.d/override.conf",
+                    "524288",
+                    TRACKED_STDERR,
+                ),
+            )
+            .with_stdout(
+                "busctl --json=short get-property",
+                &exec_start_property(
+                    TRACKED_BINARY,
+                    &[
+                        TRACKED_BINARY,
+                        "start",
+                        "--listen-addr",
+                        "127.0.0.1:3000",
+                        "--data-dir",
+                        "/srv/other",
+                        "--non-interactive",
+                    ],
+                ),
+            );
+
+        let error = reconcile(&project, &stack.runner())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ExecStart is"), "{error}");
+        assert!(error.contains("/srv/other"), "{error}");
+        assert!(
+            error.contains("/etc/systemd/system/spacetimedb-standalone.service.d/override.conf")
+        );
+        assert!(error.contains("NOT reconciled"), "{error}");
+    }
+
+    #[test]
+    fn an_effective_executable_path_drift_is_reported_even_when_argv_matches() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack = reconcilable_host(ahead_stack())
+            .with_stdout(
+                "--property=ActiveState",
+                &effective_properties(
+                    "active",
+                    "/etc/systemd/system/spacetimedb-standalone.service.d/override.conf",
+                    "524288",
+                    TRACKED_STDERR,
+                ),
+            )
+            .with_stdout(
+                "busctl --json=short get-property",
+                &exec_start_property("/srv/override/spacetimedb-standalone", TRACKED_ARGV),
+            );
+
+        let error = reconcile(&project, &stack.runner())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("path=/srv/override/spacetimedb-standalone"),
+            "{error}"
+        );
+        assert!(error.contains("NOT reconciled"), "{error}");
+    }
+
+    #[test]
+    fn effective_argument_boundaries_are_compared_without_flattening() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack = reconcilable_host(ahead_stack())
+            .with_stdout(
+                "--property=ActiveState",
+                &effective_properties(
+                    "active",
+                    "/etc/systemd/system/spacetimedb-standalone.service.d/override.conf",
+                    "524288",
+                    TRACKED_STDERR,
+                ),
+            )
+            .with_stdout(
+                "busctl --json=short get-property",
+                &exec_start_property(
+                    TRACKED_BINARY,
+                    &[
+                        TRACKED_BINARY,
+                        "start --listen-addr",
+                        "127.0.0.1:3000",
+                        "--data-dir",
+                        "/var/lib/lyracore/spacetimedb",
+                        "--non-interactive",
+                    ],
+                ),
+            );
+
+        let error = reconcile(&project, &stack.runner())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("\"start --listen-addr\""), "{error}");
+        assert!(error.contains("\"start\", \"--listen-addr\""), "{error}");
+        assert!(error.contains("override.conf"), "{error}");
+        assert!(error.contains("NOT reconciled"), "{error}");
+    }
+
+    #[test]
+    fn multiple_effective_start_commands_are_reported_as_unreconciled() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack = reconcilable_host(ahead_stack())
+            .with_stdout(
+                "--property=ActiveState",
+                &effective_properties(
+                    "active",
+                    "/etc/systemd/system/spacetimedb-standalone.service.d/override.conf",
+                    "524288",
+                    TRACKED_STDERR,
+                ),
+            )
+            .with_stdout(
+                "busctl --json=short get-property",
+                &serde_json::json!({
+                    "type": "a(sasbttttuii)",
+                    "data": [
+                        [TRACKED_BINARY, TRACKED_ARGV, false, 0, 0, 0, 0, 0, 0, 0],
+                        ["/usr/bin/extra", ["/usr/bin/extra"], false, 0, 0, 0, 0, 0, 0, 0],
+                    ],
+                })
+                .to_string(),
+            );
+
+        let error = reconcile(&project, &stack.runner())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("ExecStart is 2 effective commands"),
+            "{error}"
+        );
+        assert!(error.contains("override.conf"), "{error}");
+        assert!(error.contains("NOT reconciled"), "{error}");
+    }
+
+    #[test]
     fn the_inherited_1024_descriptor_ceiling_is_reported_as_unreconciled() {
         let tmp = TempDir::new().unwrap();
         let project = project(&tmp);
         let stack = reconcilable_host(ahead_stack()).with_stdout(
             "--property=ActiveState",
-            "ActiveState=active\n\
-             LimitNOFILE=1024\n\
-             StandardError=append:/var/log/lyracore/spacetimedb-standalone.log\n",
+            &effective_properties("active", "", "1024", TRACKED_STDERR),
         );
 
         let error = reconcile(&project, &stack.runner())
@@ -945,7 +1463,7 @@ WantedBy=multi-user.target
         let project = project(&tmp);
         let stack = reconcilable_host(ahead_stack()).with_stdout(
             "--property=ActiveState",
-            "ActiveState=active\nLimitNOFILE=524288\nStandardError=inherit\n",
+            &effective_properties("active", "", "524288", "inherit"),
         );
 
         let error = reconcile(&project, &stack.runner())
