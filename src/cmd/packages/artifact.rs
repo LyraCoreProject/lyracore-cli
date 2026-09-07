@@ -141,6 +141,19 @@ pub struct Enabled {
     pub scripts: Vec<ScriptArtifact>,
 }
 
+/// Generated artifacts relevant to a candidate Package's trust review.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewArtifacts {
+    /// Physical Package Delta files, independent of how many Import Families each one spans.
+    pub package_delta_count: usize,
+    /// Package Delta membership grouped by Import Family.
+    pub package_delta_families: Vec<(String, usize)>,
+    /// Runtime Script names read from Script Artifacts.
+    pub runtime_scripts: Vec<String>,
+    /// Whether the candidate carries a Script Artifact, including an empty one.
+    pub has_script_artifact: bool,
+}
+
 impl Enabled {
     /// The Script Artifact files, for the steps that hand a path to a subprocess or a sidecar
     /// rather than reading the parsed artifact.
@@ -162,11 +175,12 @@ pub fn read_enabled(root: &Path) -> Result<Enabled> {
     read_enabled_except(root, &[])
 }
 
-/// Count one candidate Package's Deltas in every Import Family their claims name.
+/// Summarize one candidate Package's generated artifacts for its trust review.
 ///
 /// This is an inventory for the trust review. It reads the Package Delta envelope and table names,
-/// while the core parser remains the authority for keys, columns, types, and claim policy.
-pub fn summarize_package_deltas(package: &Path) -> Result<Vec<(String, usize)>> {
+/// while the core parser remains the authority for keys, columns, types, and claim policy. Script
+/// Artifacts use their full parser because each Runtime Script is already a supported replay unit.
+pub fn summarize_package_artifacts(package: &Path) -> Result<ReviewArtifacts> {
     if !package.is_dir() {
         return Err(Error::Usage(format!(
             "Package `{}` is not a directory.",
@@ -174,26 +188,39 @@ pub fn summarize_package_deltas(package: &Path) -> Result<Vec<(String, usize)>> 
         )));
     }
 
-    let mut counts = BTreeMap::<&'static str, usize>::new();
-    let mut seen = BTreeMap::<String, PathBuf>::new();
+    let mut summary = ReviewArtifacts::default();
+    let mut family_counts = BTreeMap::<&'static str, usize>::new();
+    let mut seen_deltas = BTreeMap::<String, PathBuf>::new();
+    let mut seen_scripts = BTreeMap::<String, PathBuf>::new();
     for path in generated_artifact_paths(package, &[])? {
         let text = std::fs::read_to_string(&path)?;
         if script::is_script_artifact(&text) {
+            let artifact = script::parse(&text, &path)?;
+            if let Some(first) = seen_scripts.insert(artifact.package.clone(), path.clone()) {
+                return Err(named_twice(&artifact.package, &first, &path));
+            }
+            summary.has_script_artifact = true;
+            summary
+                .runtime_scripts
+                .extend(artifact.scripts().iter().map(|script| script.name.clone()));
             continue;
         }
         let (package_name, families) = summarize_delta(&text, &path)?;
-        if let Some(first) = seen.insert(package_name.clone(), path.clone()) {
+        if let Some(first) = seen_deltas.insert(package_name.clone(), path.clone()) {
             return Err(named_twice(&package_name, &first, &path));
         }
+        summary.package_delta_count += 1;
         for family in families {
-            *counts.entry(family).or_default() += 1;
+            *family_counts.entry(family).or_default() += 1;
         }
     }
 
-    Ok(counts
+    summary.package_delta_families = family_counts
         .into_iter()
         .map(|(family, count)| (family.to_string(), count))
-        .collect())
+        .collect();
+    summary.runtime_scripts.sort();
+    Ok(summary)
 }
 
 /// The same walk, passing over files the caller is about to retire.
@@ -908,9 +935,11 @@ mod tests {
 
         assert!(found.deltas.is_empty());
         assert_eq!(found.scripts.len(), 1);
-        assert!(summarize_package_deltas(&tree.root().join("bolt"))
-            .expect("the review summary succeeds")
-            .is_empty());
+        let summary = summarize_package_artifacts(&tree.root().join("bolt"))
+            .expect("the review summary succeeds");
+        assert!(summary.has_script_artifact);
+        assert_eq!(summary.runtime_scripts, ["bolt.greet"]);
+        assert_eq!(summary.package_delta_count, 0);
     }
 
     #[test]

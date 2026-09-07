@@ -14,9 +14,9 @@
 //! Everything else in the Rust is code that runs inside the module with full database access, and
 //! the report says so.
 //!
-//! Runtime Scripts ARE counted: a Package ships its `scripts/` sources inside its own folder, and
-//! that Lua runs on the realm once the Package is built. Package Deltas are counted from
-//! `data/.generated/`; their claim tables decide which Import Families the review names.
+//! Runtime Scripts ARE counted from a generated Script Artifact when one exists, with `scripts/`
+//! sources as the pre-build fallback. Package Deltas are counted from `data/.generated/`; their
+//! claim tables decide which Import Families the review names.
 //!
 //! DUPLICATION, ON PURPOSE: `strip_comments_and_strings` and the three marker matchers are a port
 //! of `module/build.rs`, which lives in the server repository and is not a dependency of this CLI.
@@ -69,8 +69,10 @@ pub struct TrustReview {
     pub addons: Vec<String>,
     /// Files under `client/mpq/` — each one shadows a stock client file.
     pub client_overrides: usize,
-    /// Runtime Script sources under `scripts/` — Lua this Package would run on the realm.
+    /// Runtime Scripts this Package would run, by artifact name or pre-build source file.
     pub runtime_scripts: Vec<String>,
+    /// Physical generated Package Delta artifacts.
+    pub package_delta_count: usize,
     /// Generated Package Deltas grouped by Import Family.
     pub package_deltas: Vec<(String, usize)>,
     pub rust_files: usize,
@@ -126,7 +128,7 @@ impl TrustReview {
             })
             .count();
 
-        review.runtime_scripts = entries
+        let mut source_scripts: Vec<String> = entries
             .iter()
             .filter(|entry| {
                 entry.kind == EntryKind::File
@@ -145,9 +147,16 @@ impl TrustReview {
                     .into_owned()
             })
             .collect();
-        review.runtime_scripts.sort();
+        source_scripts.sort();
 
-        review.package_deltas = artifact::summarize_package_deltas(package_dir)?;
+        let generated = artifact::summarize_package_artifacts(package_dir)?;
+        review.runtime_scripts = if generated.has_script_artifact {
+            generated.runtime_scripts
+        } else {
+            source_scripts
+        };
+        review.package_delta_count = generated.package_delta_count;
+        review.package_deltas = generated.package_delta_families;
 
         Ok(review)
     }
@@ -203,7 +212,7 @@ impl TrustReview {
             && self.addons.is_empty()
             && self.client_overrides == 0
             && self.runtime_scripts.is_empty()
-            && self.package_deltas.is_empty()
+            && self.package_delta_count == 0
     }
 
     /// The full block `packages add` prints before it asks.
@@ -232,7 +241,10 @@ impl TrustReview {
         ));
         out.push_str(&row("addons", self.addons.len(), &self.addons));
         out.push_str(&row("client overrides", self.client_overrides, &[]));
-        out.push_str(&package_delta_row(&self.package_deltas));
+        out.push_str(&package_delta_row(
+            self.package_delta_count,
+            &self.package_deltas,
+        ));
         out.push_str(&row(
             "runtime scripts",
             self.runtime_scripts.len(),
@@ -254,10 +266,16 @@ impl TrustReview {
     /// The one-line content-kind summary `packages list` shows per Package.
     pub fn kinds_summary(&self) -> String {
         let mut parts = Vec::new();
-        let package_delta_count: usize = self.package_deltas.iter().map(|(_, count)| count).sum();
-        if package_delta_count > 0 {
-            let suffix = if package_delta_count == 1 { "" } else { "s" };
-            parts.push(format!("{package_delta_count} package delta{suffix}"));
+        if self.package_delta_count > 0 {
+            let suffix = if self.package_delta_count == 1 {
+                ""
+            } else {
+                "s"
+            };
+            parts.push(format!(
+                "{} package delta{suffix}",
+                self.package_delta_count
+            ));
         }
         for (label, count) in [
             ("tables", self.tables.len()),
@@ -284,11 +302,10 @@ impl TrustReview {
     }
 }
 
-fn package_delta_row(families: &[(String, usize)]) -> String {
-    if families.is_empty() {
+fn package_delta_row(count: usize, families: &[(String, usize)]) -> String {
+    if count == 0 {
         return "  package deltas     none\n".to_string();
     }
-    let count = families.iter().map(|(_, count)| count).sum();
     let details: Vec<String> = families
         .iter()
         .map(|(family, count)| format!("{family}: {count}"))
@@ -614,6 +631,12 @@ mod tests {
         )
     }
 
+    fn two_script_artifact(package: &str) -> String {
+        format!(
+            r#"{{"kind":"script","version":1,"package":"{package}","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scripts":[{{"script_id":100002,"name":"example.goodbye","event":"on_logout","priority":0,"enabled":true,"source":"return"}},{{"script_id":100001,"name":"example.greet","event":"on_login","priority":0,"enabled":true,"source":"return"}}]}}"#
+        )
+    }
+
     #[test]
     fn the_review_names_what_the_build_would_register() {
         let tmp = package(&[(
@@ -779,6 +802,26 @@ mod tests {
     }
 
     #[test]
+    fn a_prebuilt_script_artifact_is_counted_without_script_sources() {
+        let tmp = package(&[(
+            "data/.generated/runtime.json",
+            &two_script_artifact("example.prebuilt"),
+        )]);
+
+        let review = TrustReview::scan(tmp.path()).unwrap();
+
+        assert_eq!(review.runtime_scripts, ["example.goodbye", "example.greet"]);
+        assert!(!review.registers_nothing(), "{review:?}");
+        let text = review.render(tmp.path());
+        assert!(text.contains("runtime scripts    2"), "{text}");
+        assert!(text.contains("example.goodbye, example.greet"), "{text}");
+        assert!(
+            review.kinds_summary().contains("2 runtime scripts"),
+            "{review:?}"
+        );
+    }
+
+    #[test]
     fn generated_package_deltas_are_counted_by_import_family() {
         let tmp = TempDir::new().unwrap();
         let candidate = tmp.path().join("candidate");
@@ -796,6 +839,7 @@ mod tests {
 
         let review = TrustReview::scan(&candidate).unwrap();
 
+        assert_eq!(review.package_delta_count, 1);
         assert_eq!(review.package_deltas, [("spell".to_string(), 1)]);
         assert!(!review.registers_nothing(), "{review:?}");
         let text = review.render(&candidate);
@@ -822,8 +866,13 @@ mod tests {
             review.package_deltas,
             [("items".to_string(), 1), ("spell".to_string(), 1)]
         );
-        assert!(text.contains("package deltas     2"), "{text}");
+        assert_eq!(review.package_delta_count, 1);
+        assert!(text.contains("package deltas     1"), "{text}");
         assert!(text.contains("items: 1, spell: 1"), "{text}");
+        assert!(
+            review.kinds_summary().contains("1 package delta"),
+            "{review:?}"
+        );
     }
 
     #[test]

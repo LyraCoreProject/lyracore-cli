@@ -1233,6 +1233,38 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_prebuilt_multi_script_artifact_reaches_consent_without_script_sources() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+        let generated = source.join("data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(
+            generated.join("runtime.json"),
+            r#"{"kind":"script","version":1,"package":"greeter","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scripts":[{"script_id":100002,"name":"greeter.goodbye","event":"on_logout","priority":0,"enabled":true,"source":"return"},{"script_id":100001,"name":"greeter.greet","event":"on_login","priority":0,"enabled":true,"source":"return"}]}"#,
+        )
+        .unwrap();
+        let prompt = RecordingAnswer {
+            asked: Cell::new(false),
+        };
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &prompt,
+            source.to_str().unwrap(),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            prompt.asked.get(),
+            "the prebuilt Script Artifact must reach consent: {error}"
+        );
+        assert!(!project.packages_dir().join("greeter").exists());
+    }
+
+    #[test]
     fn the_copy_is_a_copy_never_a_link() {
         // A linked Package would compile from a folder outside the checkout, so preflight, publish
         // and client sync would each read whatever it said at the time.
