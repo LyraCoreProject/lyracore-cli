@@ -23,6 +23,7 @@
 //! unreachable — LOGONS WILL BE REFUSED". Passing them all in one command is what makes "all of
 //! them" checkable instead of remembered.
 
+use crate::cmd::import;
 use crate::cmd::preflight;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::{Component, ProjectLayout, Topology};
@@ -35,6 +36,24 @@ const DESTRUCTIVE: [&str; 4] = ["-c", "--clear-database", "--delete-data", "--cl
 
 /// The verb name this module's refusals quote back at the operator.
 const VERB: &str = "publish";
+
+const LOOT_RECEIPT_TABLE: &str = "game_loot_roll_promotion_receipt";
+const LOOT_RECEIPT_BINDING: &str =
+    "gateway/src/stdb/bindings/game_loot_roll_promotion_receipt_table.rs";
+const LOOT_DRAIN_QUERIES: [(&str, &str); 3] = [
+    (
+        "active or staging Loot Rolls",
+        "SELECT COUNT(*) AS n FROM game_loot_roll WHERE id >= 0",
+    ),
+    (
+        "Loot Roll votes",
+        "SELECT COUNT(*) AS n FROM game_loot_roll_vote WHERE id >= 0",
+    ),
+    (
+        "withheld corpse loot",
+        "SELECT COUNT(*) AS n FROM game_corpse_loot WHERE withheld = true",
+    ),
+];
 
 /// Reject anything that is not a plain database name, on behalf of `verb`.
 ///
@@ -134,6 +153,139 @@ pub fn publish_command(project: &ProjectLayout, database: &str) -> Result<Comman
         .arg(database))
 }
 
+fn describe_command(database: &str) -> CommandSpec {
+    CommandSpec::new("spacetime")
+        .arg("describe")
+        .arg("--json")
+        .arg("-s")
+        .arg(ProjectLayout::STDB_SERVER)
+        .arg(database)
+}
+
+fn checkout_has_loot_receipt_binding(project: &ProjectLayout) -> Result<bool> {
+    let binding = project.root.join(LOOT_RECEIPT_BINDING);
+    match std::fs::metadata(&binding) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(Error::Process(format!(
+            "loot-roll upgrade marker is not a file: {}. Nothing was published.",
+            binding.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::Process(format!(
+            "could not inspect loot-roll upgrade marker {}: {error}. Nothing was published.",
+            binding.display()
+        ))),
+    }
+}
+
+fn deployed_has_loot_receipt(database: &str, output: &str) -> Result<bool> {
+    let schema: serde_json::Value = serde_json::from_str(output).map_err(|error| {
+        Error::Process(format!(
+            "could not read the deployed schema for '{database}': invalid JSON ({error}). Nothing \
+             was published."
+        ))
+    })?;
+    let tables = schema
+        .as_object()
+        .and_then(|root| root.get("tables"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            Error::Process(format!(
+                "could not read the deployed schema for '{database}': expected a top-level \
+                 `tables` list. Nothing was published."
+            ))
+        })?;
+
+    let mut receipt_tables = 0usize;
+    for table in tables {
+        let Some(name) = table
+            .as_object()
+            .and_then(|table| table.get("name"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(Error::Process(format!(
+                "could not read the deployed schema for '{database}': a table has no string \
+                 `name`. Nothing was published."
+            )));
+        };
+        if name == LOOT_RECEIPT_TABLE {
+            receipt_tables += 1;
+        }
+    }
+    match receipt_tables {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(Error::Process(format!(
+            "could not read the deployed schema for '{database}': `{LOOT_RECEIPT_TABLE}` appears \
+             more than once. Nothing was published."
+        ))),
+    }
+}
+
+fn parse_count(database: &str, state: &str, output: &str) -> Result<u64> {
+    let rows = import::table_cells(output);
+    let [header, value] = rows.as_slice() else {
+        return Err(Error::Process(format!(
+            "could not read {state} on '{database}': expected one `n` count. Nothing was published."
+        )));
+    };
+    if header.as_slice() != ["n"] || value.len() != 1 {
+        return Err(Error::Process(format!(
+            "could not read {state} on '{database}': unexpected SQL output. Nothing was published."
+        )));
+    }
+    value[0].parse().map_err(|_| {
+        Error::Process(format!(
+            "could not read {state} on '{database}': count is not an unsigned integer. Nothing was \
+             published."
+        ))
+    })
+}
+
+fn require_loot_roll_upgrade_ready(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    databases: &[String],
+) -> Result<()> {
+    if !checkout_has_loot_receipt_binding(project)? {
+        return Ok(());
+    }
+
+    for database in databases {
+        let schema = runner
+            .run_and_wait(&describe_command(database))
+            .map_err(|error| {
+                Error::Process(format!(
+                    "could not read the deployed schema for '{database}': {error}. Nothing was \
+                     published."
+                ))
+            })?;
+        if deployed_has_loot_receipt(database, &schema)? {
+            continue;
+        }
+
+        for (state, query) in LOOT_DRAIN_QUERIES {
+            let output = runner
+                .run_and_wait(&import::sql_command(project, database, query))
+                .map_err(|error| {
+                    Error::Process(format!(
+                        "could not read {state} on '{database}': {error}. Nothing was published."
+                    ))
+                })?;
+            let count = parse_count(database, state, &output)?;
+            if count != 0 {
+                return Err(Error::Process(format!(
+                    "loot-roll receipt upgrade refused: '{database}' still has {count} {state}. \
+                     Stop new Loot Roll producers, keep the old Gateways running until settlement \
+                     clears every row, then stop the old Gateways and re-run `lyracore publish`. \
+                     Nothing was published."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Publish to each database in turn, stopping at the first failure.
 ///
 /// Fail-fast is deliberate: a half-published realm is the state the gateway reports as an unrelated
@@ -149,6 +301,9 @@ pub fn run(
     } else {
         databases.to_vec()
     };
+    for database in &databases {
+        validate_database(VERB, database)?;
+    }
 
     if skip_preflight {
         println!(
@@ -158,6 +313,8 @@ pub fn run(
     } else {
         preflight::run(project, runner)?;
     }
+
+    require_loot_roll_upgrade_ready(project, runner, &databases)?;
 
     for (index, database) in databases.iter().enumerate() {
         println!();
@@ -331,6 +488,309 @@ mod tests {
         )
         .unwrap();
         ProjectLayout::from_root(root).unwrap()
+    }
+
+    fn loot_receipt_upgrade(tmp: &TempDir) -> ProjectLayout {
+        let project = healthy(tmp);
+        let binding = project.root.join(LOOT_RECEIPT_BINDING);
+        std::fs::create_dir_all(binding.parent().unwrap()).unwrap();
+        std::fs::write(binding, "// generated receipt table binding\n").unwrap();
+        project
+    }
+
+    fn schema(tables: &[&str]) -> String {
+        serde_json::json!({
+            "typespace": { "types": [] },
+            "tables": tables
+                .iter()
+                .map(|name| serde_json::json!({ "name": name }))
+                .collect::<Vec<_>>(),
+            "reducers": [],
+        })
+        .to_string()
+    }
+
+    fn clean_old_schema_stack() -> FakeStack {
+        FakeStack::new()
+            .with_stdout("spacetime describe", &schema(&["game_loot_roll"]))
+            .with_stdout("FROM game_loot_roll WHERE", " n\n 0\n")
+            .with_stdout("FROM game_loot_roll_vote WHERE", " n\n 0\n")
+            .with_stdout("FROM game_corpse_loot WHERE", " n\n 0\n")
+    }
+
+    #[test]
+    fn the_receipt_upgrade_checks_every_destination_before_any_publish() {
+        let tmp = TempDir::new().unwrap();
+        let project = loot_receipt_upgrade(&tmp);
+        let stack = clean_old_schema_stack();
+        let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
+
+        run(&project, &stack.runner(), &wanted, true).unwrap();
+
+        let rendered = stack.rendered();
+        let first_publish = rendered
+            .iter()
+            .position(|command| command.starts_with("spacetime publish"))
+            .unwrap();
+        assert_eq!(
+            rendered[..first_publish]
+                .iter()
+                .filter(|command| command.starts_with("spacetime describe"))
+                .count(),
+            wanted.len()
+        );
+        assert_eq!(
+            rendered[..first_publish]
+                .iter()
+                .filter(|command| command.starts_with("spacetime sql"))
+                .count(),
+            wanted.len() * LOOT_DRAIN_QUERIES.len()
+        );
+    }
+
+    #[test]
+    fn direct_run_validates_every_destination_before_any_live_read() {
+        let tmp = TempDir::new().unwrap();
+        let project = loot_receipt_upgrade(&tmp);
+        let stack = FakeStack::new();
+
+        let error = run(
+            &project,
+            &stack.runner(),
+            &names(&["lyracore", "--delete-data"]),
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
+        assert!(stack.rendered().is_empty(), "{:?}", stack.rendered());
+    }
+
+    #[test]
+    fn every_legacy_loot_state_blocks_the_whole_publish() {
+        for (blocked_query, state) in [
+            ("FROM game_loot_roll WHERE", "active or staging Loot Rolls"),
+            ("FROM game_loot_roll_vote WHERE", "Loot Roll votes"),
+            ("FROM game_corpse_loot WHERE", "withheld corpse loot"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let project = loot_receipt_upgrade(&tmp);
+            let stack = clean_old_schema_stack().with_stdout(blocked_query, " n\n 1\n");
+
+            let error = run(
+                &project,
+                &stack.runner(),
+                &names(&["lyracore", "realm-core"]),
+                true,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains(state), "{state}: {error}");
+            assert!(
+                !stack
+                    .rendered()
+                    .iter()
+                    .any(|command| command.starts_with("spacetime publish")),
+                "{state}: {:?}",
+                stack.rendered()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_or_malformed_live_state_refuses_before_publish() {
+        let cases = [
+            FakeStack::new().fail_on("spacetime describe", "database is missing"),
+            FakeStack::new().with_stdout("spacetime describe", "not json"),
+            FakeStack::new().with_stdout("spacetime describe", r#"{"tables":"unknown"}"#),
+            FakeStack::new()
+                .with_stdout("spacetime describe", &schema(&["game_loot_roll"]))
+                .with_stdout("FROM game_loot_roll WHERE", "not a count"),
+        ];
+        for stack in cases {
+            let tmp = TempDir::new().unwrap();
+            let project = loot_receipt_upgrade(&tmp);
+
+            let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+
+            assert!(
+                error.to_string().contains("Nothing was published"),
+                "{error}"
+            );
+            assert!(
+                !stack
+                    .rendered()
+                    .iter()
+                    .any(|command| command.starts_with("spacetime publish")),
+                "{:?}",
+                stack.rendered()
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_actual_receipt_table_marks_a_destination_upgraded() {
+        let tmp = TempDir::new().unwrap();
+        let project = loot_receipt_upgrade(&tmp);
+        let decoy = serde_json::json!({
+            "tables": [{ "name": "game_loot_roll" }],
+            "reducers": [{ "description": LOOT_RECEIPT_TABLE }],
+        })
+        .to_string();
+        let stack = clean_old_schema_stack()
+            .with_stdout("spacetime describe", &decoy)
+            .with_stdout("FROM game_loot_roll WHERE", " n\n 1\n");
+
+        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+
+        assert!(
+            error.to_string().contains("active or staging Loot Rolls"),
+            "{error}"
+        );
+        assert!(stack
+            .rendered()
+            .iter()
+            .any(|command| command.starts_with("spacetime sql")));
+    }
+
+    #[test]
+    fn an_ambiguous_receipt_table_schema_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let project = loot_receipt_upgrade(&tmp);
+        let stack = FakeStack::new().with_stdout(
+            "spacetime describe",
+            &schema(&[LOOT_RECEIPT_TABLE, LOOT_RECEIPT_TABLE]),
+        );
+
+        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+
+        assert!(error.to_string().contains("more than once"), "{error}");
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|command| command.starts_with("spacetime publish")));
+    }
+
+    #[test]
+    fn an_already_upgraded_destination_needs_no_legacy_drain_query() {
+        let tmp = TempDir::new().unwrap();
+        let project = loot_receipt_upgrade(&tmp);
+        let stack =
+            FakeStack::new().with_stdout("spacetime describe", &schema(&[LOOT_RECEIPT_TABLE]));
+
+        run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap();
+
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|command| command.starts_with("spacetime sql")));
+        assert!(stack
+            .rendered()
+            .iter()
+            .any(|command| command.starts_with("spacetime publish")));
+    }
+
+    #[test]
+    fn a_mixed_batch_checks_legacy_state_only_on_destinations_still_needing_the_upgrade() {
+        let tmp = TempDir::new().unwrap();
+        let project = loot_receipt_upgrade(&tmp);
+        let stack = FakeStack::new()
+            .with_stdout(
+                "spacetime describe --json -s local lyracore",
+                &schema(&[LOOT_RECEIPT_TABLE]),
+            )
+            .with_stdout(
+                "spacetime describe --json -s local realm-core",
+                &schema(&["game_loot_roll"]),
+            )
+            .with_stdout("FROM game_loot_roll WHERE", " n\n 0\n")
+            .with_stdout("FROM game_loot_roll_vote WHERE", " n\n 0\n")
+            .with_stdout("FROM game_corpse_loot WHERE", " n\n 0\n");
+
+        run(
+            &project,
+            &stack.runner(),
+            &names(&["lyracore", "realm-core"]),
+            true,
+        )
+        .unwrap();
+
+        let rendered = stack.rendered();
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|command| command.starts_with("spacetime describe"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|command| command.starts_with("spacetime sql"))
+                .count(),
+            LOOT_DRAIN_QUERIES.len()
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|command| command.starts_with("spacetime publish"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn skip_preflight_cannot_skip_the_live_loot_upgrade_check() {
+        let tmp = TempDir::new().unwrap();
+        let project = loot_receipt_upgrade(&tmp);
+        std::fs::write(project.rust_toolchain_file(), "channel = \"1.0.0\"\n").unwrap();
+        let stack = clean_old_schema_stack().with_stdout("FROM game_loot_roll WHERE", " n\n 1\n");
+
+        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+
+        assert!(
+            error.to_string().contains("active or staging Loot Rolls"),
+            "{error}"
+        );
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|command| command.contains("cargo check")));
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|command| command.starts_with("spacetime publish")));
+    }
+
+    #[test]
+    fn ordinary_publishes_without_the_receipt_binding_keep_the_existing_path() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        let stack = FakeStack::new().fail_on("spacetime describe", "must not inspect live state");
+
+        run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap();
+
+        assert_eq!(
+            stack
+                .rendered()
+                .iter()
+                .filter(|command| command.starts_with("spacetime publish"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_invalid_receipt_binding_marker_refuses_before_live_reads_or_publish() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        std::fs::create_dir_all(project.root.join(LOOT_RECEIPT_BINDING)).unwrap();
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+
+        assert!(error.to_string().contains("not a file"), "{error}");
+        assert!(stack.rendered().is_empty(), "{:?}", stack.rendered());
     }
 
     // ---- bare `publish` resolves against the recorded topology, not a hardcoded default ----
