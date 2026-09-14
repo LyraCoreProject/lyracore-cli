@@ -105,7 +105,7 @@ impl FakeStack {
         self
     }
 
-    /// Answer any command whose rendered form contains `needle` with this stdout.
+    /// Answer matching commands with this stdout. The longest matching needle wins.
     pub fn with_stdout(self, needle: &str, stdout: &str) -> Self {
         self.0
             .lock()
@@ -393,7 +393,10 @@ impl ProcessRunner for FakeProcessRunner {
             inner
                 .stdouts
                 .iter()
-                .find(|(needle, _)| render.contains(needle.as_str()))
+                .filter(|(needle, _)| render.contains(needle.as_str()))
+                .max_by(|(left, _), (right, _)| {
+                    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+                })
                 .map(|(_, stdout)| stdout.clone())
         };
         Ok(canned.unwrap_or_else(|| canned_stdout(&render)))
@@ -487,6 +490,20 @@ impl ProcessRunner for FakeProcessRunner {
 }
 
 pub struct FakeProcessInspector(Arc<Mutex<Inner>>);
+
+#[test]
+fn specific_stdout_overrides_the_command_default() {
+    let stack = FakeStack::new()
+        .with_stdout("spacetime sql", "default rows")
+        .with_stdout("SELECT skin_loot_id", "no skinning rows");
+    let command = CommandSpec::new("spacetime")
+        .arg("sql")
+        .arg("SELECT skin_loot_id FROM game_skinning_loot");
+    assert_eq!(
+        stack.runner().run_and_wait(&command).unwrap(),
+        "no skinning rows"
+    );
+}
 
 impl ProcessInspector for FakeProcessInspector {
     fn identity(&self, pid: u32) -> Option<String> {

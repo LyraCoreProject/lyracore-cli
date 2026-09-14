@@ -12,6 +12,10 @@ checkout, and only when you run
 
 ## Commands
 
+`import world` checks each destination's World Import Profile. Skinning minimums apply to
+`alliance-eastern`, `alliance-kalimdor` and `alliance-single`. The `instances` profile allows no
+skinnable creatures, as in Deadmines, but requires loot for every referenced skinning table.
+
 ```text
 lyracore doctor
 lyracore preflight

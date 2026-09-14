@@ -1570,6 +1570,49 @@ fn verify_caster_spell_catalogue(a: &mut Assertions<'_>) -> Result<()> {
     Ok(())
 }
 
+fn verify_skinning_loot(a: &mut Assertions<'_>, profile: WorldProfile) -> Result<()> {
+    if profile != WorldProfile::Instances {
+        a.chk_count(
+            "FLOOR_SKINNING_LOOT",
+            "skinning loot rows (game_skinning_loot) [V]",
+            "SELECT id FROM game_skinning_loot",
+            RowMatch::Numeric,
+        )?;
+        return a.chk_count(
+            "FLOOR_CREATURES_WITH_SKIN",
+            "creatures with a skin table (creature_template.skin_loot_id>0) [V]",
+            "SELECT entry FROM game_creature_template WHERE skin_loot_id > 0",
+            RowMatch::Numeric,
+        );
+    }
+
+    // Deadmines has no skinnable creatures. Any referenced skinning table must still have loot.
+    let referenced: BTreeSet<i64> = a
+        .values("SELECT skin_loot_id FROM game_creature_template")?
+        .into_iter()
+        .filter(|id| *id > 0)
+        .collect();
+    let imported: BTreeSet<i64> = a
+        .values("SELECT skin_loot_id FROM game_skinning_loot")?
+        .into_iter()
+        .collect();
+    let missing: Vec<i64> = referenced.difference(&imported).copied().collect();
+    if missing.is_empty() {
+        println!(
+            "  ok    skinning loot: all {} referenced tables have loot",
+            referenced.len()
+        );
+    } else {
+        println!(
+            "  FAIL  skinning loot: {} referenced tables have no loot, first IDs: {:?}",
+            missing.len(),
+            &missing[..missing.len().min(12)]
+        );
+        a.failed += 1;
+    }
+    Ok(())
+}
+
 /// Profile-aware post-import Verification. Global catalogue checks run on every destination,
 /// corridor checks follow the bounded slices, and instance checks run only where map 36 is owned.
 fn assert_floors(
@@ -1969,12 +2012,7 @@ fn assert_floors(
         "SELECT id FROM game_pickpocket_loot",
         RowMatch::Numeric,
     )?;
-    a.chk_count(
-        "FLOOR_SKINNING_LOOT",
-        "skinning loot rows (game_skinning_loot) [V]",
-        "SELECT id FROM game_skinning_loot",
-        RowMatch::Numeric,
-    )?;
+    verify_skinning_loot(&mut a, profile)?;
     a.chk_count(
         "FLOOR_GAMEOBJECT_CHEST_LOOT",
         "gameobject (chest) loot rows (game_gameobject_loot) [V]",
@@ -1993,13 +2031,6 @@ fn assert_floors(
         "SELECT entry FROM game_creature_template WHERE pickpocket_loot_id > 0",
         RowMatch::Numeric,
     )?;
-    a.chk_count(
-        "FLOOR_CREATURES_WITH_SKIN",
-        "creatures with a skin table (creature_template.skin_loot_id>0) [V]",
-        "SELECT entry FROM game_creature_template WHERE skin_loot_id > 0",
-        RowMatch::Numeric,
-    )?;
-
     if a.failed > 0 {
         return Err(Error::Process(format!(
             "{} assertion(s) came in under their floor — see the FAIL lines above. A floor that \
@@ -3223,6 +3254,137 @@ pub(crate) mod tests {
     }
 
     // ---- the floors ----
+
+    #[test]
+    fn instances_accept_no_skinning_loot_when_no_creatures_reference_it() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let stack = healthy()
+            .with_stdout("lyracore-instances SELECT id FROM game_skinning_loot", " id \n----\n")
+            .with_stdout("lyracore-instances SELECT entry FROM game_creature_template WHERE skin_loot_id > 0", " entry \n-------\n")
+            .with_stdout("lyracore-instances SELECT skin_loot_id FROM game_creature_template", " skin_loot_id \n--------------\n 0 \n 0 \n")
+            .with_stdout("lyracore-instances SELECT skin_loot_id FROM game_skinning_loot", " skin_loot_id \n--------------\n");
+
+        run_world(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn world_profiles_keep_both_skinning_floors() {
+        for (topology, shard, profile) in [
+            (Topology::Sharded, "lyracore", "alliance-eastern"),
+            (Topology::Sharded, "lyracore-kalimdor", "alliance-kalimdor"),
+            (Topology::Single, "lyracore", "alliance-single"),
+        ] {
+            for query in [
+                "SELECT id FROM game_skinning_loot",
+                "SELECT entry FROM game_creature_template WHERE skin_loot_id > 0",
+            ] {
+                let tmp = TempDir::new().unwrap();
+                let project = checkout(&tmp);
+                let data = client_data(&tmp);
+                set_topology(&project, topology);
+                let stack = healthy().with_stdout(&format!("{shard} {query}"), " id \n----\n");
+
+                let error = run_world(
+                    &project,
+                    &stack.runner(),
+                    &ScriptedPrompt::new(&[]),
+                    &accepted(&data),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains(profile), "{error}");
+                assert!(error.contains("1 assertion(s)"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn instances_require_every_referenced_skinning_table() {
+        for loot_rows in [
+            " skin_loot_id \n--------------\n",
+            " skin_loot_id \n--------------\n 700 \n",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let project = checkout(&tmp);
+            let data = client_data(&tmp);
+            let stack = healthy()
+                .with_stdout(
+                    "lyracore-instances SELECT skin_loot_id FROM game_creature_template",
+                    " skin_loot_id \n--------------\n 700 \n 701 \n",
+                )
+                .with_stdout(
+                    "lyracore-instances SELECT skin_loot_id FROM game_skinning_loot",
+                    loot_rows,
+                );
+
+            let error = run_world(
+                &project,
+                &stack.runner(),
+                &ScriptedPrompt::new(&[]),
+                &accepted(&data),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("instances"), "{error}");
+            assert!(error.contains("1 assertion(s)"), "{error}");
+        }
+    }
+
+    #[test]
+    fn instances_accept_shared_skinning_tables_with_loot() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let stack = healthy()
+            .with_stdout(
+                "lyracore-instances SELECT skin_loot_id FROM game_creature_template",
+                " skin_loot_id \n--------------\n 0 \n 700 \n 700 \n 701 \n",
+            )
+            .with_stdout(
+                "lyracore-instances SELECT skin_loot_id FROM game_skinning_loot",
+                " skin_loot_id \n--------------\n 700 \n 701 \n 701 \n",
+            );
+
+        run_world(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_instance_skinning_query_is_not_an_empty_profile() {
+        for table in ["game_creature_template", "game_skinning_loot"] {
+            let tmp = TempDir::new().unwrap();
+            let project = checkout(&tmp);
+            let data = client_data(&tmp);
+            let stack = healthy().fail_on(
+                &format!("lyracore-instances SELECT skin_loot_id FROM {table}"),
+                "Unable to connect",
+            );
+
+            let error = run_world(
+                &project,
+                &stack.runner(),
+                &ScriptedPrompt::new(&[]),
+                &accepted(&data),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("NOT zero rows"), "{error}");
+            assert!(error.contains("Unable to connect"), "{error}");
+        }
+    }
 
     #[test]
     fn a_manifest_missing_a_consumed_floor_fails_before_anything_expensive_runs() {
