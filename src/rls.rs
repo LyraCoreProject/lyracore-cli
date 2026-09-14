@@ -5,13 +5,10 @@
 //! extraction: a filter naming a column that does not exist passes `spacetime publish` and then
 //! rejects a gateway *subscription* — i.e. it breaks login, and only login, on a live stack.
 //!
-//! WHY IT IS HAND-ROLLED. The Python leans on `re`; this crate deliberately carries four
-//! dependencies and none of them is a regex engine. Every pattern the validator needs is a word
-//! scan over ASCII, so the port is a tokenizer rather than a new dependency in a CLI that is
-//! installed with `cargo install --locked` on a contributor's first run.
+//! The SQL checks use ASCII word scans rather than a regex dependency.
 //!
-//! Behaviour is kept verdict-for-verdict identical to the Python, including its non-overlapping
-//! scan for `FROM`/`JOIN` table references — see `table_refs`.
+//! SQL checks retain the Python's non-overlapping scan for `FROM`/`JOIN` table references.
+//! See `table_refs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -286,9 +283,8 @@ fn filter_sql_call(region: &[u8]) -> Option<usize> {
 // reading the generated bindings
 // ---------------------------------------------------------------------------------------------
 
-/// Read `<bindings>/*_table.rs` into `table -> columns`, following each table handle to the row
-/// struct it names. Same shape as the Python: a `*_table.rs` that does not carry both the doc
-/// comment and the row `use` is skipped, not failed.
+/// Read each documented table's declared `Row` type and its public columns.
+/// Other imports may name indexed column types rather than the table row.
 pub fn generated_schema(bindings_dir: &Path) -> (Schema, Vec<String>) {
     let mut schema: Schema = BTreeMap::new();
     let mut errors = Vec::new();
@@ -310,9 +306,14 @@ pub fn generated_schema(bindings_dir: &Path) -> (Schema, Vec<String>) {
         let Ok(table_text) = std::fs::read_to_string(&table_path) else {
             continue;
         };
-        let (Some(table), Some((module, row))) =
-            (documented_table(&table_text), row_use(&table_text))
-        else {
+        let Some(table) = documented_table(&table_text) else {
+            continue;
+        };
+        let Some((module, row)) = row_use(&table_text) else {
+            errors.push(format!(
+                "{}: generated table row type could not be resolved",
+                table_path.display()
+            ));
             continue;
         };
         let type_path = bindings_dir.join(format!("{module}.rs"));
@@ -364,8 +365,11 @@ fn documented_table(text: &str) -> Option<String> {
     (!name.is_empty() && name.bytes().all(is_word_byte)).then(|| name.to_string())
 }
 
-/// `use super::character_type::Character;`
+/// Resolve `type Row = Character;` through `use super::character_type::Character;`.
 fn row_use(text: &str) -> Option<(String, String)> {
+    let declared_row = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("type Row = ")?.strip_suffix(';'))?;
     for line in text.lines() {
         let Some(rest) = line.trim().strip_prefix("use super::") else {
             continue;
@@ -376,7 +380,8 @@ fn row_use(text: &str) -> Option<(String, String)> {
         let Some((module, row)) = rest.split_once("::") else {
             continue;
         };
-        if !module.is_empty()
+        if row == declared_row
+            && !module.is_empty()
             && !row.is_empty()
             && module.bytes().all(is_word_byte)
             && row.bytes().all(is_word_byte)
@@ -736,7 +741,10 @@ mod tests {
         std::fs::write(
             bindings.join("game_character_table.rs"),
             "use super::character_type::Character;\n\
-             /// Table handle for the table `game_character`.\n",
+             /// Table handle for the table `game_character`.\n\
+             impl __sdk::Table for GameCharacterTableHandle<'_> {\n\
+                 type Row = Character;\n\
+             }\n",
         )
         .unwrap();
         std::fs::write(
@@ -951,6 +959,75 @@ mod tests {
     }
 
     #[test]
+    fn filters_use_the_declared_row_despite_column_type_imports() {
+        for (module_name, type_name, declaration) in [
+            (
+                "action_kind_type",
+                "ActionKind",
+                "pub enum ActionKind { Move }",
+            ),
+            (
+                "position_type",
+                "Position",
+                "pub struct Position {\n pub x: f32,\n}\n",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let (bindings, module) = fixture(
+                tmp.path(),
+                "SELECT * FROM game_character WHERE owner_identity = :sender",
+                "#[client_visibility_filter]",
+            );
+            std::fs::write(bindings.join(format!("{module_name}.rs")), declaration).unwrap();
+            std::fs::write(
+                bindings.join("game_character_table.rs"),
+                format!(
+                    "use super::{module_name}::{type_name};\n\
+                     use super::character_type::Character;\n\
+                     /// Table handle for the table `game_character`.\n\
+                     impl __sdk::Table for GameCharacterTableHandle<'_> {{\n\
+                         type Row = Character;\n\
+                     }}\n"
+                ),
+            )
+            .unwrap();
+
+            let (count, errors) = validate(&bindings, &module);
+            assert_eq!(count, 1);
+            assert!(errors.is_empty(), "{type_name}: {errors:?}");
+            let (schema, errors) = generated_schema(&bindings);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(
+                schema["game_character"],
+                BTreeSet::from(["guid".to_string(), "owner_identity".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolved_declared_row_does_not_fall_back_to_another_import() {
+        let tmp = TempDir::new().unwrap();
+        let (bindings, _) = fixture(tmp.path(), "SELECT * FROM game_character", "#[table]");
+        std::fs::write(
+            bindings.join("game_character_table.rs"),
+            "use super::character_type::Character;\n\
+             /// Table handle for the table `game_character`.\n\
+             impl __sdk::Table for GameCharacterTableHandle<'_> {\n\
+                 type Row = MissingRow;\n\
+             }\n",
+        )
+        .unwrap();
+        let (schema, errors) = generated_schema(&bindings);
+        assert!(schema.is_empty());
+        assert!(
+            errors.iter().any(
+                |error| error.contains("game_character_table.rs") && error.contains("row type")
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn a_row_struct_whose_module_is_missing_is_an_error() {
         let tmp = TempDir::new().unwrap();
         let bindings = tmp.path().join("bindings");
@@ -958,7 +1035,10 @@ mod tests {
         std::fs::write(
             bindings.join("game_character_table.rs"),
             "use super::character_type::Character;\n\
-             /// Table handle for the table `game_character`.\n",
+             /// Table handle for the table `game_character`.\n\
+             impl __sdk::Table for GameCharacterTableHandle<'_> {\n\
+                 type Row = Character;\n\
+             }\n",
         )
         .unwrap();
         let (schema, errors) = generated_schema(&bindings);
