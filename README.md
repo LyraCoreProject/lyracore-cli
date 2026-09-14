@@ -342,11 +342,12 @@ reconciliation is one job, so the verb owns the git steps too. In order:
    and one data directory.
 5. **The install.** `install -o root -g root -m 0644` into `/etc/systemd/system/`, then
    `systemctl daemon-reload`, `enable`, `restart`.
-6. **The verification.** `systemctl show` must report `ActiveState=active` plus the `LimitNOFILE` and
-   `StandardError` the tracked unit declares. The typed `ExecStart` D-Bus property must match the
-   tracked command, including each argument boundary. If the command differs, the refusal also names
-   the applicable systemd drop-ins. A node that came back with the inherited 1024-descriptor ceiling
-   fails here instead of passing as reconciled.
+6. **The verification.** `systemctl show` must report `ActiveState=active`, the tracked `LimitNOFILE`,
+   and stderr mode `append`. The CLI compares the running `MainPID` file descriptor 2 with the tracked
+   log by device and inode. A different destination or unreadable file fails reconciliation. The
+   typed `ExecStart` D-Bus property must match the tracked command, including each argument boundary.
+   If the command differs, the failure also names the applicable systemd drop-ins. A node with the
+   inherited 1024-descriptor ceiling fails reconciliation.
 
 Every expected value is read out of the tracked unit rather than duplicated in this CLI, so it
 cannot certify a host against a contract the checkout no longer ships. The node's persistent data
@@ -355,7 +356,7 @@ the same end state, and it runs even when the checkout is already at `origin/mai
 deployment drift is independent of git drift. It restarts the node every time, so every run costs a
 short outage.
 
-Steps 3 to 6 read the host before they change it, so a refusal there leaves the checkout on
+Steps 3 and 4 check the host before changing it, so a failure there leaves the checkout on
 `origin/main` and the host as it was. The reset in step 2 comes first on purpose: the unit to
 install, and the contract to check the host against, are read out of the updated checkout.
 

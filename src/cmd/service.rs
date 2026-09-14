@@ -523,7 +523,8 @@ fn verify(unit: &str, contract: &UnitContract, runner: &dyn ProcessRunner) -> Re
             .arg("--property=ActiveState")
             .arg("--property=DropInPaths")
             .arg("--property=LimitNOFILE")
-            .arg("--property=StandardError"),
+            .arg("--property=StandardError")
+            .arg("--property=MainPID"),
     )?;
     let property = |name: &str| -> Option<String> {
         shown.lines().find_map(|line| {
@@ -566,9 +567,14 @@ fn verify(unit: &str, contract: &UnitContract, runner: &dyn ProcessRunner) -> Re
             wrong.push(format!("applicable drop-ins: {paths}"));
         }
     }
+    let stderr_mode = contract.standard_error.as_deref().map(|expected| {
+        expected
+            .strip_prefix("append:")
+            .map_or(expected, |_| "append")
+    });
     for (name, expected) in [
         ("LimitNOFILE", contract.limit_nofile.as_deref()),
-        ("StandardError", contract.standard_error.as_deref()),
+        ("StandardError", stderr_mode),
     ] {
         let Some(expected) = expected else { continue };
         match property(name) {
@@ -577,6 +583,11 @@ fn verify(unit: &str, contract: &UnitContract, runner: &dyn ProcessRunner) -> Re
                 "{name} is {} (the tracked unit requires {expected})",
                 other.as_deref().unwrap_or("unreported")
             )),
+        }
+    }
+    if let Some(log_path) = contract.log_path() {
+        if let Err(reason) = verify_stderr_file(log_path, property("MainPID").as_deref(), runner) {
+            wrong.push(reason);
         }
     }
     if wrong.is_empty() {
@@ -592,6 +603,49 @@ fn verify(unit: &str, contract: &UnitContract, runner: &dyn ProcessRunner) -> Re
             .collect::<Vec<_>>()
             .join("\n")
     )))
+}
+
+// systemd exposes the stderr mode through D-Bus, but not its file path. Compare the running
+// process's open stderr file with the tracked destination, including device and inode.
+fn verify_stderr_file(
+    log_path: &str,
+    main_pid: Option<&str>,
+    runner: &dyn ProcessRunner,
+) -> std::result::Result<(), String> {
+    let pid = main_pid
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| {
+            format!(
+                "MainPID is {} (cannot verify stderr destination {log_path})",
+                main_pid.unwrap_or("unreported")
+            )
+        })?;
+    let descriptor = format!("/proc/{pid}/fd/2");
+    let shown = runner
+        .run_and_wait(
+            &CommandSpec::new("stat")
+                .arg("--dereference")
+                .arg("--format=%d:%i")
+                .arg("--")
+                .arg(&descriptor)
+                .arg(log_path),
+        )
+        .map_err(|error| {
+            format!("cannot verify stderr destination {log_path} through {descriptor}: {error}")
+        })?;
+    let identities: Vec<&str> = shown.lines().collect();
+    let valid_identity = |identity: &str| {
+        identity.split_once(':').is_some_and(|(device, inode)| {
+            device.parse::<u64>().is_ok() && inode.parse::<u64>().is_ok()
+        })
+    };
+    match identities.as_slice() {
+        [actual, expected] if actual == expected && valid_identity(actual) => Ok(()),
+        _ => Err(format!(
+            "stderr destination {descriptor} does not match {log_path}, or its file identity is unreadable"
+        )),
+    }
 }
 
 /// Parse busctl's JSON representation of systemd's typed ExecStart D-Bus property. Only the path,
@@ -685,7 +739,7 @@ WantedBy=multi-user.target
         "/var/lib/lyracore/spacetimedb",
         "--non-interactive",
     ];
-    const TRACKED_STDERR: &str = "append:/var/log/lyracore/spacetimedb-standalone.log";
+    const TRACKED_STDERR: &str = "append";
 
     fn effective_properties(
         active_state: &str,
@@ -697,7 +751,7 @@ WantedBy=multi-user.target
             "ActiveState={active_state}\n\
              DropInPaths={drop_in_paths}\n\
              LimitNOFILE={limit_nofile}\n\
-             StandardError={standard_error}\n"
+             StandardError={standard_error}\nMainPID=1234\n"
         )
     }
 
@@ -746,6 +800,7 @@ WantedBy=multi-user.target
                 "busctl --json=short get-property",
                 &exec_start_property(TRACKED_BINARY, TRACKED_ARGV),
             )
+            .with_stdout("stat --dereference", "2049:7654\n2049:7654\n")
     }
 
     /// The git half of the plan, as `update` runs it: fetch, the dirty-tree check, and the two
@@ -1001,11 +1056,14 @@ ExecStart=/usr/bin/standalone start
             "systemctl --no-pager enable spacetimedb-standalone.service".to_string(),
             "systemctl --no-pager restart spacetimedb-standalone.service".to_string(),
             "systemctl --no-pager show spacetimedb-standalone.service --property=ActiveState \
-             --property=DropInPaths --property=LimitNOFILE --property=StandardError"
+             --property=DropInPaths --property=LimitNOFILE --property=StandardError --property=MainPID"
                 .to_string(),
             "busctl --json=short get-property org.freedesktop.systemd1 \
              /org/freedesktop/systemd1/unit/spacetimedb_2dstandalone_2eservice \
              org.freedesktop.systemd1.Service ExecStart"
+                .to_string(),
+            "stat --dereference --format=%d:%i -- /proc/1234/fd/2 \
+             /var/log/lyracore/spacetimedb-standalone.log"
                 .to_string(),
         ]);
         assert_eq!(stack.rendered(), expected);
@@ -1458,6 +1516,99 @@ ExecStart=/usr/bin/standalone start
     }
 
     #[test]
+    fn systemd_append_mode_with_the_tracked_open_file_is_reconciled() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack = reconcilable_host(ahead_stack())
+            .with_stdout(
+                "--property=ActiveState",
+                "ActiveState=active\nDropInPaths=\nLimitNOFILE=524288\nStandardError=append\nMainPID=1234\n",
+            )
+            .with_stdout("stat --dereference", "2049:7654\n2049:7654\n");
+
+        reconcile(&project, &stack.runner()).unwrap();
+    }
+
+    #[test]
+    fn a_wrong_or_unreadable_stderr_file_is_reported_as_unreconciled() {
+        for identities in [
+            "2049:7654\n2049:7655\n",
+            "2049:7654\n2050:7654\n",
+            "2049:7654\n",
+            "\n\n",
+            "invalid\ninvalid\n",
+            "2049:7654\n2049:7654\n2049:7654\n",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let project = project(&tmp);
+            let stack =
+                reconcilable_host(ahead_stack()).with_stdout("stat --dereference", identities);
+
+            let error = reconcile(&project, &stack.runner())
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("stderr destination /proc/1234/fd/2 does not match"),
+                "{error}"
+            );
+            assert!(error.contains("NOT reconciled"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_stderr_descriptor_is_reported_as_unreconciled() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack =
+            reconcilable_host(ahead_stack()).fail_on("stat --dereference", "Permission denied");
+
+        let error = reconcile(&project, &stack.runner())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("cannot verify stderr destination"),
+            "{error}"
+        );
+        assert!(error.contains("Permission denied"), "{error}");
+        assert!(error.contains("NOT reconciled"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_or_invalid_main_pid_cannot_verify_the_stderr_file() {
+        for pid_property in [
+            "",
+            "MainPID=0\n",
+            "MainPID=invalid\n",
+            "MainPID=4294967296\n",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let project = project(&tmp);
+            let stack = reconcilable_host(ahead_stack()).with_stdout(
+                "--property=ActiveState",
+                &format!(
+                    "ActiveState=active\nLimitNOFILE=524288\nStandardError=append\n{pid_property}"
+                ),
+            );
+
+            let error = reconcile(&project, &stack.runner())
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("cannot verify stderr destination"),
+                "{error}"
+            );
+            assert!(error.contains("NOT reconciled"), "{error}");
+            assert!(!stack
+                .rendered()
+                .iter()
+                .any(|command| command.starts_with("stat ")));
+        }
+    }
+
+    #[test]
     fn a_stderr_destination_that_keeps_no_evidence_is_reported_as_unreconciled() {
         let tmp = TempDir::new().unwrap();
         let project = project(&tmp);
@@ -1472,7 +1623,7 @@ ExecStart=/usr/bin/standalone start
 
         assert!(error.contains("StandardError is inherit"), "{error}");
         assert!(
-            error.contains("append:/var/log/lyracore/spacetimedb-standalone.log"),
+            error.contains("the tracked unit requires append"),
             "{error}"
         );
     }
