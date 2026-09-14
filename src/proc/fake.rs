@@ -333,7 +333,10 @@ fn materialize_generated_bindings(cmd: &CommandSpec) {
     let _ = std::fs::write(
         out.join("game_character_table.rs"),
         "use super::character_type::Character;\n\
-         /// Table handle for the table `game_character`.\n",
+         /// Table handle for the table `game_character`.\n\
+         impl __sdk::Table for GameCharacterTableHandle<'_> {\n\
+             type Row = Character;\n\
+         }\n",
     );
     let _ = std::fs::write(
         out.join("character_type.rs"),
