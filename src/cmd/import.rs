@@ -1588,8 +1588,9 @@ fn verify_skinning_loot(a: &mut Assertions<'_>, profile: WorldProfile) -> Result
 
     // Deadmines has no skinnable creatures. Any referenced skinning table must still have loot.
     let referenced: BTreeSet<i64> = a
-        .values("SELECT skin_loot_id FROM game_creature_template WHERE skin_loot_id > 0")?
+        .values("SELECT skin_loot_id FROM game_creature_template")?
         .into_iter()
+        .filter(|id| *id > 0)
         .collect();
     let imported: BTreeSet<i64> = a
         .values("SELECT skin_loot_id FROM game_skinning_loot")?
@@ -3262,7 +3263,8 @@ pub(crate) mod tests {
         let stack = healthy()
             .with_stdout("lyracore-instances SELECT id FROM game_skinning_loot", " id \n----\n")
             .with_stdout("lyracore-instances SELECT entry FROM game_creature_template WHERE skin_loot_id > 0", " entry \n-------\n")
-            .with_stdout("lyracore-instances SELECT skin_loot_id", " skin_loot_id \n--------------\n");
+            .with_stdout("lyracore-instances SELECT skin_loot_id FROM game_creature_template", " skin_loot_id \n--------------\n 0 \n 0 \n")
+            .with_stdout("lyracore-instances SELECT skin_loot_id FROM game_skinning_loot", " skin_loot_id \n--------------\n");
 
         run_world(
             &project,
@@ -3344,7 +3346,7 @@ pub(crate) mod tests {
         let stack = healthy()
             .with_stdout(
                 "lyracore-instances SELECT skin_loot_id FROM game_creature_template",
-                " skin_loot_id \n--------------\n 700 \n 700 \n 701 \n",
+                " skin_loot_id \n--------------\n 0 \n 700 \n 700 \n 701 \n",
             )
             .with_stdout(
                 "lyracore-instances SELECT skin_loot_id FROM game_skinning_loot",
