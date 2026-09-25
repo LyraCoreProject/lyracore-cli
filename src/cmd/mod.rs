@@ -79,10 +79,10 @@ USAGE:
                                                consent first, every time
   lyracore import world --profile-shard PROFILE=SHARD
                                                explicitly assign all three sharded World Import
-                                               Profiles on an external realm; repeat for
-                                               alliance-eastern, alliance-kalimdor, and instances.
-                                               starting-eastern and starting-kalimdor also include
-                                               the Horde starting areas
+                                               Profiles on an external realm. For each continent,
+                                               choose either alliance-* or starting-*; the latter
+                                               also includes Horde starting areas. Assign instances
+                                               as the third profile, using a distinct Shard for each
   lyracore import world --accept               the same command by its full name (`import`
                                                is its alias), with the consent answered in
                                                advance (scripted runs)
