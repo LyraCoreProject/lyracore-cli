@@ -199,6 +199,8 @@ enum WorldProfile {
     AllianceEastern,
     AllianceKalimdor,
     AllianceSingle,
+    StartingEastern,
+    StartingKalimdor,
     Instances,
 }
 
@@ -214,6 +216,8 @@ impl WorldProfile {
             Self::AllianceEastern => "alliance-eastern",
             Self::AllianceKalimdor => "alliance-kalimdor",
             Self::AllianceSingle => "alliance-single",
+            Self::StartingEastern => "starting-eastern",
+            Self::StartingKalimdor => "starting-kalimdor",
             Self::Instances => "instances",
         }
     }
@@ -222,8 +226,18 @@ impl WorldProfile {
         match name {
             "alliance-eastern" => Some(Self::AllianceEastern),
             "alliance-kalimdor" => Some(Self::AllianceKalimdor),
+            "starting-eastern" => Some(Self::StartingEastern),
+            "starting-kalimdor" => Some(Self::StartingKalimdor),
             "instances" => Some(Self::Instances),
             _ => None,
+        }
+    }
+
+    fn topology_slot(self) -> Self {
+        match self {
+            Self::StartingEastern => Self::AllianceEastern,
+            Self::StartingKalimdor => Self::AllianceKalimdor,
+            profile => profile,
         }
     }
 
@@ -232,11 +246,17 @@ impl WorldProfile {
     }
 
     fn includes_eastern_corridors(self) -> bool {
-        matches!(self, Self::AllianceEastern | Self::AllianceSingle)
+        matches!(
+            self,
+            Self::AllianceEastern | Self::StartingEastern | Self::AllianceSingle
+        )
     }
 
     fn includes_kalimdor_corridors(self) -> bool {
-        matches!(self, Self::AllianceKalimdor | Self::AllianceSingle)
+        matches!(
+            self,
+            Self::AllianceKalimdor | Self::StartingKalimdor | Self::AllianceSingle
+        )
     }
 
     fn includes_instances(self) -> bool {
@@ -245,8 +265,8 @@ impl WorldProfile {
 
     fn open_world_maps(self) -> &'static [i64] {
         match self {
-            Self::AllianceEastern => &[0],
-            Self::AllianceKalimdor => &[1],
+            Self::AllianceEastern | Self::StartingEastern => &[0],
+            Self::AllianceKalimdor | Self::StartingKalimdor => &[1],
             Self::AllianceSingle => &[0, 1],
             Self::Instances => &[],
         }
@@ -475,6 +495,7 @@ fn import_destinations(
     }
 
     let mut configured = BTreeMap::new();
+    let mut shards = BTreeSet::new();
     for assignment in profile_shards {
         let (profile, shard) = assignment.split_once('=').ok_or_else(|| {
             Error::Usage(format!(
@@ -483,7 +504,7 @@ fn import_destinations(
         })?;
         let profile = WorldProfile::parse_sharded(profile).ok_or_else(|| {
             Error::Usage(format!(
-                "`--profile-shard` accepts alliance-eastern, alliance-kalimdor, or instances; got {profile:?}"
+                "`--profile-shard` accepts alliance-eastern, starting-eastern, alliance-kalimdor, starting-kalimdor, or instances; got {profile:?}"
             ))
         })?;
         if shard.is_empty()
@@ -495,10 +516,24 @@ fn import_destinations(
                 "`--profile-shard` has an invalid shard name {shard:?}; use letters, digits, `-`, or `_`"
             )));
         }
-        if configured.insert(profile, shard.to_string()).is_some() {
+        if !shards.insert(shard) {
             return Err(Error::Usage(format!(
-                "`--profile-shard` names {} more than once",
-                profile.name()
+                "World Import Profile destinations must use distinct Shards; {shard:?} is repeated"
+            )));
+        }
+        if configured
+            .insert(
+                profile.topology_slot(),
+                ImportDestination {
+                    shard: shard.to_string(),
+                    profile,
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::Usage(format!(
+                "`--profile-shard` assigns the {} destination more than once",
+                profile.topology_slot().name()
             )));
         }
     }
@@ -510,17 +545,16 @@ fn import_destinations(
         .collect();
     if !missing.is_empty() {
         return Err(Error::Usage(format!(
-            "production profile destinations must name alliance-eastern, alliance-kalimdor, and instances exactly once; missing {}",
+            "production profile destinations need one eastern profile, one Kalimdor profile, and instances; missing topology slots {}",
             missing.join(", ")
         )));
     }
     Ok(WorldProfile::SHARDED
         .iter()
-        .map(|profile| ImportDestination {
-            shard: configured
+        .map(|profile| {
+            configured
                 .remove(profile)
-                .expect("every required profile was checked"),
-            profile: *profile,
+                .expect("every required profile was checked")
         })
         .collect())
 }
@@ -2375,6 +2409,75 @@ pub(crate) mod tests {
         .to_string();
         assert!(error.contains("alliance-eastern"), "{error}");
         assert!(error.contains("instances"), "{error}");
+    }
+
+    #[test]
+    fn starting_profiles_keep_the_complete_sharded_import_plan() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        set_topology(&project, Topology::Sharded);
+        let stack = healthy();
+        let options = ImportOptions {
+            profile_shards: [
+                "starting-eastern=lyracore",
+                "starting-kalimdor=lyracore-world-1",
+                "instances=lyracore-instances",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            ..accepted(&data)
+        };
+        run_world(
+            &project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(
+            dump_destinations(&stack),
+            vec![
+                ("lyracore".to_string(), "starting-eastern".to_string()),
+                (
+                    "lyracore-world-1".to_string(),
+                    "starting-kalimdor".to_string()
+                ),
+                ("lyracore-instances".to_string(), "instances".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn alternate_profiles_cannot_assign_the_same_continent_twice() {
+        let error = import_destinations(
+            Topology::Sharded,
+            &[
+                "alliance-eastern=first".to_string(),
+                "starting-eastern=second".to_string(),
+                "starting-kalimdor=third".to_string(),
+                "instances=fourth".to_string(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn separate_import_profiles_cannot_overwrite_the_same_shard() {
+        let error = import_destinations(
+            Topology::Sharded,
+            &[
+                "starting-eastern=world".to_string(),
+                "starting-kalimdor=world".to_string(),
+                "instances=instances".to_string(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("distinct Shards"), "{error}");
     }
 
     #[test]
