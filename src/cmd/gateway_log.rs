@@ -1,5 +1,7 @@
 //! Structured evidence from the latest gateway start in a possibly append-only log.
 
+use std::collections::BTreeMap;
+
 pub(crate) const CONNECTED_MARKER: &str = "coordinator connected to shard";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -24,6 +26,7 @@ impl GatewayEvidence {
             saw_start: start.is_some(),
             ..Self::default()
         };
+        let mut occupancy_by_shard = BTreeMap::new();
 
         for line in latest.lines() {
             if let Some((_, tail)) = line.split_once(CONNECTED_MARKER) {
@@ -57,9 +60,23 @@ impl GatewayEvidence {
             evidence.coordinator_token_warning |=
                 line.contains("LYRACORE_COORDINATOR_TOKEN is unset");
             evidence.realm_address_warning |= line.contains("realm advertises ");
-            evidence.metrics_warning |= line.contains("LYRACORE_METRICS_DB_IDS is unset")
-                || line.contains("occupancy=unmeasured");
+            evidence.metrics_warning |= line.contains("LYRACORE_METRICS_DB_IDS is unset");
+            if let Some((_, tail)) = line.split_once("SHARDLOAD shard=") {
+                let mut fields = tail.split_whitespace();
+                let name = plausible_database(fields.next());
+                let occupancy = fields
+                    .next()
+                    .and_then(|field| field.strip_prefix("occupancy="));
+                if let (Some(name), Some(occupancy)) = (name, occupancy) {
+                    let measured = occupancy
+                        .strip_suffix('%')
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .is_some_and(|value| value.is_finite() && value >= 0.0);
+                    occupancy_by_shard.insert(name, measured);
+                }
+            }
         }
+        evidence.metrics_warning |= occupancy_by_shard.values().any(|measured| !measured);
         evidence
     }
 }
@@ -140,5 +157,70 @@ mod tests {
              WARN expected `coordinator connected to shard` for each database\n",
         );
         assert!(evidence.connected.is_empty());
+    }
+
+    #[test]
+    fn measured_occupancy_replaces_the_same_shards_startup_gap() {
+        let evidence = GatewayEvidence::parse(
+            "gateway starting: current\n\
+             SHARDLOAD shard=lyracore occupancy=unmeasured sessions=0\n\
+             SHARDLOAD shard=lyracore-world-1 occupancy=unmeasured sessions=0\n\
+             SHARDLOAD shard=lyracore occupancy=4.9% sessions=0\n\
+             SHARDLOAD shard=lyracore-world-1 occupancy=0.3% sessions=0\n",
+        );
+        assert!(!evidence.metrics_warning);
+    }
+
+    #[test]
+    fn measured_occupancy_does_not_hide_another_shards_gap() {
+        let evidence = GatewayEvidence::parse(
+            "gateway starting: current\n\
+             SHARDLOAD shard=lyracore-world-1 occupancy=unmeasured sessions=0\n\
+             SHARDLOAD shard=lyracore occupancy=4.9% sessions=0\n",
+        );
+        assert!(evidence.metrics_warning);
+    }
+
+    #[test]
+    fn occupancy_warning_returns_when_measurement_stops() {
+        let evidence = GatewayEvidence::parse(
+            "gateway starting: current\n\
+             SHARDLOAD shard=lyracore occupancy=4.9% sessions=0\n\
+             SHARDLOAD shard=lyracore occupancy=unmeasured sessions=0\n",
+        );
+        assert!(evidence.metrics_warning);
+    }
+
+    #[test]
+    fn invalid_occupancy_cannot_clear_a_measurement_gap() {
+        for value in ["NaN%", "inf%", "-1%", "4.9", "bad%"] {
+            let evidence = GatewayEvidence::parse(&format!(
+                "gateway starting: current\n\
+                 SHARDLOAD shard=lyracore occupancy=unmeasured sessions=0\n\
+                 SHARDLOAD shard=lyracore occupancy={value} sessions=0\n"
+            ));
+            assert!(evidence.metrics_warning, "{value}");
+        }
+    }
+
+    #[test]
+    fn a_new_start_does_not_inherit_old_occupancy_gaps() {
+        let evidence = GatewayEvidence::parse(
+            "gateway starting: previous\n\
+             SHARDLOAD shard=lyracore-world-1 occupancy=unmeasured sessions=0\n\
+             gateway starting: current\n\
+             SHARDLOAD shard=lyracore occupancy=0.0% sessions=0\n",
+        );
+        assert!(!evidence.metrics_warning);
+    }
+
+    #[test]
+    fn measured_occupancy_does_not_hide_missing_configuration() {
+        let evidence = GatewayEvidence::parse(
+            "gateway starting: current\n\
+             WARN LYRACORE_METRICS_DB_IDS is unset\n\
+             SHARDLOAD shard=lyracore occupancy=4.9% sessions=0\n",
+        );
+        assert!(evidence.metrics_warning);
     }
 }

@@ -284,9 +284,9 @@ pub fn inspect(options: &StatusOptions, runner: &dyn ProcessRunner) -> StatusRep
             Outcome::Pass
         },
         if evidence.metrics_warning {
-            "writer occupancy is unmeasured; configure LYRACORE_METRICS_DB_IDS for every shard"
+            "latest shard occupancy is unmeasured or metrics configuration is missing; check LYRACORE_METRICS_DB_IDS and the metrics endpoint"
         } else {
-            "no missing-metrics warning in the latest start"
+            "no unresolved metrics warning in the latest start"
         },
     );
     report
@@ -431,6 +431,22 @@ mod tests {
             realm_address.detail.contains("every database"),
             "{realm_address:?}"
         );
+    }
+
+    #[test]
+    fn recovered_occupancy_does_not_warn_about_startup_samples() {
+        let tmp = TempDir::new().unwrap();
+        let log = format!(
+            "{}SHARDLOAD shard=lyracore occupancy=unmeasured sessions=0\n\
+             SHARDLOAD shard=lyracore occupancy=4.9% sessions=0\n",
+            healthy_log()
+        );
+        let status = inspect(&options(&tmp, &log), &healthy_stack().runner());
+        assert_eq!(status.outcome(), Outcome::Pass);
+        assert!(status
+            .checks
+            .iter()
+            .any(|check| { check.label == "writer occupancy" && check.outcome == Outcome::Pass }));
     }
 
     #[test]
