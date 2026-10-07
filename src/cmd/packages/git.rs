@@ -1201,7 +1201,7 @@ mod tests {
         let project = checkout(&tmp);
         let tree = candidate(&tmp, "anything");
         install(&project, &repository(&tree, FIRST));
-        super::super::lifecycle::disable(&project, "greeter").unwrap();
+        super::super::lifecycle::tests::disable_without_stack(&project, "greeter").unwrap();
 
         std::fs::write(tree.join("src/mod.rs"), "pub fn greet_v2() {}\n").unwrap();
         let stack = repository(&tree, SECOND);

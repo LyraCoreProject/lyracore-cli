@@ -123,10 +123,11 @@ USAGE:
   lyracore packages enable NAME                move a disabled Package back into packages/, where
                                                the build compiles it again. Its provenance stamp
                                                travels with the folder
-  lyracore packages disable NAME               move an enabled Package into .lyracore/packages-
+  lyracore packages disable NAME [--yes]       move an enabled Package into .lyracore/packages-
                                                disabled/, out of the build's sight but still on
-                                               disk. Reports the Module tables it registers first,
-                                               because publishing without them is a schema change
+                                               disk. With the dev stack up, asks, then runs
+                                               Package Teardown on every Shard first, so the next
+                                               publish can remove the Package's tables
   lyracore packages remove NAME [--yes]        delete a DISABLED Package from this checkout. Asks
                                                first, and refuses a folder that no longer matches
                                                its recorded content identity, because those local
@@ -270,6 +271,8 @@ pub enum Command {
     },
     PackagesDisable {
         name: String,
+        /// `--yes`: the teardown confirmation was answered in advance (scripted runs).
+        yes: bool,
     },
     PackagesRemove {
         name: String,
@@ -438,14 +441,19 @@ impl Command {
             ["packages", "enable", rest @ ..] => Ok(Command::PackagesEnable {
                 name: parse_packages_move("enable", rest)?,
             }),
-            ["packages", "disable", rest @ ..] => Ok(Command::PackagesDisable {
-                name: parse_packages_move("disable", rest)?,
-            }),
-            ["packages", "remove", rest @ ..] => parse_packages_remove(rest),
+            ["packages", "disable", rest @ ..] => {
+                let (name, yes) = parse_packages_name_and_yes("disable", rest)?;
+                Ok(Command::PackagesDisable { name, yes })
+            }
+            ["packages", "remove", rest @ ..] => {
+                let (name, yes) = parse_packages_name_and_yes("remove", rest)?;
+                Ok(Command::PackagesRemove { name, yes })
+            }
             ["packages", ..] => Err(Error::Usage(
                 "`packages` supports: add FOLDER|GIT-URL [--yes], build, check, config NAME [KEY \
-                 [VALUE]] [--new], disable NAME, enable NAME, list, new NAME, remove NAME [--yes], \
-                 replay [DATABASE ...] [--check] [--yes] [--force-all], update [NAME] [--yes]"
+                 [VALUE]] [--new], disable NAME [--yes], enable NAME, list, new NAME, remove NAME \
+                 [--yes], replay [DATABASE ...] [--check] [--yes] [--force-all], update [NAME] \
+                 [--yes]"
                     .to_string(),
             )),
 
@@ -798,10 +806,10 @@ fn parse_packages_config(args: &[&str]) -> Result<Command> {
     }))
 }
 
-/// `packages enable NAME` and `packages disable NAME`: one Package name, no options.
+/// `packages enable NAME`: one Package name, no options.
 ///
-/// Neither destroys anything, and each is the other's undo, so neither has a confirmation to
-/// answer in advance. `--yes` on one of them would be a flag that did nothing.
+/// Enabling destroys nothing, so it has no confirmation to answer in advance. `--yes` would be a
+/// flag that did nothing.
 fn parse_packages_move(verb: &str, args: &[&str]) -> Result<String> {
     match args {
         [name] if !name.starts_with('-') => Ok((*name).to_string()),
@@ -817,12 +825,12 @@ fn parse_packages_move(verb: &str, args: &[&str]) -> Result<String> {
     }
 }
 
-/// `packages remove NAME [--yes]`, in either order.
+/// `packages remove NAME [--yes]` and `packages disable NAME [--yes]`, in either order.
 ///
-/// `--yes` answers the deletion question in advance, like `packages add`'s. A name is a Package
-/// folder name, so it can never start with `-`; an option-looking argument is refused rather than
-/// taken as one.
-fn parse_packages_remove(args: &[&str]) -> Result<Command> {
+/// `--yes` answers the confirmation in advance, like `packages add`'s. A name is a Package folder
+/// name, so it can never start with `-`; an option-looking argument is refused rather than taken
+/// as one.
+fn parse_packages_name_and_yes(verb: &str, args: &[&str]) -> Result<(String, bool)> {
     let mut name: Option<String> = None;
     let mut yes = false;
     for arg in args {
@@ -830,25 +838,22 @@ fn parse_packages_remove(args: &[&str]) -> Result<Command> {
             "--yes" => yes = true,
             option if option.starts_with('-') => {
                 return Err(Error::Usage(format!(
-                    "unknown `packages remove` option '{option}' — the only one is --yes"
+                    "unknown `packages {verb}` option '{option}' — the only one is --yes"
                 )))
             }
             candidate if name.is_none() => name = Some(candidate.to_string()),
             extra => {
                 return Err(Error::Usage(format!(
-                    "`packages remove` deletes one Package at a time (got a second: '{extra}')"
+                    "`packages {verb}` takes one Package at a time (got a second: '{extra}')"
                 )))
             }
         }
     }
-    match name {
-        Some(name) => Ok(Command::PackagesRemove { name, yes }),
-        None => Err(Error::Usage(
-            "`packages remove` needs the name of a disabled Package, e.g. `packages remove \
-             my-package`"
-                .to_string(),
-        )),
-    }
+    name.map(|name| (name, yes)).ok_or_else(|| {
+        Error::Usage(format!(
+            "`packages {verb}` needs a Package name, e.g. `packages {verb} my-package`"
+        ))
+    })
 }
 
 /// `dev up [--single] [--lan <IP>]`, in either order.
@@ -1900,13 +1905,21 @@ mod tests {
                 name: "greeter".to_string()
             }
         );
-        assert_eq!(
-            parse("packages disable greeter").unwrap(),
-            Command::PackagesDisable {
-                name: "greeter".to_string()
-            }
-        );
-        // Neither destroys anything, so neither has a confirmation for --yes to answer.
+        for (line, yes) in [
+            ("packages disable greeter", false),
+            ("packages disable greeter --yes", true),
+            ("packages disable --yes greeter", true),
+        ] {
+            assert_eq!(
+                parse(line).unwrap(),
+                Command::PackagesDisable {
+                    name: "greeter".to_string(),
+                    yes
+                },
+                "{line}"
+            );
+        }
+        // Enabling destroys nothing, so it has no confirmation for --yes to answer.
         for line in [
             "packages enable",
             "packages enable greeter extra",

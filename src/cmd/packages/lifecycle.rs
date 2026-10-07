@@ -6,10 +6,14 @@
 //! next build compiles; a state file, a stamp key or a config entry all could.
 //!
 //! Both directories are on the same filesystem, so the rename is atomic and its inverse is the
-//! other command. That is why `enable` and `disable` do not ask the way `add` and `remove` do:
-//! nothing is destroyed, and the undo is one command their own output names. The provenance stamp
-//! lives inside the folder, so a move carries it along untouched. A re-enabled Package still says
-//! where it came from and what it looked like when it was installed.
+//! other command. The provenance stamp lives inside the folder, so a move carries it along
+//! untouched. A re-enabled Package still says where it came from and what it looked like when it
+//! was installed.
+//!
+//! `disable` runs Package Teardown first when the recorded dev stack is up: `teardown_package` on
+//! every Shard, then once more on each. A publish cannot remove a table that holds rows, and
+//! teardown empties them. Teardown deletes the Package's rows, so `disable` asks first, the way
+//! `remove` does. `enable` destroys nothing and does not ask.
 //!
 //! `remove` is the one that deletes, so it is the one with gates. It requires the Package to be
 //! disabled already, because the build must stop compiling a Package before the folder goes. It
@@ -22,13 +26,20 @@
 
 use super::stamp::{self, SOURCE_GIT, SOURCE_LOCAL, SOURCE_OFFICIAL};
 use super::{
-    collision, collision_reason, confirm, find, review::TrustReview, shell_quote, InstalledPackage,
-    PackageName, PackageState,
+    collision, collision_reason, confirm, find, review::TrustReview, shard_list, shell_quote,
+    InstalledPackage, PackageName, PackageState,
 };
+use crate::cmd::dev::{operator_call_failure, reducer_url};
 use crate::cmd::import::Prompt;
-use crate::project::ProjectLayout;
+use crate::http::HttpClient;
+use crate::proc::ProcessRunner;
+use crate::project::{Component, ProjectLayout};
+use crate::state::RuntimeState;
 use crate::{Error, Result};
 use std::path::Path;
+
+/// The Module reducer that stops a Package on one Shard. Idempotent.
+const TEARDOWN_REDUCER: &str = "teardown_package";
 
 /// Move a disabled Package back into `packages/`, where the next build compiles it.
 pub fn enable(project: &ProjectLayout, name: &str) -> Result<()> {
@@ -67,8 +78,16 @@ pub fn enable(project: &ProjectLayout, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Move an enabled Package out of `packages/`, so the build stops seeing it.
-pub fn disable(project: &ProjectLayout, name: &str) -> Result<()> {
+/// What `disable` needs to reach the Realm for Package Teardown.
+pub struct Realm<'a> {
+    pub runner: &'a dyn ProcessRunner,
+    pub http: &'a dyn HttpClient,
+    pub prompt: &'a dyn Prompt,
+}
+
+/// Move an enabled Package out of `packages/`, so the build stops seeing it. Package Teardown runs
+/// on every Shard first when the recorded dev stack is up.
+pub fn disable(project: &ProjectLayout, realm: &Realm, name: &str, yes: bool) -> Result<()> {
     let name = PackageName::parse(name)?;
     let package = find(project, &name)?;
     if package.state == PackageState::Disabled {
@@ -79,11 +98,25 @@ pub fn disable(project: &ProjectLayout, name: &str) -> Result<()> {
         )));
     }
 
-    // The tables have to be read while the Package is still where it is, and reported before the
-    // move, because they are the one consequence of disabling that the operator cannot undo by
-    // enabling it again: by then a publish may already have refused, or dropped, the tables.
     let review = TrustReview::scan(&package.dir)?;
-    if !review.tables.is_empty() {
+    let state = RuntimeState::load(&project.state_file())?;
+    if state.record(Component::Spacetime).is_some() {
+        let shards = super::recorded_databases(project)?;
+        println!();
+        print!("{}", teardown_notice(&name, &shards));
+        confirm(
+            realm.prompt,
+            &format!(
+                "Tear down '{}' on every Shard and move it out of the build?",
+                name.as_str()
+            ),
+            "Nothing was torn down or moved.",
+            yes,
+        )?;
+        teardown(project, realm, &name, &shards)?;
+    } else if !review.tables.is_empty() {
+        // No recorded stack to tear down on. The tables are reported before the move, because a
+        // publish that would remove them refuses while they hold rows.
         println!();
         print!("{}", table_warning(&name, &review.tables));
     }
@@ -96,23 +129,82 @@ pub fn disable(project: &ProjectLayout, name: &str) -> Result<()> {
     print!("{moved}");
     print!("{}", super::provenance_report(package.stamp.as_ref()));
 
+    let mut steps = vec![
+        "lyracore publish       publish the module WITHOUT the Package to every database of this \
+         realm"
+            .to_string(),
+    ];
+    if !review.runtime_scripts.is_empty() {
+        steps.push(
+            "lyracore packages replay\n                         remove the Package's Runtime Scripts from every Shard"
+                .to_string(),
+        );
+    }
+    steps.push(client_sync_step(&review));
     println!();
     println!(
-        "'{}' is out of the build and still on disk. Two steps remain, and this command ran \
-         neither:",
-        name.as_str()
+        "'{}' is out of the build and still on disk. {} steps remain, and this command ran none \
+         of them:",
+        name.as_str(),
+        steps.len()
     );
-    println!(
-        "  lyracore publish       publish the module WITHOUT the Package to every database of \
-         this realm"
-    );
-    println!("  {}", client_sync_step(&review));
+    for step in steps {
+        println!("  {step}");
+    }
     println!();
     println!(
         "undo this move with `lyracore packages enable {}`.",
         name.as_str()
     );
     Ok(())
+}
+
+/// Run `teardown_package` for `name` on every Shard, then once more on each. The second pass
+/// catches a Character that crossed into a Shard the first pass had already torn down.
+fn teardown(
+    project: &ProjectLayout,
+    realm: &Realm,
+    name: &PackageName,
+    shards: &[String],
+) -> Result<()> {
+    let credential = crate::token::resolve_existing(realm.runner, &project.token_file())?;
+    let arguments = serde_json::to_string(&(name.as_str(),))?;
+    for _pass in 0..2 {
+        for shard in shards {
+            realm
+                .http
+                .post_json(
+                    &reducer_url(shard, TEARDOWN_REDUCER),
+                    Some(credential.token()),
+                    &arguments,
+                )
+                .map_err(|error| {
+                    Error::Process(format!(
+                        "{}\n  Package Teardown stopped at {shard}. Nothing was moved. Teardown is \
+                         idempotent: fix the cause and re-run `lyracore packages disable {}`. To \
+                         move the Package without a teardown, stop the stack first with \
+                         `lyracore dev down`.",
+                        operator_call_failure(project, shard, error),
+                        name.as_str()
+                    ))
+                })?;
+        }
+    }
+    println!("torn down {} on: {}", name.as_str(), shard_list(shards));
+    Ok(())
+}
+
+/// What Package Teardown will do, printed before the question that allows it.
+fn teardown_notice(name: &PackageName, shards: &[String]) -> String {
+    format!(
+        "Before the move, Package Teardown stops '{}' on {} Shard(s): {}\n  It empties the \
+         Package's tables and deletes its Package Config, so the next `lyracore publish`\n  can \
+         remove the tables. Its Characters go offline and stay as Dormant Characters.\n  \
+         Enabling the Package again starts it with empty tables.\n",
+        name.as_str(),
+        shards.len(),
+        shard_list(shards)
+    )
 }
 
 /// Delete a disabled Package from this checkout, after the operator confirms it.
@@ -265,24 +357,24 @@ fn check_recorded_and_clean(package: &InstalledPackage) -> Result<()> {
     Ok(())
 }
 
-/// What a disabled Package's tables mean for the next publish.
+/// What a Package disabled without a teardown means for the next publish.
 ///
 /// Disabling takes the tables out of the Module schema, so the next publish is a schema change that
 /// drops them. `lyracore publish` never passes SpacetimeDB's destructive wipe flag (see
 /// `cmd::publish`), so that publish stops rather than deleting rows. This informs; it does not
-/// block. Refusing to disable a Package because its tables hold rows would leave the operator no
-/// way to take a Package out of the build at all.
+/// block. Refusing to disable a Package because no stack is up would leave the operator no way to
+/// take a Package out of the build at all.
 fn table_warning(name: &PackageName, tables: &[String]) -> String {
     format!(
-        "'{}' registers {} table(s) in the Module schema:\n      {}\n  Disabling it takes them \
-         out of that schema, so the next `lyracore publish` is a\n  schema change that removes \
-         them. `lyracore publish` never passes SpacetimeDB's\n  destructive wipe flag, so a \
-         publish that would drop a table still holding rows\n  STOPS instead of deleting them. \
-         The rows are intact if that happens, and\n  `lyracore packages enable {}` puts the \
-         tables back.\n",
+        "'{}' registers {} table(s) in the Module schema:\n      {}\n  No dev stack is \
+         recorded, so Package Teardown does not run. Disabling takes the tables\n  out of the \
+         schema, and a `lyracore publish` that would drop a table still holding rows\n  STOPS \
+         instead of deleting them. If that happens, run `lyracore packages enable {}`,\n  \
+         `lyracore dev up`, then `lyracore packages disable {}` again.\n",
         name.as_str(),
         tables.len(),
         tables.join(", "),
+        name.as_str(),
         name.as_str()
     )
 }
@@ -345,13 +437,143 @@ fn client_sync_step(review: &TrustReview) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::stamp::ProvenanceStamp;
     use super::*;
     use crate::cmd::packages::tests::{candidate, checkout, Answer};
     use crate::cmd::packages::{add, inventory};
+    use crate::http::fake::FakeHttp;
     use crate::proc::fake::FakeStack;
+    use crate::project::Topology;
+    use crate::state::ProcessRecord;
     use tempfile::TempDir;
+
+    /// `disable` in a checkout with no recorded dev stack, where no teardown runs.
+    pub(crate) fn disable_without_stack(project: &ProjectLayout, name: &str) -> Result<()> {
+        let stack = FakeStack::new();
+        let runner = stack.runner();
+        let realm = Realm {
+            runner: &runner,
+            http: &FakeHttp::failing("no stack is recorded, so nothing may call the Realm"),
+            prompt: &Answer("no"),
+        };
+        disable(project, &realm, name, false)
+    }
+
+    /// A recorded sharded dev stack and a persisted operator credential.
+    fn with_stack(project: &ProjectLayout) {
+        crate::token::resolve_or_mint(
+            &FakeStack::new()
+                .fail_on("login show", "not logged in")
+                .runner(),
+            &FakeHttp::new(),
+            &project.token_file(),
+            "http://127.0.0.1:3000",
+        )
+        .unwrap();
+        RuntimeState {
+            spacetime: Some(ProcessRecord {
+                pid: 4000,
+                identity: "spacetime".to_string(),
+            }),
+            gateway: Some(ProcessRecord {
+                pid: 4001,
+                identity: "gateway".to_string(),
+            }),
+            topology: Topology::Sharded.as_str().to_string(),
+            ..Default::default()
+        }
+        .save(&project.state_file())
+        .unwrap();
+    }
+
+    fn teardown_calls(http: &FakeHttp) -> Vec<String> {
+        http.requests()
+            .into_iter()
+            .filter(|request| request.url.ends_with("/call/teardown_package"))
+            .map(|request| {
+                assert_eq!(request.body, r#"["greeter"]"#);
+                assert!(request.bearer.is_some(), "teardown is an Operator call");
+                request.url
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_a_stack_up_disable_tears_down_every_shard_twice_before_the_move() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        with_stack(&project);
+        let stack = FakeStack::new();
+        let runner = stack.runner();
+        let http = FakeHttp::new();
+        let realm = Realm {
+            runner: &runner,
+            http: &http,
+            prompt: &Answer("yes"),
+        };
+
+        disable(&project, &realm, "greeter", false).unwrap();
+
+        let shards = crate::cmd::packages::recorded_databases(&project).unwrap();
+        let calls = teardown_calls(&http);
+        assert_eq!(calls.len(), shards.len() * 2, "{calls:?}");
+        for (call, shard) in calls.iter().zip(shards.iter().chain(shards.iter())) {
+            assert!(call.contains(&format!("/database/{shard}/")), "{call}");
+        }
+        assert!(project.packages_disabled_dir().join("greeter").is_dir());
+    }
+
+    #[test]
+    fn a_refused_teardown_moves_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        with_stack(&project);
+        let stack = FakeStack::new();
+        let runner = stack.runner();
+        let http = FakeHttp::refusing("teardown_package", "Character 7 is crossing between Shards");
+        let realm = Realm {
+            runner: &runner,
+            http: &http,
+            prompt: &Answer("yes"),
+        };
+
+        let error = disable(&project, &realm, "greeter", true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("crossing between Shards"), "{error}");
+        assert!(error.contains("Nothing was moved"), "{error}");
+        assert_eq!(
+            teardown_calls(&http).len(),
+            1,
+            "teardown stops at the first Refusal"
+        );
+        assert!(project.packages_dir().join("greeter").is_dir());
+    }
+
+    #[test]
+    fn an_answer_other_than_yes_tears_down_nothing_and_moves_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        with_stack(&project);
+        let stack = FakeStack::new();
+        let runner = stack.runner();
+        let http = FakeHttp::new();
+        let realm = Realm {
+            runner: &runner,
+            http: &http,
+            prompt: &Answer("no"),
+        };
+
+        assert!(disable(&project, &realm, "greeter", false).is_err());
+
+        assert!(teardown_calls(&http).is_empty());
+        assert!(project.packages_dir().join("greeter").is_dir());
+    }
 
     /// Install `name` from a folder outside the checkout, the way an operator would, so every
     /// lifecycle test starts from a real stamped Package rather than a hand-built directory.
@@ -375,7 +597,7 @@ mod tests {
         let enabled = project.packages_dir().join("greeter");
         let disabled = project.packages_disabled_dir().join("greeter");
 
-        disable(&project, "greeter").unwrap();
+        disable_without_stack(&project, "greeter").unwrap();
 
         assert!(!enabled.exists(), "the build must not still see it");
         assert!(disabled.join("src/mod.rs").is_file());
@@ -400,7 +622,7 @@ mod tests {
         installed(&tmp, &project, "greeter");
         let before = ProvenanceStamp::read(&project.packages_dir().join("greeter")).unwrap();
 
-        disable(&project, "greeter").unwrap();
+        disable_without_stack(&project, "greeter").unwrap();
         let disabled = project.packages_disabled_dir().join("greeter");
         assert_eq!(ProvenanceStamp::read(&disabled), Some(before.clone()));
         assert_eq!(
@@ -445,8 +667,8 @@ mod tests {
         let error = enable(&project, "greeter").unwrap_err();
         assert!(error.to_string().contains("already enabled"), "{error}");
 
-        disable(&project, "greeter").unwrap();
-        let error = disable(&project, "greeter").unwrap_err();
+        disable_without_stack(&project, "greeter").unwrap();
+        let error = disable_without_stack(&project, "greeter").unwrap_err();
         assert!(error.to_string().contains("already disabled"), "{error}");
     }
 
@@ -456,7 +678,7 @@ mod tests {
         let project = checkout(&tmp);
         installed(&tmp, &project, "greeter");
 
-        let error = disable(&project, "absent").unwrap_err();
+        let error = disable_without_stack(&project, "absent").unwrap_err();
         assert!(error.to_string().contains("packages list"), "{error}");
 
         std::fs::rename(
@@ -464,7 +686,7 @@ mod tests {
             project.packages_dir().join("my-package"),
         )
         .unwrap();
-        let error = disable(&project, "my_package").unwrap_err();
+        let error = disable_without_stack(&project, "my_package").unwrap_err();
         assert!(error.to_string().contains("'my-package'"), "{error}");
         assert!(
             project.packages_dir().join("my-package").is_dir(),
@@ -485,7 +707,7 @@ mod tests {
         assert!(warning.contains("pkg_greeter_log"), "{warning}");
         assert!(warning.contains("still holding rows"), "{warning}");
         // Informs, never blocks: the move itself must still happen.
-        disable(&project, "greeter").unwrap();
+        disable_without_stack(&project, "greeter").unwrap();
         assert!(project.packages_disabled_dir().join("greeter").is_dir());
     }
 
@@ -496,7 +718,7 @@ mod tests {
         installed(&tmp, &project, "greeter");
         installed(&tmp, &project, "keeper");
         let source = tmp.path().join("sources/greeter");
-        disable(&project, "greeter").unwrap();
+        disable_without_stack(&project, "greeter").unwrap();
 
         remove(&project, &Answer("yes"), "greeter", false).unwrap();
 
@@ -532,7 +754,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         installed(&tmp, &project, "greeter");
-        disable(&project, "greeter").unwrap();
+        disable_without_stack(&project, "greeter").unwrap();
         let disabled = project.packages_disabled_dir().join("greeter");
         std::fs::write(disabled.join("src/mod.rs"), "// hours of local work\n").unwrap();
 
@@ -569,7 +791,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         installed(&tmp, &project, "greeter");
-        disable(&project, "greeter").unwrap();
+        disable_without_stack(&project, "greeter").unwrap();
         let disabled = project.packages_disabled_dir().join("greeter");
 
         let error = remove(&project, &Answer("no"), "greeter", false).unwrap_err();
@@ -668,9 +890,9 @@ mod tests {
         .unwrap();
         let calls_after_add = stack.rendered().len();
 
-        disable(&project, "greeter").unwrap();
+        disable_without_stack(&project, "greeter").unwrap();
         enable(&project, "greeter").unwrap();
-        disable(&project, "greeter").unwrap();
+        disable_without_stack(&project, "greeter").unwrap();
         remove(&project, &Answer("yes"), "greeter", true).unwrap();
 
         assert_eq!(
