@@ -142,9 +142,17 @@ fn run(args: &[String]) -> Result<i32> {
         Command::PackagesEnable { name } => {
             cmd::packages::lifecycle::enable(&ProjectLayout::discover()?, &name).map(|_| EXIT_OK)
         }
-        Command::PackagesDisable { name } => {
-            cmd::packages::lifecycle::disable(&ProjectLayout::discover()?, &name).map(|_| EXIT_OK)
-        }
+        Command::PackagesDisable { name, yes } => cmd::packages::lifecycle::disable(
+            &ProjectLayout::discover()?,
+            &cmd::packages::lifecycle::Realm {
+                runner: &runner,
+                http: &http,
+                prompt: &cmd::import::TtyPrompt::packages_disable(),
+            },
+            &name,
+            yes,
+        )
+        .map(|_| EXIT_OK),
         Command::PackagesReplay(options) => cmd::packages::replay::run(
             &ProjectLayout::discover()?,
             &runner,

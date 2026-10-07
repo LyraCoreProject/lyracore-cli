@@ -109,6 +109,12 @@ impl TtyPrompt {
         }
     }
 
+    pub const fn packages_disable() -> Self {
+        Self {
+            no_terminal_remedy: "pass --yes to confirm the Package Teardown in advance",
+        }
+    }
+
     pub const fn packages_replay() -> Self {
         Self {
             no_terminal_remedy: "pass --yes to confirm the replay in advance, or --check to see \
