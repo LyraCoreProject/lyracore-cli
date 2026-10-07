@@ -136,7 +136,7 @@ pub fn disable(project: &ProjectLayout, realm: &Realm, name: &str, yes: bool) ->
     ];
     if !review.runtime_scripts.is_empty() {
         steps.push(
-            "lyracore packages replay   remove the Package's Runtime Scripts from every Shard"
+            "lyracore packages replay\n                         remove the Package's Runtime Scripts from every Shard"
                 .to_string(),
         );
     }
@@ -197,10 +197,10 @@ fn teardown(
 /// What Package Teardown will do, printed before the question that allows it.
 fn teardown_notice(name: &PackageName, shards: &[String]) -> String {
     format!(
-        "Before the move, Package Teardown runs '{}' down on {} Shard(s): {}\n  It empties the \
-         Package's tables and deletes its Package Config, so the next `lyracore publish` can \
-         remove\n  the tables. Its Characters go offline and stay as Dormant Characters. \
-         Enabling the Package\n  again starts it with empty tables.\n",
+        "Before the move, Package Teardown stops '{}' on {} Shard(s): {}\n  It empties the \
+         Package's tables and deletes its Package Config, so the next `lyracore publish`\n  can \
+         remove the tables. Its Characters go offline and stay as Dormant Characters.\n  \
+         Enabling the Package again starts it with empty tables.\n",
         name.as_str(),
         shards.len(),
         shard_list(shards)
