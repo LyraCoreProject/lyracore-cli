@@ -83,7 +83,7 @@ impl Input {
     /// What changed, and where to look — the sentence a staleness refusal names this input with.
     pub fn description(self) -> &'static str {
         match self {
-            Input::Source => "its Datascript source under datascripts/src/<package>/",
+            Input::Source => "its Datascript source under packages/<package>/datascripts/ or datascripts/src/<package>/",
             Input::Generated => {
                 "the generated Module schema/typings in datascripts/generated/ (a schema change)"
             }
@@ -269,9 +269,8 @@ fn hash_file(path: &Path) -> Result<String> {
 }
 
 /// The enabled Package folder an artifact was discovered inside — the top component of its path
-/// relative to `packages/`. This is a Package's FOLDER name, which is what selects its Datascript
-/// source under `datascripts/src/<folder>/`; it need not equal the artifact's own declared
-/// `package` identity.
+/// relative to `packages/`. Its folder name selects both Datascript source locations; it need not
+/// equal the artifact's declared `package` identity.
 pub fn package_dir(project: &ProjectLayout, artifact_path: &Path) -> Result<PathBuf> {
     let root = project.packages_dir();
     let relative = artifact_path.strip_prefix(&root).map_err(|_| {
@@ -309,7 +308,18 @@ pub fn compute(
     })?;
     let datascripts = project.datascripts_dir();
 
-    let source_hash = hash_tree(&project.datascripts_src_dir().join(name), None)?;
+    let legacy_hash = hash_tree(&project.datascripts_src_dir().join(name), None)?;
+    let local = package_dir.join("datascripts");
+    let source_hash = if local.is_dir() {
+        let mut hasher = Sha256::new();
+        hasher.update(legacy_hash.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(hash_tree(&local, None)?.as_bytes());
+        format!("sha256-datascript-sources-v1:{:x}", hasher.finalize())
+    } else {
+        // Preserve existing Build Identities when the Package has no local Datascript directory.
+        legacy_hash
+    };
     let generated_hash = hash_tree(
         &project.datascript_types_dir(),
         Some(ProjectLayout::BASE_SNAPSHOT_FILE),
@@ -711,6 +721,24 @@ mod tests {
 
         let changed = recorded.changed_against(&current, available);
         assert_eq!(changed, vec![Input::Source], "{changed:?}");
+    }
+
+    #[test]
+    fn changed_package_local_datascript_sources_are_named() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let dir = package_dir_of(&project).join("datascripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("welcome.ts"), "// original\n").unwrap();
+        let (recorded, _) = compute(&project, &package_dir_of(&project), HASH_A).unwrap();
+
+        std::fs::write(dir.join("welcome.ts"), "// changed\n").unwrap();
+        let (current, available) = compute(&project, &package_dir_of(&project), HASH_A).unwrap();
+
+        assert_eq!(
+            recorded.changed_against(&current, available),
+            vec![Input::Source]
+        );
     }
 
     #[test]

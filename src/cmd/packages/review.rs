@@ -71,6 +71,8 @@ pub struct TrustReview {
     pub client_overrides: usize,
     /// Runtime Scripts this Package would run, by artifact name or pre-build source file.
     pub runtime_scripts: Vec<String>,
+    /// Package-local Datascripts run by the author during `packages build`.
+    pub datascripts: Vec<String>,
     /// Physical generated Package Delta artifacts.
     pub package_delta_count: usize,
     /// Generated Package Deltas grouped by Import Family.
@@ -149,6 +151,17 @@ impl TrustReview {
             .collect();
         source_scripts.sort();
 
+        review.datascripts = entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::File
+                    && entry.relative.parent() == Some(Path::new("datascripts"))
+                    && entry.relative.extension().is_some_and(|ext| ext == "ts")
+            })
+            .map(|entry| entry.relative.to_string_lossy().into_owned())
+            .collect();
+        review.datascripts.sort();
+
         let generated = artifact::summarize_package_artifacts(package_dir)?;
         review.runtime_scripts = if generated.has_script_artifact {
             generated.runtime_scripts
@@ -200,9 +213,7 @@ impl TrustReview {
         self.character_owned.sort();
     }
 
-    /// Does this Package register anything at all? A folder with neither Rust nor client content
-    /// is rejected before the review runs, so a review with nothing in it means Rust that
-    /// registers nothing — which is still trusted code.
+    /// Whether the inventory contains no registered behavior or authoring scripts.
     pub fn registers_nothing(&self) -> bool {
         self.tables.is_empty()
             && self.reducers.is_empty()
@@ -212,6 +223,7 @@ impl TrustReview {
             && self.addons.is_empty()
             && self.client_overrides == 0
             && self.runtime_scripts.is_empty()
+            && self.datascripts.is_empty()
             && self.package_delta_count == 0
     }
 
@@ -250,6 +262,14 @@ impl TrustReview {
             self.runtime_scripts.len(),
             &self.runtime_scripts,
         ));
+        out.push_str(&row(
+            "datascripts",
+            self.datascripts.len(),
+            &self.datascripts,
+        ));
+        if !self.datascripts.is_empty() {
+            out.push_str("  Datascripts are trusted code run on your machine by packages build.\n");
+        }
         out.push_str(&format!(
             "  trusted Rust       {} file(s), {} line(s)\n",
             self.rust_files, self.rust_lines
@@ -286,6 +306,7 @@ impl TrustReview {
             ("addons", self.addons.len()),
             ("client overrides", self.client_overrides),
             ("runtime scripts", self.runtime_scripts.len()),
+            ("datascripts", self.datascripts.len()),
         ] {
             if count > 0 {
                 parts.push(format!("{count} {label}"));
@@ -799,6 +820,19 @@ mod tests {
             review.kinds_summary().contains("2 runtime scripts"),
             "{review:?}"
         );
+    }
+
+    #[test]
+    fn package_local_datascripts_are_named_before_installation() {
+        let tmp = package(&[
+            ("datascripts/welcome.ts", "// a Datascript\n"),
+            ("datascripts/README.md", "not a script\n"),
+        ]);
+        let review = TrustReview::scan(tmp.path()).unwrap();
+        assert_eq!(review.datascripts, ["datascripts/welcome.ts"]);
+        assert!(!review.registers_nothing());
+        assert!(review.kinds_summary().contains("1 datascripts"));
+        assert!(review.render(tmp.path()).contains("run on your machine"));
     }
 
     #[test]
