@@ -396,6 +396,20 @@ guarantees that used to belong to `scripts/publish-module.sh` and `scripts/prefl
 properties of `cmd/publish.rs` and `cmd/preflight.rs` here, so a checkout that ships without a
 `scripts/` or `adapters/` directory is still fully drivable.
 
+## Host operations scripts
+
+`deploy/` holds the production host scripts that are not CLI commands: the SpacetimeDB history
+prune, the disk guard that renews the Bot Capacity Lease, the diagnostic capture wrapper, and their
+systemd units. They moved here from the LyraCore repository. The server's `docs/danger-zones.md`
+and `docs/operations/disk-policy.md` give the install steps; run them from a checkout of this
+repository. The Standalone Supervisor unit stays in the LyraCore checkout, because
+`service reconcile` reads it from there.
+
+```bash
+bash deploy/spacetimedb-prune-test.sh
+python3 -m unittest discover -s deploy -p 'test_*.py'
+```
+
 ## Exit codes
 
 | Code | Meaning |
