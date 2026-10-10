@@ -662,7 +662,8 @@ repairs schedules on each published Shard before continuing. Rust Packages cause
 every run; artifact provenance does not track compiled Rust. Disable a Rust Package through
 `packages disable` before removing it so its tables and Characters receive Package Teardown.
 
-Artifact application then runs Shard by Shard:
+Each Shard completes its publish and schedule repair, when needed, before applying artifacts.
+Only then does the command continue to the next Shard:
 
 - The spell Import Family reimports `Spell.dbc`, then applies the enabled Package Deltas.
 - The script Import Family reconciles `game_script` to the enabled Script Artifacts in one

@@ -527,10 +527,7 @@ pub fn run(
     let mut confirmation = if wanted.is_empty() {
         String::new()
     } else {
-        format!(
-            "{} Proceed?",
-            question(&wanted, artifacts, scripts, &pending)
-        )
+        question(&wanted, artifacts, scripts, &pending)
     };
     if !publish_shards.is_empty() {
         confirmation = format!(
@@ -552,25 +549,44 @@ pub fn run(
         runner.run_streaming(&import::build_importer_command(project))?;
     }
     if !publish_shards.is_empty() {
-        publish::run_and_repair(project, runner, &publish_shards).map_err(|error| {
-            Error::Process(format!(
-                "{error}\n  Artifact application has not started. Retry with:\n    {}",
-                resume_command(&shards, options)
-            ))
-        })?;
+        preflight::run(project, runner)?;
+        publish::require_loot_roll_upgrade_ready(project, runner, &publish_shards)?;
     }
 
     let mut completed = Vec::new();
+    let mut published = Vec::new();
+    let pending_targets: Vec<_> = targets
+        .iter()
+        .filter(|target| target.wanted() || publish_shards.contains(&target.database))
+        .collect();
     let stop_context = StopContext {
         targets: &targets,
-        wanted: &wanted,
+        wanted: &pending_targets,
         shards: &shards,
         options,
     };
 
-    for (index, target) in wanted.iter().enumerate() {
+    for (index, target) in pending_targets.iter().enumerate() {
         println!();
         println!("==> applying {}", target.database);
+        if publish_shards.contains(&target.database) {
+            publish::publish_and_repair(project, runner, &target.database).map_err(|error| {
+                let remaining: Vec<_> = pending_targets[index + 1..]
+                    .iter()
+                    .map(|target| target.database.clone())
+                    .collect();
+                Error::Process(format!(
+                    "{error}\n  Published and repaired: {}\n  Completed artifacts:\n    \
+                     spell: {}\n    script: {}\n  Not attempted: {}\n  Retry with:\n    {}",
+                    shard_list(&published),
+                    shard_list(&completed_in(&completed, SPELL_FAMILY)),
+                    shard_list(&completed_in(&completed, SCRIPT_FAMILY)),
+                    shard_list(&remaining),
+                    resume_command(&shards, options)
+                ))
+            })?;
+            published.push(target.database.clone());
+        }
 
         match &target.spell {
             Some(reason) => println!("  {SPELL_FAMILY}: already complete — {reason}"),
@@ -589,6 +605,7 @@ pub fn run(
                         index,
                         &error.to_string(),
                         &completed,
+                        &published,
                         &stop_context,
                     ));
                 }
@@ -612,6 +629,7 @@ pub fn run(
                         index,
                         &refusal(&error),
                         &completed,
+                        &published,
                         &stop_context,
                     ));
                 }
@@ -621,7 +639,11 @@ pub fn run(
     }
 
     println!();
-    println!("applied:");
+    println!(
+        "Module published and schedules repaired: {}",
+        shard_list(&published)
+    );
+    println!("applied artifacts:");
     println!(
         "{}",
         applied(
@@ -644,7 +666,7 @@ pub fn run(
     );
     if !skipped.is_empty() {
         println!(
-            "already complete in both families, untouched: {}",
+            "artifact families already complete: {}",
             shard_list(&skipped)
         );
     }
@@ -666,6 +688,7 @@ fn stopped(
     index: usize,
     cause: &str,
     completed: &[(String, &'static str)],
+    published: &[String],
     context: &StopContext<'_, '_>,
 ) -> Error {
     let completed_spell = completed_in(completed, SPELL_FAMILY);
@@ -678,13 +701,14 @@ fn stopped(
         .collect::<Vec<_>>();
 
     Error::Process(format!(
-        "{cause}\n  apply stopped at: {failed} ({family} family)\n  completed this run:\n    \
+        "{cause}\n  Module published and schedules repaired: {published}\n  apply stopped at: {failed} ({family} family)\n  completed this run:\n    \
          {SPELL_FAMILY}: {completed_spell}\n    {SCRIPT_FAMILY}: {completed_script}\n  already complete \
          before this run:\n    {SPELL_FAMILY}: {skipped_spell}\n    {SCRIPT_FAMILY}: \
          {skipped_script}\n  unattempted artifact Shards: {untouched}\n\n  Earlier completed \
          families stay applied. Script reconciliation is one transaction. A failed spell import \
          may already have replaced base rows. Fix the cause and re-run the SAME command. \
          Provenance makes completed families skip:\n    {resume}",
+        published = shard_list(published),
         completed_spell = shard_list(&completed_spell),
         completed_script = shard_list(&completed_script),
         skipped_spell = shard_list(&skipped_spell),
@@ -859,7 +883,14 @@ mod tests {
                 ),
             )
             .unwrap();
-            super::super::identity::write_all(&self.project, &self.enabled().deltas).unwrap();
+            for artifact in self
+                .enabled()
+                .deltas
+                .iter()
+                .filter(|a| a.package == package)
+            {
+                super::super::identity::write(&self.project, artifact).unwrap();
+            }
             self
         }
 
@@ -1852,7 +1883,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("Any family that completed earlier stays applied."),
+            message.contains("Earlier completed families stay applied."),
             "{message}"
         );
     }
@@ -2186,7 +2217,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_failure_repairs_completed_shards_and_stops_before_artifacts() {
+    fn publish_failure_keeps_prior_shards_complete_and_stops() {
         let checkout = Checkout::new();
         checkout
             .with_rust()
@@ -2201,14 +2232,15 @@ mod tests {
         .unwrap_err();
         let message = error.to_string();
         assert!(
-            message.contains("completed: one") && message.contains("not attempted: three"),
+            message.contains("Published and repaired: one")
+                && message.contains("Not attempted: three"),
             "{message}"
         );
         assert!(stack
             .rendered()
             .iter()
             .any(|call| call.contains("one debug_repair_after_publish")));
-        assert!(script_applies(&stack).is_empty());
+        assert_eq!(script_applies(&stack).len(), 1);
         assert!(
             message.contains("lyracore packages apply one two three"),
             "{message}"
@@ -2237,5 +2269,94 @@ mod tests {
             .rendered()
             .iter()
             .any(|call| call.starts_with("spacetime publish") && call.ends_with("two")));
+    }
+    #[test]
+    fn artifact_failure_leaves_later_shards_unpublished() {
+        let checkout = Checkout::new();
+        checkout
+            .with_rust()
+            .with_script("greeter", 100300, "greeter.login");
+        let stack = FakeStack::new().fail_on("one apply_package_deltas", "script refused");
+        let error = run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one", "two"]),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Module published and schedules repaired: one"),
+            "{message}"
+        );
+        assert!(
+            message.contains("unattempted artifact Shards: two"),
+            "{message}"
+        );
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|call| call.starts_with("spacetime publish") && call.ends_with("two")));
+    }
+
+    #[test]
+    fn script_build_preserves_a_source_free_delta_without_a_snapshot() {
+        let checkout = Checkout::new();
+        checkout
+            .with_package("imported", 133, 1500)
+            .with_script_source();
+        let sidecar = checkout
+            .generated("imported")
+            .join(super::super::identity::IDENTITY_FILE);
+        let identity = std::fs::read(&sidecar).unwrap();
+        std::fs::remove_file(checkout.project.base_snapshot_file()).unwrap();
+        let stack = FakeStack::new().with_stdout("bun --version", "1.3.7");
+        run(
+            &checkout.project,
+            &PackageCompiler {
+                checkout: &checkout,
+                stack: stack.clone(),
+            },
+            &ScriptedPrompt::new(&[]),
+            &checkout.options(&["one"]),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(sidecar).unwrap(), identity);
+        assert!(!checkout.project.base_snapshot_file().exists());
+        assert_eq!(applies(&stack).len(), 1);
+        assert_eq!(script_applies(&stack).len(), 1);
+    }
+
+    #[test]
+    fn a_new_snapshot_cannot_certify_a_source_free_delta() {
+        let checkout = Checkout::new();
+        std::fs::write(checkout.project.base_snapshot_file(), "snapshot A").unwrap();
+        checkout.with_package("imported", 134, 1500);
+        let sidecar = checkout
+            .generated("imported")
+            .join(super::super::identity::IDENTITY_FILE);
+        let identity = std::fs::read(&sidecar).unwrap();
+        std::fs::remove_file(checkout.project.base_snapshot_file()).unwrap();
+        let dir = checkout.project.packages_dir().join("greeter/datascripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("spells.ts"), "// new Datascript").unwrap();
+        let stack = FakeStack::new().with_stdout("bun --version", "1.3.7");
+        let error = run(
+            &checkout.project,
+            &PackageCompiler {
+                checkout: &checkout,
+                stack: stack.clone(),
+            },
+            &ScriptedPrompt::new(&[]),
+            &checkout.options(&["one"]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Base Snapshot"), "{error}");
+        assert_eq!(std::fs::read(sidecar).unwrap(), identity);
+        assert!(applies(&stack).is_empty());
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|call| call.starts_with("spacetime publish")));
     }
 }

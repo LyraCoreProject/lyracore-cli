@@ -93,6 +93,9 @@ pub(crate) fn prepare(
         }
         println!("preparing installed Package sources");
         build::run(project, runner)?;
+        // A newly extracted Base Snapshot can reveal drift in a source-free Delta. Its identity
+        // was preserved by the build, so compare it again before any Realm write.
+        run(project, runner)?;
         let built = artifact::read_enabled(&project.packages_dir())?;
         for (names, emitted) in [
             (

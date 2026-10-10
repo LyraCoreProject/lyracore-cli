@@ -395,7 +395,6 @@ fn recovery_note(name: &PackageName, stamp: Option<&stamp::ProvenanceStamp>) -> 
     }
 }
 
-/// The `client sync` line, which says whether there is any client content to sync at all.
 #[cfg(test)]
 pub(crate) mod tests {
     use super::stamp::ProvenanceStamp;

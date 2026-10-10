@@ -430,6 +430,9 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
         );
     }
     if datascript_packages.is_empty() && script_packages.is_empty() {
+        if project.packages_dir().is_dir() {
+            validate_generated_artifacts(project, runner, None)?;
+        }
         return Ok(());
     }
 
@@ -466,7 +469,12 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
             return Err(error);
         }
     };
-    if let Err(error) = identity::write_all(project, &enabled.deltas) {
+    let identities = enabled
+        .deltas
+        .iter()
+        .filter(|delta| datascript_packages.contains(&delta.package))
+        .try_for_each(|delta| identity::write(project, delta));
+    if let Err(error) = identities {
         transition.rollback()?;
         return Err(error);
     }
