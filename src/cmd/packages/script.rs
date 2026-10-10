@@ -24,8 +24,8 @@
 //!    A Datascript sits outside a Package folder because only artifacts belong in one; a Runtime
 //!    Script is a Package's own content, and the Official Package Collection ships both halves.
 //!  * The builder is handed the hook Event Binding catalogue, read from `lyracore-delta-check
-//!    --print-events`, so a `@event` typo fails while the author can still see which file it is in.
-//!    The catalogue is never copied into the toolchain: the Module owns it, and a copy would drift.
+//!    --print-events`, so an unknown Event Binding fails with its source filename. The Module owns
+//!    the catalogue; the toolchain derives author declarations from it.
 
 use std::path::{Path, PathBuf};
 
@@ -351,7 +351,8 @@ const LEGACY_TRANSITION_BACKUP_SUFFIX: &str = ".lyracore-script-build-backup";
 ///
 /// The inventory is deliberately shallow and contains only regular `.ts` and `.lua` files. This
 /// is the same definition as the Runtime Script Toolchain's `scriptSources`: a nested file, a
-/// symlink, or a README cannot affect emitted Lua and therefore cannot affect its Build Identity.
+/// symlink, or a README is not executable. The Package's `script-ids.json` is a separate Build
+/// Identity input.
 pub fn source_files(project: &ProjectLayout, package: &str) -> Result<Vec<PathBuf>> {
     let scripts_dir = project.package_scripts_dir(package);
     if !scripts_dir.is_dir() {
@@ -501,7 +502,7 @@ pub fn run_builds(
         .map_err(|e| {
             Error::Process(format!(
                 "could not read the Event Binding catalogue from `lyracore-delta-check \
-                 --print-events`, so a script's `@event` could not be checked against the Module. \
+                 --print-events`, so a script's Event Binding could not be checked against the Module. \
                  Nothing was compiled.\n  ({e})"
             ))
         })?;
@@ -1254,6 +1255,13 @@ mod tests {
         std::fs::create_dir_all(&notes).unwrap();
         std::fs::write(notes.join("README.md"), "not executable\n").unwrap();
         std::fs::create_dir_all(notes.join("nested.ts")).unwrap();
+        let ledger_only = project.packages_dir().join("ledger_only");
+        std::fs::create_dir_all(&ledger_only).unwrap();
+        std::fs::write(
+            ledger_only.join("script-ids.json"),
+            "{\"version\":1,\"package\":\"ledger_only\",\"ids\":{\"removed\":100200}}\n",
+        )
+        .unwrap();
 
         assert_eq!(packages_with_scripts(&project).unwrap(), ["alpha", "zeta"]);
     }
@@ -1276,6 +1284,29 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(relative, ["alpha.ts", "zeta.lua"]);
+    }
+
+    #[test]
+    fn a_retained_script_id_ledger_does_not_keep_an_artifact_after_its_last_source_leaves() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_scripts(&project, "fire_nova", "welcome.ts");
+        let ledger = project.packages_dir().join("fire_nova/script-ids.json");
+        std::fs::write(
+            &ledger,
+            "{\"version\":1,\"package\":\"fire_nova\",\"ids\":{\"welcome\":100200}}\n",
+        )
+        .unwrap();
+        let artifact = with_built_artifact(&project, "fire_nova");
+        let sidecar = artifact.with_file_name(identity::SCRIPT_IDENTITY_FILE);
+        std::fs::remove_file(project.package_scripts_dir("fire_nova").join("welcome.ts")).unwrap();
+
+        let removed = remove_artifacts_without_sources(&project).unwrap();
+
+        assert_eq!(removed.as_slice(), std::slice::from_ref(&artifact));
+        assert!(!artifact.exists());
+        assert!(!sidecar.exists());
+        assert!(ledger.exists());
     }
 
     #[test]
