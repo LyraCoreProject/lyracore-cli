@@ -102,8 +102,7 @@ fn is_scp_style(url: &str) -> bool {
     !user.is_empty() && !host.is_empty() && !host.contains('/') && !path.is_empty()
 }
 
-/// A repository cloned into this checkout's scratch space, at the commit its default branch points
-/// at right now. Dropping it removes the clone.
+/// A repository cloned at its default branch or a named tag. Dropping it removes the scratch copy.
 ///
 /// `pub(crate)`: [`official`](super::official) clones the Official Package Collection through the
 /// same machinery, rather than a second copy of it, so a clone behaves identically (depth-1,
@@ -118,6 +117,7 @@ impl RepositoryClone {
         project: &ProjectLayout,
         runner: &dyn ProcessRunner,
         source: &GitSource,
+        tag: Option<&str>,
     ) -> Result<Self> {
         let root = project.state_dir.join(CLONE_DIR);
         std::fs::create_dir_all(&root)?;
@@ -132,9 +132,12 @@ impl RepositoryClone {
         };
 
         println!("· cloning {}", source.url());
+        let mut clone_command = CommandSpec::new("git").arg("clone");
+        if let Some(tag) = tag {
+            clone_command = clone_command.arg("--branch").arg(tag);
+        }
         runner.run_and_wait(
-            &CommandSpec::new("git")
-                .arg("clone")
+            &clone_command
                 // One commit is all an install records and all it copies. History would be fetched
                 // only to be deleted with `.git` a moment later.
                 .arg("--depth")
@@ -170,6 +173,22 @@ impl RepositoryClone {
                 source.url()
             )));
         }
+        if let Some(tag) = tag {
+            // `clone --branch` also accepts branch names. Only the tag authorizes this revision.
+            let tagged_revision = runner.run_and_wait(
+                &CommandSpec::new("git")
+                    .cwd(clone.dir.clone())
+                    .arg("rev-parse")
+                    .arg("--verify")
+                    .arg(format!("refs/tags/{tag}^{{commit}}")),
+            )?;
+            if tagged_revision.trim() != revision {
+                return Err(Error::Process(format!(
+                    "cloned {} but HEAD does not match tag '{tag}'. Nothing was installed.",
+                    source.url()
+                )));
+            }
+        }
         clone.revision = revision;
         Ok(clone)
     }
@@ -203,7 +222,7 @@ pub(crate) fn add(
     super::check_not_tracked(project, runner, &name, source.url())?;
     super::check_collision(project, &name)?;
 
-    let clone = RepositoryClone::fetch(project, runner, source)?;
+    let clone = RepositoryClone::fetch(project, runner, source, None)?;
     super::install(
         project,
         runner,
@@ -446,11 +465,8 @@ impl UpdateSource {
         runner: &dyn ProcessRunner,
     ) -> Result<RepositoryClone> {
         match self {
-            Self::Git(source) => RepositoryClone::fetch(project, runner, source),
-            Self::Official => {
-                let collection = super::official::collection_source();
-                RepositoryClone::fetch(project, runner, &collection)
-            }
+            Self::Git(source) => RepositoryClone::fetch(project, runner, source, None),
+            Self::Official => super::official::fetch(project, runner),
         }
     }
 

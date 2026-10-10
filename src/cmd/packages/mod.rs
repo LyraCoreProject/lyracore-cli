@@ -1036,6 +1036,12 @@ pub(super) mod tests {
              Filter::Sql(\"SELECT * FROM game_character WHERE owner_identity = :sender\");\n",
         )
         .unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("docs/package-api.md"),
+            "# Package API, version 1\n",
+        )
+        .unwrap();
         ProjectLayout::from_root(&root).unwrap()
     }
 

@@ -8,6 +8,9 @@
 //! Source's — see [`RepositoryClone`] — so this module reuses that machinery rather than a second
 //! copy of it.
 //!
+//! The checkout's `docs/package-api.md` selects a collection tag such as `api-v1`. A missing tag
+//! refuses the install or update before changing the installed Package.
+//!
 //! THE COMMIT IS RECORDED AT INSTALL AND UPDATE TIME. The stamp records the exact commit the named
 //! directory was resolved at. `packages update` re-clones the Official Package Collection and
 //! resolves that same name in the candidate tree before it asks to replace the installed Package.
@@ -32,8 +35,59 @@ use std::path::{Path, PathBuf};
 pub(crate) const COLLECTION_URL: &str = "https://github.com/LyraCoreProject/packages";
 
 /// The one cloneable source behind the Official Package Collection.
-pub(crate) fn collection_source() -> GitSource {
+fn collection_source() -> GitSource {
     GitSource::parse(COLLECTION_URL).expect("COLLECTION_URL is a hardcoded https:// URL")
+}
+
+/// Where a checkout states its Package API version, on the first line.
+const PACKAGE_API_DOC: &str = "docs/package-api.md";
+const PACKAGE_API_HEADING: &str = "# Package API, version ";
+
+/// The collection tag for this checkout's Package API version: `api-v<N>`.
+pub(crate) fn pinned_tag(project: &ProjectLayout) -> Result<String> {
+    let doc = project.root.join(PACKAGE_API_DOC);
+    let text = std::fs::read_to_string(&doc).map_err(|error| {
+        Error::State(format!(
+            "cannot read {}: {error}. The Official Package Collection is tagged per Package API \
+             version, and this file names the version this checkout builds. Nothing was changed.",
+            doc.display()
+        ))
+    })?;
+    let version = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix(PACKAGE_API_HEADING))
+        .map(str::trim)
+        .filter(|version| {
+            !version.is_empty()
+                && !version.starts_with('0')
+                && version.bytes().all(|b| b.is_ascii_digit())
+        });
+    match version {
+        Some(version) => Ok(format!("api-v{version}")),
+        None => Err(Error::State(format!(
+            "{} does not open with `{PACKAGE_API_HEADING}<N>`, so this checkout's Package API \
+             version is unknown and no Official Package Collection tag can be chosen. Nothing \
+             was changed.",
+            doc.display()
+        ))),
+    }
+}
+
+/// Clone the collection at the tag for this checkout's Package API version.
+pub(crate) fn fetch(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+) -> Result<RepositoryClone> {
+    let tag = pinned_tag(project)?;
+    RepositoryClone::fetch(project, runner, &collection_source(), Some(&tag)).map_err(|error| {
+        Error::Process(format!(
+            "cannot clone the Official Package Collection ({COLLECTION_URL}) at `{tag}`, the tag \
+             for this checkout's Package API version ({PACKAGE_API_DOC}). If git says the remote \
+             branch was not found, the collection has no Packages for this Package API version \
+             yet. Nothing was changed.\n  ({error})"
+        ))
+    })
 }
 
 /// Install the top-level directory `name` names in the collection, the same way `packages add`
@@ -51,8 +105,7 @@ pub(crate) fn add(
     super::check_not_tracked(project, runner, name, &source_name)?;
     super::check_collision(project, name)?;
 
-    let collection = collection_source();
-    let clone = RepositoryClone::fetch(project, runner, &collection)?;
+    let clone = fetch(project, runner)?;
     let source = resolve(clone.path(), name)?;
 
     super::install(
@@ -150,6 +203,7 @@ mod tests {
         FakeStack::new()
             .with_git_clone(tree)
             .with_stdout("rev-parse HEAD", &format!("{revision}\n"))
+            .with_stdout("rev-parse --verify refs/tags/", &format!("{revision}\n"))
     }
 
     #[test]
@@ -174,6 +228,100 @@ mod tests {
             recorded.content_identity,
             stamp::content_identity(&installed).unwrap(),
             "the stamp must record the identity of what was actually copied"
+        );
+    }
+
+    #[test]
+    fn the_collection_is_cloned_at_the_tag_for_the_checkout_package_api_version() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::write(
+            project.root.join(PACKAGE_API_DOC),
+            "# Package API, version 3\n\nbody\n",
+        )
+        .unwrap();
+        let root = collection(&tmp, &["greeter"]);
+        let added = repository(&root, FIRST);
+        super::super::add(&project, &added.runner(), &Answer("yes"), "greeter", true).unwrap();
+        let updated = repository(&root, SECOND);
+        super::super::git::update(
+            &project,
+            &updated.runner(),
+            &Answer("yes"),
+            Some("greeter"),
+            true,
+        )
+        .unwrap();
+
+        for stack in [added, updated] {
+            let clones: Vec<String> = stack
+                .rendered()
+                .into_iter()
+                .filter(|call| call.starts_with("git clone"))
+                .collect();
+            assert_eq!(clones.len(), 1, "{clones:?}");
+            assert!(clones[0].contains("--branch api-v3"), "{clones:?}");
+        }
+    }
+
+    #[test]
+    fn a_package_api_version_without_a_tag_names_the_tag_and_installs_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = repository(&collection(&tmp, &["greeter"]), FIRST).fail_on(
+            "git clone",
+            "fatal: Remote branch api-v1 not found in upstream origin",
+        );
+
+        let error = super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("`api-v1`"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("no Packages for this Package API version"),
+            "{error}"
+        );
+        assert!(!project.packages_dir().exists(), "{error}");
+    }
+
+    #[test]
+    fn a_branch_cannot_replace_the_package_api_tag() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = repository(&collection(&tmp, &["greeter"]), FIRST)
+            .with_stdout("rev-parse --verify refs/tags/api-v1", SECOND);
+
+        let error = super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("HEAD does not match tag 'api-v1'"),
+            "{error}"
+        );
+        assert!(!project.packages_dir().exists());
+    }
+
+    #[test]
+    fn a_checkout_without_a_package_api_version_is_refused_before_the_network() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::write(project.root.join(PACKAGE_API_DOC), "# Package API\n").unwrap();
+        let stack = repository(&collection(&tmp, &["greeter"]), FIRST);
+
+        let error = super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains(PACKAGE_API_HEADING), "{error}");
+        assert!(
+            stack
+                .rendered()
+                .iter()
+                .all(|call| !call.contains("git clone")),
+            "an unknown version must be refused before the network"
         );
     }
 
