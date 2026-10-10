@@ -1,7 +1,7 @@
 //! The enabled Packages' generated Delta artifacts: what they claim, what they disagree about, and
 //! the digest the Shard records for each one.
 //!
-//! `packages replay` has to answer two questions before it writes to the first Shard: is this set of
+//! `packages apply` has to answer two questions before it writes to the first Shard: is this set of
 //! artifacts applicable at all, and does a Shard already hold exactly this set. Both are answered
 //! here, from the working tree, once per run.
 //!
@@ -132,7 +132,7 @@ pub struct Artifact {
 /// A Package ships every artifact kind it has into one `data/.generated/` directory, so the walk
 /// meets Script Artifacts as well as Package Deltas. They are a different artifact with a different
 /// applier and a different Import Family, so they are kept apart rather than merged: `packages
-/// replay` applies both, and every other caller wants only the Deltas.
+/// apply` applies both, and every other caller wants only the Deltas.
 #[derive(Debug, Clone, Default)]
 pub struct Enabled {
     /// Every Package Delta, ordered by Package folder then file name.
@@ -179,7 +179,7 @@ pub fn read_enabled(root: &Path) -> Result<Enabled> {
 ///
 /// This is an inventory for the trust review. It reads the Package Delta envelope and table names,
 /// while the core parser remains the authority for keys, columns, types, and claim policy. Script
-/// Artifacts use their full parser because each Runtime Script is already a supported replay unit.
+/// Artifacts use their full parser because each Runtime Script is already a supported artifact.
 pub fn summarize_package_artifacts(package: &Path) -> Result<ReviewArtifacts> {
     if !package.is_dir() {
         return Err(Error::Usage(format!(

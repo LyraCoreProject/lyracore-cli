@@ -242,7 +242,7 @@ fn parse_count(database: &str, state: &str, output: &str) -> Result<u64> {
     })
 }
 
-fn require_loot_roll_upgrade_ready(
+pub(crate) fn require_loot_roll_upgrade_ready(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     databases: &[String],
@@ -296,6 +296,25 @@ pub fn run(
     databases: &[String],
     skip_preflight: bool,
 ) -> Result<()> {
+    run_inner(project, runner, databases, skip_preflight, false)
+}
+
+/// Activate compiled Packages and repair schedules on each Shard before publishing the next.
+pub(crate) fn run_and_repair(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    databases: &[String],
+) -> Result<()> {
+    run_inner(project, runner, databases, false, true)
+}
+
+fn run_inner(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    databases: &[String],
+    skip_preflight: bool,
+    repair: bool,
+) -> Result<()> {
     let databases = if databases.is_empty() {
         recorded_databases(project)?
     } else {
@@ -325,6 +344,18 @@ pub fn run(
                 database_list(&databases[..index]),
                 database_list(&databases[index + 1..])
             )));
+        }
+        if repair {
+            runner
+                .run_and_wait(&import::call_command(project, database, "debug_repair_after_publish"))
+                .map_err(|error| Error::Process(format!(
+                    "{error}\n  '{database}' was published, but schedule repair failed.\n  \
+                     Published and repaired: {}\n  Not attempted: {}\n  \
+                     Repair this Shard with `spacetime call -s local {database} \
+                     debug_repair_after_publish`, then retry `lyracore packages apply` with the same Shard list.",
+                    database_list(&databases[..index]),
+                    database_list(&databases[index + 1..]),
+                )))?;
         }
     }
 

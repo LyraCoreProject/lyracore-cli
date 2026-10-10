@@ -153,10 +153,10 @@ fn run(args: &[String]) -> Result<i32> {
             yes,
         )
         .map(|_| EXIT_OK),
-        Command::PackagesReplay(options) => cmd::packages::replay::run(
+        Command::PackagesApply(options) => cmd::packages::apply::run(
             &ProjectLayout::discover()?,
             &runner,
-            &cmd::import::TtyPrompt::packages_replay(),
+            &cmd::import::TtyPrompt::packages_apply(),
             &options,
         )
         .map(|_| EXIT_OK),

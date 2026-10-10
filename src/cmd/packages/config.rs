@@ -366,7 +366,7 @@ fn set(
 
 /// A write that stopped part way through the Realm.
 ///
-/// Fail fast, never rollback — the rule `packages replay` already runs on, for the same reason: a
+/// Fail fast, never rollback — the rule `packages apply` already runs on, for the same reason: a
 /// Realm that reported success while half-written cannot be recovered from its own report, and one
 /// that named the Shard it stopped at can. Re-running the same command after the cause is fixed
 /// rewrites the Shards that already took the value, which changes nothing on them.
@@ -450,7 +450,7 @@ mod tests {
 
         /// A stack that was brought up in this topology. The gateway record is what makes the
         /// recorded topology count: with nothing recorded, the default sharded fixture is the
-        /// answer, which is the behaviour `publish` and `packages replay` already have.
+        /// answer, which is the behaviour `publish` and `packages apply` already have.
         fn with_topology(&self, topology: Topology) -> &Self {
             RuntimeState {
                 gateway: Some(ProcessRecord {

@@ -426,31 +426,14 @@ fn update_one(
     preserved.discard();
 
     println!();
-    if compiled_in {
-        println!(
-            "'{name}' is at {} and preflight is green. Two steps remain, and this command runs \
-             neither:",
-            short(clone.revision())
-        );
-        println!("  lyracore publish       compile the new revision into the module and publish it to every database");
-    } else {
-        println!(
-            "'{name}' is at {} and preflight is green. It is disabled, so the module still does \
-             not compile it. Two steps remain, and this command runs neither:",
-            short(clone.revision())
-        );
+    println!(
+        "'{name}' is at {} and preflight is green.",
+        short(clone.revision())
+    );
+    if !compiled_in {
         println!("  lyracore packages enable {name}");
-        println!("  lyracore publish       compile the new revision into the module and publish it to every database");
     }
-    if review.addons.is_empty() && review.client_overrides == 0 {
-        println!("  lyracore client sync   not needed: this Package ships no client content");
-    } else {
-        println!(
-            "  lyracore client sync   install its {} addon(s) and {} client override(s) into your client",
-            review.addons.len(),
-            review.client_overrides
-        );
-    }
+    print!("{}", super::activation_steps(&package.dir));
     Ok(true)
 }
 

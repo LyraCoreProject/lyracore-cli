@@ -403,7 +403,7 @@ pub fn packages_with_scripts(project: &ProjectLayout) -> Result<Vec<String>> {
 /// Remove Script Artifacts previously emitted by this build after their last source disappears.
 ///
 /// A `script.identity` sidecar marks the source-built mode. A source-free Script Artifact without
-/// that sidecar is prebuilt Lua and remains untouched, so an Operator can install and replay it
+/// that sidecar is prebuilt Lua and remains untouched, so an Operator can install and apply it
 /// without Bun. Artifact files are removed before the sidecar. If removal fails, the remaining
 /// sidecar keeps any surviving artifact from being mistaken for prebuilt Lua by `packages check`.
 pub fn remove_artifacts_without_sources(project: &ProjectLayout) -> Result<Vec<PathBuf>> {
@@ -888,7 +888,7 @@ pub fn stale(project: &ProjectLayout, artifacts: &[PathBuf]) -> Result<Vec<Strin
         if !has_sources {
             problems.push(format!(
                 "{}: its Runtime Script sources were removed, but a source-built Script Artifact \
-                 remains. Run `lyracore packages build` to remove it before replay.",
+                 remains. Run `lyracore packages build` to remove it before applying.",
                 path.display()
             ));
             continue;

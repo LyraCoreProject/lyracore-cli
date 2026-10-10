@@ -115,9 +115,9 @@ impl TtyPrompt {
         }
     }
 
-    pub const fn packages_replay() -> Self {
+    pub const fn packages_apply() -> Self {
         Self {
-            no_terminal_remedy: "pass --yes to confirm the replay in advance, or --check to see \
+            no_terminal_remedy: "pass --yes to confirm the application in advance, or --check to see \
                                  the plan without writing",
         }
     }

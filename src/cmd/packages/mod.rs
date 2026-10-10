@@ -2,7 +2,7 @@
 //! packages list`, the lifecycle verbs in [`lifecycle`] (`enable`, `disable`, `remove`), the Git
 //! Package Source verbs in [`git`] (the URL form of `add` and all `update` forms), the Official
 //! Package Collection form of `add` in [`official`] (the bare-name form), and the two verbs that
-//! reach a running Realm: [`replay`] (a Package's Delta) and [`config`] (a Package's key-values).
+//! reach a running Realm: [`apply`] (a Package's Delta) and [`config`] (a Package's key-values).
 //!
 //! A Package is a drop-in folder under `packages/<name>/` that the server build compiles into the
 //! module with no core-file edits: `module/build.rs` discovers it, generates `pub mod pkg_<name>`
@@ -25,6 +25,7 @@
 //! operator would meet much later, holding two folders and no way to tell which one the build
 //! compiled.
 
+pub mod apply;
 pub mod artifact;
 pub mod build;
 pub mod check;
@@ -33,7 +34,6 @@ pub mod git;
 pub mod identity;
 pub mod lifecycle;
 pub(crate) mod official;
-pub mod replay;
 pub mod review;
 pub mod script;
 pub mod stamp;
@@ -538,17 +538,8 @@ pub(crate) fn install(
     })?;
 
     println!();
-    println!("'{}' is installed and preflight is green. Two steps remain, and this command runs neither:", name.as_str());
-    println!("  lyracore publish       compile the Package into the module and publish it to every database");
-    if review.addons.is_empty() && review.client_overrides == 0 {
-        println!("  lyracore client sync   not needed: this Package ships no client content");
-    } else {
-        println!(
-            "  lyracore client sync   install its {} addon(s) and {} client override(s) into your client",
-            review.addons.len(),
-            review.client_overrides
-        );
-    }
+    println!("'{}' is installed and preflight is green.", name.as_str());
+    print!("{}", activation_steps(&destination));
     Ok(())
 }
 
@@ -906,26 +897,32 @@ fn validate_scaffold_names(reference: &Path, name: &PackageName) -> Result<()> {
     Ok(())
 }
 
+fn activation_steps(package_dir: &Path) -> String {
+    let mut text = String::new();
+    if ["src", "scripts", "datascripts", "data"]
+        .iter()
+        .any(|dir| package_dir.join(dir).is_dir())
+    {
+        text.push_str("  lyracore packages apply   prepare and activate installed Packages on your development topology\n");
+    }
+    if package_dir.join("client").is_dir() {
+        text.push_str("  lyracore client sync      install enabled client content\n");
+    }
+    text
+}
+
 fn scaffold_next_steps(package_dir: &Path) -> String {
     let mut text = String::new();
     if package_dir.join("scripts").is_dir() || package_dir.join("datascripts").is_dir() {
         text.push_str("Generated artifacts are omitted. Choose distinct Script IDs or Package Spell IDs \
-            before using this copy beside another. Run `lyracore packages build` to build artifacts \
-            for the renamed source, then apply them with `lyracore packages replay` on your development \
-            topology.\n\n");
+            before using this copy beside another. `packages apply` builds the renamed sources.\n\n");
     }
     if package_dir.join("datascripts").is_dir() {
         text.push_str(
-            "The Datascript needs a Base Snapshot from your own client data. Keep its \
-            generated Delta local.\n\n",
+            "The Datascript needs your own client data. Keep its generated Delta local.\n\n",
         );
     }
-    if package_dir.join("src").is_dir() {
-        text.push_str("Publish through the normal realm update to load the Rust half.\n\n");
-    }
-    if package_dir.join("client").is_dir() {
-        text.push_str("Run `lyracore client sync` to install the client half.\n\n");
-    }
+    text.push_str(&activation_steps(package_dir));
     text
 }
 
@@ -1731,7 +1728,7 @@ pub(super) mod tests {
         assert!(!scaffolded.join("src").exists());
         assert!(!scaffolded.join("data/.generated").exists());
         let readme = std::fs::read_to_string(scaffolded.join("README.md")).unwrap();
-        assert!(readme.contains("packages build"));
+        assert!(readme.contains("packages apply"));
         assert!(readme.contains(&format!("/tree/{COLLECTION_REVISION}/example-script")));
         assert!(!readme.contains("packages add"));
 

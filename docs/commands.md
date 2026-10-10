@@ -71,7 +71,7 @@ lyracore packages enable NAME
 lyracore packages list
 lyracore packages new NAME [--from RUNG]
 lyracore packages remove NAME [--yes]
-lyracore packages replay [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]
+lyracore packages apply [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]
 lyracore packages update [NAME] [--yes]
 lyracore character gm NAME true|false
 lyracore production status --server SERVER --gateway-log PATH --realm-core DB DATABASE ...
@@ -104,7 +104,7 @@ lyracore update
 | `packages list` | every installed Package: enabled or disabled, where it came from, and whether it has drifted |
 | `packages new` | copy and rename a Reference Package from the collection tag matching this checkout's Package API |
 | `packages remove` | delete a disabled Package, after a confirmation and a check for local changes |
-| `packages replay` | reapply every enabled Package's claims and Runtime Scripts onto the named Shards, or the whole recorded fixture topology by default |
+| `packages apply` | prepare installed sources, publish Rust Packages, and apply artifacts to the named Shards or recorded development topology |
 | `packages update` | update Git Package Sources from their repository and Official Package Sources from the compatible collection tag |
 | `character gm` | flip GM commands on or off for a character, on whichever world shard has it |
 | `production status` | read-only checks for an explicitly named production topology and the latest gateway start |
@@ -284,11 +284,11 @@ installed in its place. The Provenance Stamp records the collection's URL and th
 directory was resolved at. `packages update` can advance the installed Package to the current
 commit at the compatible tag, after the normal Trust Review and confirmation.
 
-**It publishes nothing.** The two remaining steps are printed for you to run:
+The command prints the next steps for the content it installed:
 
 ```bash
-./lyracore publish        # compile the Package in and publish it to every database
-./lyracore client sync    # if the Package ships addons or client overrides
+./lyracore packages apply # prepare and activate installed Packages
+./lyracore client sync    # if the Package ships client content
 ```
 
 A failed `preflight` leaves the copy in place, says the module on the node is unchanged, and names
@@ -315,9 +315,9 @@ Each `<name>.<script file stem>` must also fit the 64-character Runtime Script n
 
 Generated artifacts are omitted because the renamed sources need new Build Identities. Before
 using a copy beside another, choose distinct `@id` values for Runtime Scripts or a distinct Package
-Spell ID in its Datascript. Run `packages build` after editing the sources. A Datascript also needs
-a Base Snapshot from your own client data. Replay the built artifacts through the normal realm
-update; use `client sync` for a client half. Scaffolding requires network access to the collection.
+Spell ID in its Datascript. Run `packages apply` to build and activate the copy. A Datascript
+needs your own client data. Use `client sync` for a client half. Scaffolding requires network
+access to the collection.
 
 ## `packages enable`, `disable`, `remove` — taking a Package out of the build
 
@@ -366,12 +366,11 @@ The off path for a Package on a running Realm:
 
 ```bash
 ./lyracore packages disable playerbots   # asks, tears down every Shard, then moves the folder
-./lyracore publish                       # the Module without the Package; its empty tables go
-./lyracore packages replay               # removes the Package's Runtime Scripts from every Shard
+./lyracore packages apply                # publish without its Rust and remove its artifacts
 ./lyracore client sync                   # only when the Package ships client content
 ```
 
-`packages enable` followed by `publish` brings the Package back fresh: empty tables and default
+`packages enable` followed by `packages apply` brings the Package back fresh: empty tables and default
 Package Config. Its Dormant Characters stay as they are, and the Package creates new ones.
 
 **`packages remove NAME` deletes, so it has gates.** It requires the Package to be disabled already,
@@ -414,7 +413,7 @@ disabled and is excluded from compilation. The old folder is deleted only after 
 the candidate is discarded, and the error names both commits. `update` publishes nothing and
 synchronizes no client; it prints the steps it did not run.
 
-Applying and replaying Package Deltas is `packages replay`, below.
+Apply Package Deltas with `packages apply`, below.
 
 ## `packages config` — a Package's key-values, on every Shard
 
@@ -430,7 +429,7 @@ its own defaults when it initialises, so the list shows real keys with live valu
 
 **The rows are per-Shard state.** Every database of the fixture topology holds its own copy, and the
 Module coordinates none of them. A write therefore goes to every Shard of the recorded topology, the
-same set `packages replay` uses when no database is named. A read visits every Shard too: when they
+same set `packages apply` uses when no database is named. A read visits every Shard too: when they
 do not agree on a key, the command names each Shard's answer instead of printing one of them. A
 Shard with no row for the key reads as `(unset)`, which is the same kind of disagreement.
 
@@ -485,7 +484,7 @@ with neither builds exactly as it did before those steps existed:
    `@event` fails with the file that holds it. Fail-fast, the same way step 5 is.
 7. `lyracore-delta-check` traces every enabled Package's generated artifacts together, in one
    invocation, Package Deltas and Script Artifacts alike. This is the same authoritative Rust-side
-   check `packages replay` runs before it writes to a Shard, so a Claim Conflict or a Runtime Script
+   check `packages apply` runs before it writes to a Shard, so a Claim Conflict or a Runtime Script
    collision between two Packages is caught by the one implementation that also decides whether it
    may apply, not by a second, looser one.
 8. A **Build Identity** sidecar is written next to each source-built artifact that just validated:
@@ -538,8 +537,8 @@ The Build Identity covers both source directories, so editing either requires a 
 
 ### Bun is author-side only
 
-`packages build` is the only command that needs Bun, and authoring Datascripts is the only reason
-to run it. **An Operator applying a prebuilt Package needs no Bun and no Node.** Nothing in
+`packages build` needs Bun. `packages apply` runs that build when installed sources need new
+artifacts. **An Operator applying a prebuilt Package needs no Bun and no Node.** Nothing in
 `dev up`, `preflight`, `publish` or `client sync` invokes a JavaScript toolchain. That is why
 `doctor` reports a missing or different Bun version as a warning and never as a launch blocker.
 
@@ -548,7 +547,7 @@ Install the pinned version with
 
 Datascripts are **trusted author-time code**, run from this checkout by the person who wrote them.
 They are not sandboxed and are not described as sandboxed. `packages build` above is what turns one
-into a Package Delta; `packages replay`, below, is what applies it to a Shard.
+into a Package Delta; `packages apply`, below, is what applies it to a Shard.
 
 ### Runtime Scripts — `packages/<name>/scripts/`
 
@@ -633,60 +632,56 @@ prebuilt Lua and needs no Bun. In this checkout they are git-ignored output: the
 them are the repository content, and a committed copy would go stale the moment the Module schema or
 the pinned toolchain moved.
 
-## `packages replay` — reapply a Package's artifacts across the Realm
+## `packages apply`
 
-A Package's artifacts are not a one-shot edit. Its catalogues live on every World Shard and
-Instance Pool that owns a copy, so every edit has to reach all of them.
+Prepare and activate the installed Packages on a running Realm:
 
-    lyracore packages replay [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]
+```bash
+lyracore packages apply [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]
+```
 
-With no names it targets every Shard of the recorded fixture topology. Named Shards are used
-exactly as given. It takes Shard names only; anything flag-shaped is refused before a process
-starts, and it never infers a production Shard list.
+With no Shard names, the command uses the recorded development topology. Named Shards are used
+exactly as given. It never infers a production Shard list. Run it from the checkout whose Module
+and Packages you intend to deploy, with an Operator identity on each target.
 
-### The two Import Families it carries
+The command checks Build Identities and builds missing or stale artifacts from installed sources.
+A Datascript needs the pinned Bun version and your own client data. If its Base Snapshot is missing,
+`apply` extracts one locally. Use `--client-data PATH` or `lyracore config set client-data PATH` to
+select the client's Data directory. A current Script Artifact needs neither Bun nor client data.
+Source-free Package Deltas must already have a current Build Identity; install updated source or
+artifacts if they are stale. Generated Package Deltas remain local.
 
-**spell.** The artifact is a Package Delta: claims on columns of rows a base import owns. A base
-import replaces the whole family, so the claims replay as the last stage of that family's import.
-The Shard therefore reimports `Spell.dbc` first, through the importer, and the claims go on top.
+Before writing, the command validates artifacts, checks conflicts, reads every target's provenance,
+and asks once for the planned Realm changes. `--yes` answers that confirmation in advance.
+`--check` prepares local artifacts and validates the plan without publishing or calling a reducer.
+Local generated files can change during a check.
 
-**script.** The artifact is a Script Artifact: whole `game_script` rows. No DBC and no dump holds a
-Runtime Script, so this family has no base import and nothing to reload first. The whole enabled
-plan goes straight to `apply_package_deltas` in one transaction, and applying it IS the
-reconciliation: the Shard ends up holding exactly the scripts the enabled Packages ship and nothing
-else.
+If the Package Inventory contains Rust, or a target records pending Package Teardown, `apply`
+publishes this checkout's Module. It keeps the normal preflight and Loot Roll upgrade checks and
+repairs schedules on each published Shard before continuing. Rust Packages cause a publish on
+every run; artifact provenance does not track compiled Rust. Disable a Rust Package through
+`packages disable` before removing it so its tables and Characters receive Package Teardown.
 
-### The run
+Artifact application then runs Shard by Shard:
 
-1. Preflight. Every enabled Package's artifact is read and digested once, and every target's
-   provenance is read, per family. An unreadable artifact, a Package named twice, a Claim Conflict,
-   a Runtime Script collision, or an unreachable Shard fails the run before the first write.
-2. Apply, Shard by Shard in order. Each Shard takes the spell family through the importer, then the
-   script family through the reducer.
-3. Stop at the first failure and name the Shard and family. The report lists completion per family,
-   including a spell apply that finished on the Shard before its script apply refused the plan. It
-   also lists untouched Shards and prints the command to resume.
+- The spell Import Family reimports `Spell.dbc`, then applies the enabled Package Deltas.
+- The script Import Family reconciles `game_script` to the enabled Script Artifacts in one
+  transaction. A script-only run needs no base import or Module publish.
 
-Resume is the default, and it is decided per family. A Shard is reported complete for a family and
-skipped when every enabled Package is recorded in `game_package_import` with the digest this
-checkout produces, and no Package is recorded that is no longer enabled. The spell family
-additionally requires every row to sit on the Shard's current base import stamp; the script family
-has no base import to sit on. Re-running after a failure therefore costs nothing on completed
-families, and a Shard already holding this checkout's Package Deltas is still replayed for its
-Runtime Scripts. `--force-all` replays anyway.
+A family whose Package Import records already match the enabled artifacts is skipped. For spells,
+the records must also match the Shard's current base import. `--force-all` applies both families even
+when they match. An empty enabled set removes previously applied Package spells and Runtime Scripts;
+the confirmation names these removals.
 
-`--check` prints both plans, writes nothing, and asks nothing. It runs the spell importer when the
-checkout has a Package Delta plan, or when a Shard needs an empty spell reconciliation. When only
-script-family work remains, a check needs no client Data directory.
+A failure stops the run and reports completed and remaining work. Retry the printed command after
+fixing the cause. Completed artifact families are skipped. A Module publish can disconnect clients;
+a failed schedule repair names the published Shard and the repair command.
 
-Disabling a Package is a replay, not a deletion. Its folder leaves `packages/`, so its artifacts
-leave both payloads: the reducer clears the Package Spell Range as it applies the spell family, and
-the empty script plan is still sent, which is what takes the Package's Runtime Scripts off every
-Shard. Both are destructive and the confirmation names them.
+Other claim families use the importer's world-dump modes. This command owns spell and script
+artifacts only. Client content is installed separately with `lyracore client sync`.
 
-The other claim families a Package may claim in (items, quests, loot, casts and trainers) are NOT
-replayed here. Their base import is the world dump rather than a DBC, which is a much larger and
-more destructive reload than this verb owns. Reapply those with the importer's own dump modes.
+The old name, `packages replay`, is refused with a migration hint. It is not an alias because
+`apply` can build sources and publish Rust Packages.
 
 ## `packages check` — is every generated artifact still current?
 

@@ -81,7 +81,7 @@ lyracore packages disable NAME [--yes]
 lyracore packages remove NAME [--yes]
 lyracore packages build
 lyracore packages check
-lyracore packages replay [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]
+lyracore packages apply [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]
 lyracore packages config NAME [KEY [VALUE]] [--new]
 ```
 
@@ -154,7 +154,7 @@ no `--accept` option.
 | `packages remove NAME` | Delete a disabled Package after confirmation. Refuse changes to its recorded Content Identity. |
 | `packages build` | Refresh typings, install pinned Bun dependencies, typecheck and run Datascripts, compile Runtime Scripts, and check the generated artifacts together. |
 | `packages check` | Check Package Deltas and Script Artifacts against their inputs, refreshing typings when needed. Preflight also runs this check. |
-| `packages replay` | Apply enabled Packages' spell Package Deltas and reconcile Runtime Scripts on each target Shard. |
+| `packages apply` | Prepare installed sources, publish Rust Packages, and apply artifacts on each target Shard. |
 | `packages config NAME [KEY [VALUE]]` | List Package Config, read one key, or write one key on every recorded fixture Shard. |
 
 A bare name such as `playerbots` selects a Package from the
@@ -164,7 +164,7 @@ must contain one Package at its root. Use `./my-package` to select a local folde
 ```bash
 lyracore packages add playerbots
 lyracore packages list
-lyracore packages replay --check
+lyracore packages apply --check
 ```
 
 Adding, updating, enabling, or disabling a Package does not publish the Module or sync a client.
@@ -172,8 +172,10 @@ Follow the next steps the command prints. Package Teardown deletes the Package's
 before disabling it on a recorded dev node, so the command asks first. Without a recorded node it
 moves the folder and reports any tables that still need teardown before publishing.
 
-`packages replay` uses the recorded fixture Shards unless you name destinations. `--check` prints
-the plan without changing Shards. Replays skip Import Families whose recorded inputs already
+`packages apply` uses the recorded fixture Shards unless you name destinations. `--check` prints
+the plan without changing Shards. It can build local artifacts. `apply` prepares missing or stale
+artifacts and publishes the Module when the Package Inventory contains Rust or a target records
+pending Package Teardown. Artifact application skips Import Families whose recorded inputs already
 match, so a retry resumes unfinished work; `--force-all` reapplies matching families too.
 `--client-data PATH` supplies the client archives needed for the spell family. An empty enabled
 Package set also reconciles state, removing Runtime Scripts and spell changes from disabled
@@ -183,8 +185,8 @@ Packages.
 a key. Reads report disagreements between Shards. Use `lyracore config` for the client path;
 Package Config holds the values a Package reads at runtime.
 
-Use `--yes` to answer the confirmation for `add`, `update`, `disable`, `remove`, or `replay` in
-advance. It does not bypass their checks. Bun is needed for authoring with `packages build`;
+Use `--yes` to answer the confirmation for `add`, `update`, `disable`, `remove`, or `apply` in
+advance. It does not bypass their checks. Bun is needed when `build` or `apply` must compile sources;
 applying a prebuilt Package does not require it.
 
 `packages build` records a Build Identity for each artifact it generates. Datascripts need a Base
