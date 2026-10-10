@@ -805,6 +805,7 @@ pub fn new(
     let reference = official::resolve(collection.path(), &reference_name)?;
     stamp::content_identity(&reference)?;
     validate_shape(&reference)?;
+    validate_scaffold_names(&reference, &name)?;
 
     let destination = project.packages_dir().join(name.as_str());
     let mut staged = StagedPackage::new(project, &name)?;
@@ -858,6 +859,50 @@ pub fn new(
 
     println!("'{}' is scaffolded and preflight is green.", name.as_str());
     print!("{next_steps}");
+    Ok(())
+}
+
+/// Artifact Package identities and Runtime Script names have stricter limits than Rust modules.
+fn validate_scaffold_names(reference: &Path, name: &PackageName) -> Result<()> {
+    let scripts = reference.join("scripts");
+    if !scripts.is_dir() && !reference.join("datascripts").is_dir() {
+        return Ok(());
+    }
+    if name.as_str().len() > 64 || name.as_str().bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(Error::Usage(format!(
+            "'{}' cannot name a Package artifact. Use at most 64 lowercase letters, digits, '-' or '_'. Nothing was installed.",
+            name.as_str()
+        )));
+    }
+    if scripts.is_dir() {
+        for entry in std::fs::read_dir(scripts)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file()
+                || !matches!(
+                    path.extension().and_then(|part| part.to_str()),
+                    Some("ts" | "lua")
+                )
+            {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|part| part.to_str())
+                .ok_or_else(|| {
+                    Error::Usage(format!(
+                        "invalid Runtime Script filename: {}",
+                        path.display()
+                    ))
+                })?;
+            if name.as_str().len() + 1 + stem.len() > 64 {
+                return Err(Error::Usage(format!(
+                    "'{}.{stem}' exceeds the 64-character Runtime Script name limit. Choose a shorter Package name. Nothing was installed.",
+                    name.as_str()
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1783,6 +1828,40 @@ pub(super) mod tests {
             assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
             assert!(stack.calls().is_empty());
         }
+    }
+
+    #[test]
+    fn scaffold_names_must_fit_the_artifacts_the_rung_will_build() {
+        for name in ["Greeter".to_string(), "a".repeat(57)] {
+            let tmp = TempDir::new().unwrap();
+            let project = checkout(&tmp);
+            let stack = reference_collection(
+                &tmp,
+                DEFAULT_REFERENCE,
+                &[("scripts/welcome.ts", b"function script() {}")],
+            );
+            let error = new(&project, &stack.runner(), &name, DEFAULT_REFERENCE).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+            assert!(!project.packages_dir().join(&name).exists());
+            assert!(!stack
+                .rendered()
+                .iter()
+                .any(|call| call.contains("cargo check")));
+        }
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = reference_collection(
+            &tmp,
+            DEFAULT_REFERENCE,
+            &[("scripts/welcome.ts", b"function script() {}")],
+        );
+        new(
+            &project,
+            &stack.runner(),
+            &"a".repeat(56),
+            DEFAULT_REFERENCE,
+        )
+        .unwrap();
     }
 
     #[test]

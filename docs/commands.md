@@ -309,6 +309,9 @@ client filenames, prints its Trust Review and runs `preflight`. The Provenance S
 `scaffold` kind and records the chosen rung and exact collection revision. `packages update`
 does not replace scaffolded code.
 
+Rungs with Runtime Scripts or Datascripts need a lowercase Package name of at most 64 characters.
+Each `<name>.<script file stem>` must also fit the 64-character Runtime Script name limit.
+
 Generated artifacts are omitted because the renamed sources need new Build Identities. Before
 using a copy beside another, choose distinct `@id` values for Runtime Scripts or a distinct Package
 Spell ID in its Datascript. Run `packages build` after editing the sources. A Datascript also needs
