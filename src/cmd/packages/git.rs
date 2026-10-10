@@ -102,8 +102,7 @@ fn is_scp_style(url: &str) -> bool {
     !user.is_empty() && !host.is_empty() && !host.contains('/') && !path.is_empty()
 }
 
-/// A repository cloned into this checkout's scratch space, at the commit its default branch points
-/// at right now. Dropping it removes the clone.
+/// A repository cloned at its default branch or a named tag. Dropping it removes the scratch copy.
 ///
 /// `pub(crate)`: [`official`](super::official) clones the Official Package Collection through the
 /// same machinery, rather than a second copy of it, so a clone behaves identically (depth-1,
@@ -118,6 +117,7 @@ impl RepositoryClone {
         project: &ProjectLayout,
         runner: &dyn ProcessRunner,
         source: &GitSource,
+        tag: Option<&str>,
     ) -> Result<Self> {
         let root = project.state_dir.join(CLONE_DIR);
         std::fs::create_dir_all(&root)?;
@@ -132,20 +132,44 @@ impl RepositoryClone {
         };
 
         println!("· cloning {}", source.url());
-        runner.run_and_wait(
-            &CommandSpec::new("git")
-                .arg("clone")
-                // One commit is all an install records and all it copies. History would be fetched
-                // only to be deleted with `.git` a moment later.
-                .arg("--depth")
-                .arg("1")
-                // A repository that needs credentials must FAIL here rather than sit on a hidden
-                // prompt inside a command the operator may have scripted with --yes.
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .arg("--")
-                .arg(source.url())
-                .arg(clone.dir.to_string_lossy().to_string()),
-        )?;
+        if let Some(tag) = tag {
+            runner.run_and_wait(
+                &CommandSpec::new("git")
+                    .arg("init")
+                    .arg("--")
+                    .arg(clone.dir.to_string_lossy().to_string()),
+            )?;
+            // Fetch the full ref so a branch with the same name cannot shadow the tag.
+            runner.run_and_wait(
+                &CommandSpec::new("git")
+                    .cwd(clone.dir.clone())
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .arg("fetch")
+                    .arg("--depth")
+                    .arg("1")
+                    .arg("--")
+                    .arg(source.url())
+                    .arg(format!("refs/tags/{tag}")),
+            )?;
+            runner.run_and_wait(
+                &CommandSpec::new("git")
+                    .cwd(clone.dir.clone())
+                    .arg("checkout")
+                    .arg("--detach")
+                    .arg("FETCH_HEAD"),
+            )?;
+        } else {
+            runner.run_and_wait(
+                &CommandSpec::new("git")
+                    .arg("clone")
+                    .arg("--depth")
+                    .arg("1")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .arg("--")
+                    .arg(source.url())
+                    .arg(clone.dir.to_string_lossy().to_string()),
+            )?;
+        }
         if !clone.dir.is_dir() {
             return Err(Error::Process(format!(
                 "`git clone` reported success but left no working copy at {}. Nothing was \
@@ -203,7 +227,7 @@ pub(crate) fn add(
     super::check_not_tracked(project, runner, &name, source.url())?;
     super::check_collision(project, &name)?;
 
-    let clone = RepositoryClone::fetch(project, runner, source)?;
+    let clone = RepositoryClone::fetch(project, runner, source, None)?;
     super::install(
         project,
         runner,
@@ -446,11 +470,8 @@ impl UpdateSource {
         runner: &dyn ProcessRunner,
     ) -> Result<RepositoryClone> {
         match self {
-            Self::Git(source) => RepositoryClone::fetch(project, runner, source),
-            Self::Official => {
-                let collection = super::official::collection_source();
-                RepositoryClone::fetch(project, runner, &collection)
-            }
+            Self::Git(source) => RepositoryClone::fetch(project, runner, source, None),
+            Self::Official => super::official::fetch(project, runner),
         }
     }
 
@@ -1375,6 +1396,62 @@ mod tests {
 
         assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
         assert!(installed.join("src/mod.rs").is_file(), "{error}");
+    }
+
+    #[test]
+    fn a_tag_is_fetched_even_when_a_branch_has_the_same_name() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let remote = tmp.path().join("remote");
+        std::fs::create_dir(&remote).unwrap();
+        let runner = crate::proc::RealProcessRunner;
+        let git = |args: &[&str]| {
+            let mut command = CommandSpec::new("git")
+                .cwd(remote.clone())
+                .arg("-c")
+                .arg("user.name=Package test")
+                .arg("-c")
+                .arg("user.email=package@example.invalid")
+                .arg("-c")
+                .arg("commit.gpgsign=false");
+            for arg in args {
+                command = command.arg(*arg);
+            }
+            runner.run_and_wait(&command).unwrap()
+        };
+        git(&["init"]);
+        std::fs::write(remote.join("content"), "tagged").unwrap();
+        git(&["add", "content"]);
+        git(&["commit", "-m", "tagged"]);
+        git(&[
+            "-c",
+            "tag.gpgsign=false",
+            "tag",
+            "-a",
+            "api-v1",
+            "-m",
+            "API 1",
+        ]);
+        let tagged = git(&["rev-parse", "HEAD"]);
+        std::fs::write(remote.join("content"), "branch").unwrap();
+        git(&["commit", "-am", "branch"]);
+        git(&["branch", "api-v1"]);
+
+        let clone = RepositoryClone::fetch(
+            &project,
+            &runner,
+            &GitSource {
+                url: remote.to_string_lossy().into_owned(),
+            },
+            Some("api-v1"),
+        )
+        .unwrap();
+
+        assert_eq!(clone.revision(), tagged.trim());
+        assert_eq!(
+            std::fs::read_to_string(clone.path().join("content")).unwrap(),
+            "tagged"
+        );
     }
 
     #[test]
