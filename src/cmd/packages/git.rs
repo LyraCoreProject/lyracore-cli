@@ -132,23 +132,44 @@ impl RepositoryClone {
         };
 
         println!("· cloning {}", source.url());
-        let mut clone_command = CommandSpec::new("git").arg("clone");
         if let Some(tag) = tag {
-            clone_command = clone_command.arg("--branch").arg(tag);
+            runner.run_and_wait(
+                &CommandSpec::new("git")
+                    .arg("init")
+                    .arg("--")
+                    .arg(clone.dir.to_string_lossy().to_string()),
+            )?;
+            // Fetch the full ref so a branch with the same name cannot shadow the tag.
+            runner.run_and_wait(
+                &CommandSpec::new("git")
+                    .cwd(clone.dir.clone())
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .arg("fetch")
+                    .arg("--depth")
+                    .arg("1")
+                    .arg("--")
+                    .arg(source.url())
+                    .arg(format!("refs/tags/{tag}")),
+            )?;
+            runner.run_and_wait(
+                &CommandSpec::new("git")
+                    .cwd(clone.dir.clone())
+                    .arg("checkout")
+                    .arg("--detach")
+                    .arg("FETCH_HEAD"),
+            )?;
+        } else {
+            runner.run_and_wait(
+                &CommandSpec::new("git")
+                    .arg("clone")
+                    .arg("--depth")
+                    .arg("1")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .arg("--")
+                    .arg(source.url())
+                    .arg(clone.dir.to_string_lossy().to_string()),
+            )?;
         }
-        runner.run_and_wait(
-            &clone_command
-                // One commit is all an install records and all it copies. History would be fetched
-                // only to be deleted with `.git` a moment later.
-                .arg("--depth")
-                .arg("1")
-                // A repository that needs credentials must FAIL here rather than sit on a hidden
-                // prompt inside a command the operator may have scripted with --yes.
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .arg("--")
-                .arg(source.url())
-                .arg(clone.dir.to_string_lossy().to_string()),
-        )?;
         if !clone.dir.is_dir() {
             return Err(Error::Process(format!(
                 "`git clone` reported success but left no working copy at {}. Nothing was \
@@ -172,22 +193,6 @@ impl RepositoryClone {
                  nothing). Nothing was installed.",
                 source.url()
             )));
-        }
-        if let Some(tag) = tag {
-            // `clone --branch` also accepts branch names. Only the tag authorizes this revision.
-            let tagged_revision = runner.run_and_wait(
-                &CommandSpec::new("git")
-                    .cwd(clone.dir.clone())
-                    .arg("rev-parse")
-                    .arg("--verify")
-                    .arg(format!("refs/tags/{tag}^{{commit}}")),
-            )?;
-            if tagged_revision.trim() != revision {
-                return Err(Error::Process(format!(
-                    "cloned {} but HEAD does not match tag '{tag}'. Nothing was installed.",
-                    source.url()
-                )));
-            }
         }
         clone.revision = revision;
         Ok(clone)
@@ -1391,6 +1396,62 @@ mod tests {
 
         assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
         assert!(installed.join("src/mod.rs").is_file(), "{error}");
+    }
+
+    #[test]
+    fn a_tag_is_fetched_even_when_a_branch_has_the_same_name() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let remote = tmp.path().join("remote");
+        std::fs::create_dir(&remote).unwrap();
+        let runner = crate::proc::RealProcessRunner;
+        let git = |args: &[&str]| {
+            let mut command = CommandSpec::new("git")
+                .cwd(remote.clone())
+                .arg("-c")
+                .arg("user.name=Package test")
+                .arg("-c")
+                .arg("user.email=package@example.invalid")
+                .arg("-c")
+                .arg("commit.gpgsign=false");
+            for arg in args {
+                command = command.arg(*arg);
+            }
+            runner.run_and_wait(&command).unwrap()
+        };
+        git(&["init"]);
+        std::fs::write(remote.join("content"), "tagged").unwrap();
+        git(&["add", "content"]);
+        git(&["commit", "-m", "tagged"]);
+        git(&[
+            "-c",
+            "tag.gpgsign=false",
+            "tag",
+            "-a",
+            "api-v1",
+            "-m",
+            "API 1",
+        ]);
+        let tagged = git(&["rev-parse", "HEAD"]);
+        std::fs::write(remote.join("content"), "branch").unwrap();
+        git(&["commit", "-am", "branch"]);
+        git(&["branch", "api-v1"]);
+
+        let clone = RepositoryClone::fetch(
+            &project,
+            &runner,
+            &GitSource {
+                url: remote.to_string_lossy().into_owned(),
+            },
+            Some("api-v1"),
+        )
+        .unwrap();
+
+        assert_eq!(clone.revision(), tagged.trim());
+        assert_eq!(
+            std::fs::read_to_string(clone.path().join("content")).unwrap(),
+            "tagged"
+        );
     }
 
     #[test]

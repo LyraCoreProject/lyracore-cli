@@ -344,13 +344,10 @@ fn materialize_generated_bindings(cmd: &CommandSpec) {
     );
 }
 
-/// `git clone` writes a working copy into its last argument. The `.git` is part of it: stripping
+/// Materialize a cloned or fetched working copy. The `.git` is part of it: stripping
 /// that directory is the step that turns a clone into an installable Package tree, and a fake that
 /// never created one could not prove it happens.
-fn materialize_clone(cmd: &CommandSpec, tree: &Path) {
-    let Some(destination) = cmd.args().last().map(Path::new) else {
-        return;
-    };
+fn materialize_clone(destination: &Path, tree: &Path) {
     if copy_tree(tree, destination).is_err() {
         return;
     }
@@ -382,10 +379,16 @@ impl ProcessRunner for FakeProcessRunner {
         if render.contains("spacetime generate") {
             materialize_generated_bindings(cmd);
         }
-        if render.starts_with("git clone") {
-            let tree = self.0.lock().unwrap().git_clone.clone();
-            if let Some(tree) = tree {
-                materialize_clone(cmd, &tree);
+        let git_destination = if render.starts_with("git clone") {
+            cmd.args().last().map(Path::new)
+        } else if render.starts_with("git checkout --detach FETCH_HEAD") {
+            cmd.cwd_value()
+        } else {
+            None
+        };
+        if let Some(destination) = git_destination {
+            if let Some(tree) = self.0.lock().unwrap().git_clone.clone() {
+                materialize_clone(destination, &tree);
             }
         }
         let canned = {

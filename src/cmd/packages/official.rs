@@ -82,9 +82,9 @@ pub(crate) fn fetch(
     let tag = pinned_tag(project)?;
     RepositoryClone::fetch(project, runner, &collection_source(), Some(&tag)).map_err(|error| {
         Error::Process(format!(
-            "cannot clone the Official Package Collection ({COLLECTION_URL}) at `{tag}`, the tag \
-             for this checkout's Package API version ({PACKAGE_API_DOC}). If git says the remote \
-             branch was not found, the collection has no Packages for this Package API version \
+            "cannot fetch the Official Package Collection ({COLLECTION_URL}) at `{tag}`, the tag \
+             for this checkout's Package API version ({PACKAGE_API_DOC}). If git reports a missing \
+             remote ref, the collection has no Packages for this Package API version \
              yet. Nothing was changed.\n  ({error})"
         ))
     })
@@ -203,7 +203,6 @@ mod tests {
         FakeStack::new()
             .with_git_clone(tree)
             .with_stdout("rev-parse HEAD", &format!("{revision}\n"))
-            .with_stdout("rev-parse --verify refs/tags/", &format!("{revision}\n"))
     }
 
     #[test]
@@ -254,13 +253,13 @@ mod tests {
         .unwrap();
 
         for stack in [added, updated] {
-            let clones: Vec<String> = stack
+            let fetches: Vec<String> = stack
                 .rendered()
                 .into_iter()
-                .filter(|call| call.starts_with("git clone"))
+                .filter(|call| call.starts_with("git fetch"))
                 .collect();
-            assert_eq!(clones.len(), 1, "{clones:?}");
-            assert!(clones[0].contains("--branch api-v3"), "{clones:?}");
+            assert_eq!(fetches.len(), 1, "{fetches:?}");
+            assert!(fetches[0].ends_with("refs/tags/api-v3"), "{fetches:?}");
         }
     }
 
@@ -269,8 +268,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let stack = repository(&collection(&tmp, &["greeter"]), FIRST).fail_on(
-            "git clone",
-            "fatal: Remote branch api-v1 not found in upstream origin",
+            "git fetch",
+            "fatal: couldn't find remote ref refs/tags/api-v1",
         );
 
         let error = super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true)
@@ -284,25 +283,6 @@ mod tests {
             "{error}"
         );
         assert!(!project.packages_dir().exists(), "{error}");
-    }
-
-    #[test]
-    fn a_branch_cannot_replace_the_package_api_tag() {
-        let tmp = TempDir::new().unwrap();
-        let project = checkout(&tmp);
-        let stack = repository(&collection(&tmp, &["greeter"]), FIRST)
-            .with_stdout("rev-parse --verify refs/tags/api-v1", SECOND);
-
-        let error = super::super::add(&project, &stack.runner(), &Answer("yes"), "greeter", true)
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("HEAD does not match tag 'api-v1'"),
-            "{error}"
-        );
-        assert!(!project.packages_dir().exists());
     }
 
     #[test]
@@ -320,7 +300,7 @@ mod tests {
             stack
                 .rendered()
                 .iter()
-                .all(|call| !call.contains("git clone")),
+                .all(|call| !call.contains("git fetch")),
             "an unknown version must be refused before the network"
         );
     }
@@ -356,7 +336,7 @@ mod tests {
             stack
                 .rendered()
                 .iter()
-                .all(|call| !call.contains("git clone")),
+                .all(|call| !call.contains("git fetch")),
             "a known tracked destination must be refused before the network"
         );
     }
@@ -429,7 +409,7 @@ mod tests {
 
         assert!(error.to_string().contains("already"), "{error}");
         for call in stack.rendered() {
-            assert!(!call.contains("git clone"), "{call}");
+            assert!(!call.contains("git fetch"), "{call}");
         }
     }
 
@@ -531,7 +511,7 @@ mod tests {
             stack
                 .rendered()
                 .iter()
-                .all(|call| !call.contains("git clone")),
+                .all(|call| !call.contains("git fetch")),
             "the drift check must run before the collection clone"
         );
     }
