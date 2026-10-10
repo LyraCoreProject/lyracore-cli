@@ -12,6 +12,9 @@ checkout, and only when you run
 
 ## Commands
 
+[`docs/commands.md`](docs/commands.md) is the full reference for every command below, the
+`import`, `config`, `client` and `packages` families included.
+
 `import world` checks each destination's World Import Profile. Skinning minimums apply to
 `alliance-eastern`, `alliance-kalimdor` and `alliance-single`. The `instances` profile allows no
 skinnable creatures, as in Deadmines, but requires loot for every referenced skinning table.
@@ -395,6 +398,20 @@ The CLI drives a checkout through `Cargo.toml`, `rust-toolchain.toml`, `module/`
 guarantees that used to belong to `scripts/publish-module.sh` and `scripts/preflight.sh` are
 properties of `cmd/publish.rs` and `cmd/preflight.rs` here, so a checkout that ships without a
 `scripts/` or `adapters/` directory is still fully drivable.
+
+## Host operations scripts
+
+`deploy/` holds the production host scripts that are not CLI commands: the SpacetimeDB history
+prune, the disk guard that renews the Bot Capacity Lease, the diagnostic capture wrapper, and their
+systemd units. They moved here from the LyraCore repository. The server's `docs/danger-zones.md`
+and `docs/operations/disk-policy.md` give the install steps; run them from a checkout of this
+repository. The Standalone Supervisor unit stays in the LyraCore checkout, because
+`service reconcile` reads it from there.
+
+```bash
+bash deploy/spacetimedb-prune-test.sh
+python3 -m unittest discover -s deploy -p 'test_*.py'
+```
 
 ## Exit codes
 
