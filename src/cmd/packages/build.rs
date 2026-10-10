@@ -21,8 +21,8 @@
 //!    `datascripts/generated/base-snapshot.json` must already exist, or the build fails fast with
 //!    the exact `lyracore-importer --spell-snapshot` command to build one, rather than letting every
 //!    Datascript fail with the same confusing "cannot read" one at a time.
-//! 5. Every enabled Package with a `datascripts/src/<package>/` folder runs each `.ts` file there,
-//!    in name order, as its own `bun run` SUBPROCESS — never imported. The library hashes
+//! 5. Every enabled Package runs the `.ts` files in `datascripts/src/<package>/`, then in its own
+//!    `datascripts/` directory, in name order, each as a `bun run` subprocess. The library hashes
 //!    `Bun.main`, the running process's own entry script, into the artifact's `source_hash`;
 //!    importing the script into one host process instead would hash the host, not the script. The
 //!    first script to fail stops the build: later scripts, and later Packages, never run.
@@ -73,6 +73,7 @@
 //! Bun is needed HERE and nowhere else. An Operator applying a prebuilt Package Delta runs no part
 //! of this, which is why `doctor`'s Bun check is a warning rather than a launch blocker.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::cmd::doctor::{self, BunVersionCheck};
@@ -141,36 +142,76 @@ fn verify_bun(runner: &dyn ProcessRunner) -> Result<()> {
 
 // ---- Datascript emission and validation ----
 
-/// Enabled Packages carrying a Datascript, in the order step 5 runs them: the folder-name sort,
-/// same rule `packages/`'s own directory listing already uses to mean "enabled".
-///
-/// A Package's Datascripts live under `datascripts/src/<package>/`, named after the Package folder
-/// under `packages/` — not the other way around, so a Datascript for a disabled or removed Package
-/// simply has no Package to match and never runs.
+/// Enabled Packages with entry scripts in either supported Datascript location.
 fn packages_with_datascripts(project: &ProjectLayout) -> Result<Vec<String>> {
     let packages_dir = project.packages_dir();
     if !packages_dir.is_dir() {
         return Ok(Vec::new());
     }
-    let mut names: Vec<String> = std::fs::read_dir(&packages_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| project.datascripts_src_dir().join(name).is_dir())
-        .collect();
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(packages_dir)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if entry.path().is_dir() && !datascripts_of(project, &name)?.is_empty() {
+            names.push(name);
+        }
+    }
     names.sort();
     Ok(names)
 }
 
-/// One Package's Datascripts, in the deterministic order step 5 runs them: file-name sort.
+/// Legacy scripts run first, then Package-local scripts. Each directory sorts by file name.
 fn datascripts_of(project: &ProjectLayout, package: &str) -> Result<Vec<PathBuf>> {
-    let dir = project.datascripts_src_dir().join(package);
-    let mut scripts: Vec<PathBuf> = std::fs::read_dir(&dir)?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "ts"))
-        .collect();
-    scripts.sort();
+    let mut scripts = Vec::new();
+    for dir in [
+        project.datascripts_src_dir().join(package),
+        project.packages_dir().join(package).join("datascripts"),
+    ] {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "ts") {
+                entries.push(path);
+            }
+        }
+        entries.sort();
+        scripts.extend(entries);
+    }
     Ok(scripts)
+}
+
+/// Extend Core's compiler options and includes with the enabled Package-local entry scripts.
+/// The temporary file stays in `datascripts/` so TypeScript finds its installed type packages.
+fn typecheck_config(
+    project: &ProjectLayout,
+    packages: &[String],
+) -> Result<Option<tempfile::NamedTempFile>> {
+    let mut files = Vec::new();
+    for package in packages {
+        files.extend(
+            datascripts_of(project, package)?
+                .into_iter()
+                .filter(|path| path.starts_with(project.packages_dir())),
+        );
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let mut config = tempfile::Builder::new()
+        .prefix(".packages-tsconfig-")
+        .suffix(".json")
+        .tempfile_in(project.datascripts_dir())?;
+    let value = serde_json::json!({
+        "extends": project.datascripts_dir().join("tsconfig.json"),
+        "files": files,
+    });
+    config.write_all(value.to_string().as_bytes())?;
+    Ok(Some(config))
 }
 
 /// The Base Snapshot must exist before any Datascript runs — `lib/index.ts` throws a "cannot read"
@@ -361,21 +402,26 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
             ))
         })?;
 
+    let datascript_packages = packages_with_datascripts(project)?;
+    let config = typecheck_config(project, &datascript_packages)?;
+    let mut typecheck = typecheck_command(project);
+    if let Some(config) = &config {
+        typecheck = typecheck
+            .arg("--project")
+            .arg(config.path().to_string_lossy().to_string());
+    }
     println!("typechecking the Datascripts against the regenerated typings");
-    runner
-        .run_streaming(&typecheck_command(project))
-        .map_err(|e| {
-            Error::Process(format!(
-                "the Datascripts do not typecheck against the current Module schema. This is the \
+    runner.run_streaming(&typecheck).map_err(|e| {
+        Error::Process(format!(
+            "the Datascripts do not typecheck against the current Module schema. This is the \
                  gate doing its job — the errors above name the file, line and column to fix. A \
                  column the Module renamed, retyped or removed shows up there.\n  ({e})"
-            ))
-        })?;
+        ))
+    })?;
 
     println!();
     println!("Datascripts typecheck against the current Module schema.");
 
-    let datascript_packages = packages_with_datascripts(project)?;
     let script_packages = script::packages_with_scripts(project)?;
     for path in script::remove_artifacts_without_sources(project)? {
         println!(
@@ -459,6 +505,12 @@ mod tests {
         let src_dir = project.datascripts_src_dir().join(package);
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::write(src_dir.join(format!("{script}.ts")), "// a Datascript\n").unwrap();
+    }
+
+    fn with_local_datascript(project: &ProjectLayout, package: &str, script: &str) {
+        let dir = project.packages_dir().join(package).join("datascripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{script}.ts")), "// a Datascript\n").unwrap();
     }
 
     fn with_base_snapshot(project: &ProjectLayout) {
@@ -708,6 +760,92 @@ mod tests {
     }
 
     // ---- Datascript emission and validation ----
+
+    #[test]
+    fn enabled_packages_run_legacy_and_local_datascripts_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_datascript(&project, "greeter", "legacy");
+        with_local_datascript(&project, "greeter", "welcome");
+        with_local_datascript(&project, "disabled", "unused");
+        std::fs::create_dir_all(project.packages_disabled_dir()).unwrap();
+        std::fs::rename(
+            project.packages_dir().join("disabled"),
+            project.packages_disabled_dir().join("disabled"),
+        )
+        .unwrap();
+        with_base_snapshot(&project);
+        with_generated_artifact(&project, "greeter");
+        let stack = FakeStack::new();
+
+        run(&project, &stack.runner()).unwrap();
+
+        let scripts: Vec<String> = stack
+            .rendered()
+            .into_iter()
+            .filter(|call| call.starts_with("bun run"))
+            .collect();
+        assert_eq!(scripts.len(), 2, "{scripts:?}");
+        assert!(
+            scripts[0].ends_with("datascripts/src/greeter/legacy.ts"),
+            "{scripts:?}"
+        );
+        assert!(
+            scripts[1].ends_with("packages/greeter/datascripts/welcome.ts"),
+            "{scripts:?}"
+        );
+        assert!(project
+            .packages_dir()
+            .join("greeter/data/.generated/spell.identity")
+            .is_file());
+    }
+
+    #[test]
+    fn local_datascripts_require_a_base_snapshot_before_emission() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_local_datascript(&project, "greeter", "welcome");
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("no Base Snapshot"), "{error}");
+        assert!(stack
+            .rendered()
+            .iter()
+            .all(|call| !call.starts_with("bun run")));
+    }
+
+    #[test]
+    fn a_local_datascript_type_error_stops_before_emission() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        with_local_datascript(&project, "greeter", "welcome");
+        with_base_snapshot(&project);
+        let stack = FakeStack::new().fail_on("tsc", "welcome.ts does not typecheck");
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("do not typecheck"), "{error}");
+        let calls = stack.rendered();
+        assert!(
+            calls.iter().any(|call| call.contains("--project")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().all(|call| !call.starts_with("bun run")),
+            "{calls:?}"
+        );
+        assert!(std::fs::read_dir(project.datascripts_dir())
+            .unwrap()
+            .all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".packages-tsconfig-")
+            }));
+    }
 
     #[test]
     fn a_build_typegens_installs_typechecks_emits_then_validates_in_that_order() {

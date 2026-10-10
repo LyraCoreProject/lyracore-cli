@@ -239,8 +239,8 @@ around saying so.
 
 **Everything that can refuse the install happens before anything is copied.** The name must be one
 the build accepts (`[a-zA-Z][a-zA-Z0-9_-]*` — the build maps `my-package` onto the module
-`pkg_my_package` and panics on anything else). The shape must be one the build accepts: client-only
-and Rust-only are both valid, and when `src/` exists, `src/mod.rs` is required. The name must
+`pkg_my_package` and panics on anything else). A Package must carry `src/`, `client/`, `data/`, `scripts/` or `datascripts/`.
+When `src/` exists, `src/mod.rs` is required. The name must
 collide with neither the enabled nor the disabled inventory, compared on the Rust identifier rather
 than the folder name — `my-package` and `my_package` fold onto the same module.
 
@@ -248,9 +248,8 @@ Then it prints a **Trust Review** and asks. The review is a deterministic, read-
 candidate folder using a port of the build's own marker scan, so a commented-out or quoted marker
 registers nothing here either. It reports tables, reducers, hooks, tick passes, character-owned
 sweeps, addons, client overrides and Runtime Script sources. Runtime Scripts are named because they
-run on the realm once the Package is built. A Package cannot ship a Datascript of its own — the
-authoring toolchain lives in `datascripts/`, outside any Package folder — so that row is an explicit
-"none detected" rather than silence. The review states plainly that everything else in the Package's
+run on the Realm once the Package is built. It also names Package-local Datascripts, which
+`packages build` runs as trusted code on the author's machine. The review states plainly that everything else in the Package's
 Rust is trusted code and that it is an inventory, not a security guarantee.
 
 On confirmation the folder is **copied, never symlinked**: a linked Package would compile from a
@@ -460,7 +459,8 @@ then up to eight steps, in this order:
    database.
 2. `bun install --frozen-lockfile` installs exactly what `datascripts/bun.lock` records. Frozen, so
    a build never silently resolves a newer dependency than the next author will get.
-3. `tsc --noEmit` is the typecheck gate. Nothing is emitted; the answer is the exit code.
+3. `tsc --noEmit` typechecks Core's Datascript project and each enabled Package's local Datascripts.
+   The CLI extends Core's compiler configuration in a temporary file. No JavaScript is emitted.
 
 Steps 4 to 8 run only when an enabled Package carries a Datascript or a Runtime Script. A checkout
 with neither builds exactly as it did before those steps existed:
@@ -469,8 +469,9 @@ with neither builds exactly as it did before those steps existed:
    fails fast with the exact `lyracore-importer --spell-snapshot` command to build one, once, rather
    than letting every Datascript fail with the same "cannot read" error in turn. Skipped when no
    Package has a Datascript: a Runtime Script reads no base data.
-5. Every enabled Package's Datascripts run, one `bun run` subprocess per file, in name order. The
-   first script to throw stops the build; later scripts and later Packages never run.
+5. Each enabled Package runs `datascripts/src/<name>/*.ts`, then
+   `packages/<name>/datascripts/*.ts`. Each directory runs in file-name order, with one `bun run`
+   subprocess per file. The first failure stops the build.
 6. Every enabled Package with a `scripts/` folder compiles its Runtime Scripts into one Script
    Artifact, one `bun run` subprocess per Package, in folder-name order. The builder is handed the
    Module's Event Binding catalogue, read from `lyracore-delta-check --print-events`, so a mistyped
@@ -524,6 +525,10 @@ the schema's authority.
 `src/reference.ts` is the standing schema check. It names real columns, so it is the file that fails
 when the schema moves under it. Keep it referencing real columns.
 
+A Package can ship `packages/<name>/datascripts/welcome.ts`. It imports the authoring library as
+`../../../datascripts/lib/index.ts`. The older `datascripts/src/<name>/` location still works.
+The Build Identity covers both source directories, so editing either requires a rebuild.
+
 ### Bun is author-side only
 
 `packages build` is the only command that needs Bun, and authoring Datascripts is the only reason
@@ -553,8 +558,8 @@ packages/fire_nova/
     fire_nova.script.json   the Script Artifact. Committed in the Official Package Collection
 ```
 
-The sources live **inside** the Package, unlike a Datascript. A Datascript sits outside because only
-artifacts belong in a Package folder; a Runtime Script is the Package's own content.
+Runtime Script sources live in the Package's `scripts/` directory. Author-time Datascripts may
+live beside them in `datascripts/`.
 
 Every file opens with its **Script Directives**, `//` in TypeScript and `--` in Lua:
 

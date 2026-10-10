@@ -945,7 +945,7 @@ mod tests {
         let error =
             super::super::add(&project, &stack.runner(), &Answer("yes"), URL, true).unwrap_err();
 
-        assert!(error.to_string().contains("neither src/"), "{error}");
+        assert!(error.to_string().contains("not a Package"), "{error}");
         assert!(!project.packages_dir().join("greeter").exists(), "{error}");
     }
 

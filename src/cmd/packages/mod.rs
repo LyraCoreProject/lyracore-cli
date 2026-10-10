@@ -275,19 +275,16 @@ fn check_not_tracked(
     )))
 }
 
-/// The shapes `module/build.rs` accepts.
-///
-/// A `client/` with no `src/` is a legal client-only Package. A `src/` without `src/mod.rs` is not:
-/// the build panics rather than silently skipping it, so this refuses it here where the operator
-/// still has the folder in front of them. Neither directory means the folder is not a Package at
-/// all — the shape the build only warns about, because by then it is too late to ask.
+/// A Package carries Rust, client files, generated data or authoring scripts.
+/// If it carries Rust, `src/mod.rs` is its required root.
 pub fn validate_shape(source: &Path) -> Result<()> {
     let has_src = source.join("src").is_dir();
-    let has_client = source.join("client").is_dir();
-    if !has_src && !has_client {
+    let has_other_half = ["client", "data", "scripts", "datascripts"]
+        .iter()
+        .any(|name| source.join(name).is_dir());
+    if !has_src && !has_other_half {
         return Err(Error::Usage(format!(
-            "{} is not a Package: it has neither src/ (Rust compiled into the module) nor client/ \
-             (addons and client overrides). One of the two is required.",
+            "{} is not a Package: it needs src/, client/, data/, scripts/ or datascripts/.",
             source.display()
         )));
     }
@@ -1168,7 +1165,17 @@ pub(super) mod tests {
         let empty = tmp.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         let error = validate_shape(&empty).unwrap_err();
-        assert!(error.to_string().contains("neither src/"), "{error}");
+        assert!(error.to_string().contains("not a Package"), "{error}");
+    }
+
+    #[test]
+    fn authored_or_generated_data_without_rust_is_a_package() {
+        let tmp = TempDir::new().unwrap();
+        for half in ["data", "scripts", "datascripts"] {
+            let package = tmp.path().join(half);
+            std::fs::create_dir_all(package.join(half)).unwrap();
+            validate_shape(&package).unwrap();
+        }
     }
 
     // ---- the install ----
