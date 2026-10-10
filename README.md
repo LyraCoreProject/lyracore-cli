@@ -2,24 +2,46 @@
 
 # lyracore-cli
 
-Source-first developer CLI for LyraCore. It drives the local developer fixture: start SpacetimeDB,
-publish the module, claim the operator identity, run the gateway, and provision accounts.
+The CLI for [LyraCore](https://github.com/LyraCoreProject/LyraCore). Start a local realm, import
+world data, manage Packages, prepare client content, and provision Accounts.
 
-It deliberately does **not** manage production realms, backups, or the installation of Rust and
-SpacetimeDB. The one system service it can touch is the standalone supervisor unit tracked in the
-checkout, and only when you run
+It also provides read-only production status and an explicit command to reconcile the standalone
+SpacetimeDB system service. It does not install Rust or SpacetimeDB or manage backups. The system
+service changes only when you run
 [`service reconcile`](#service-reconcile--make-the-host-match-the-tracked-unit).
+
+## Use from a LyraCore checkout
+
+Follow the [LyraCore quickstart](https://github.com/LyraCoreProject/LyraCore/blob/main/docs/quickstart.md)
+to install the prerequisites and clone Core. Its `./lyracore` launcher installs and runs the CLI
+commit pinned in `.lyracore-cli-rev`. You do not need to clone this CLI repository to use it.
+
+From the Core checkout root:
+
+```bash
+./lyracore doctor
+./lyracore dev up
+./lyracore account create TEST
+./lyracore dev status
+```
+
+The global `lyracore` launcher supplied by Core's installer also works from a checkout subdirectory.
+The commands below use that spelling. Use `./lyracore` from the checkout root if you skipped the
+installer.
 
 ## Commands
 
 [`docs/commands.md`](docs/commands.md) is the full reference for every command below, the
 `import`, `config`, `client` and `packages` families included.
 
-`import world` checks each destination's World Import Profile. Skinning minimums apply to
-`alliance-eastern`, `alliance-kalimdor` and `alliance-single`. The `instances` profile allows no
-skinnable creatures, as in Deadmines, but requires loot for every referenced skinning table.
+`lyracore help` shows the short getting-started list. `lyracore help --all` shows the full help.
+In the reference below, square brackets mark optional arguments and `...` means an argument can
+repeat. Commands run against the selected Core checkout.
+
+### Local realm and publishing
 
 ```text
+lyracore help [--all]
 lyracore doctor
 lyracore preflight
 lyracore publish [DATABASE ...] [--skip-preflight]
@@ -29,14 +51,190 @@ lyracore dev logs [spacetime|gateway]
 lyracore dev smoke
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
-lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
-lyracore service reconcile
+lyracore character gm NAME true|false
 lyracore update
 ```
 
-Runtime state lives in the git-ignored `.lyracore/` of the target checkout — `state.json` for the
-processes the CLI started, `logs/{spacetime,gateway}.log`, and `coordinator-token` (mode `0600`) if
-this host had no SpacetimeDB login and the CLI minted a local identity.
+### World data and client content
+
+```text
+lyracore config
+lyracore config set client-data PATH
+lyracore import [--client-data PATH] [--accept] [--profile-shard PROFILE=SHARD ...]
+lyracore import world [--client-data PATH] [--accept] [--profile-shard PROFILE=SHARD ...]
+lyracore import vmaps [--client-data PATH] [--profile-shard PROFILE=SHARD ...]
+lyracore client sync
+lyracore client pack --out DIR [--zip]
+```
+
+Repeat `--profile-shard` for each assignment. `import` and `import world` are the same command.
+
+### Packages
+
+```text
+lyracore packages list
+lyracore packages new NAME
+lyracore packages add FOLDER|GIT-URL|NAME [--yes]
+lyracore packages update [NAME] [--yes]
+lyracore packages enable NAME
+lyracore packages disable NAME [--yes]
+lyracore packages remove NAME [--yes]
+lyracore packages build
+lyracore packages check
+lyracore packages replay [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]
+lyracore packages config NAME [KEY [VALUE]] [--new]
+```
+
+### Production inspection and host service
+
+```text
+lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
+lyracore service reconcile
+```
+
+`production status` requires the complete Shard list, including the Shard named by `--realm-core`.
+`service reconcile` requires root and restarts SpacetimeDB. Read its section before running it.
+
+## Import world data
+
+```bash
+lyracore config set client-data /path/to/WoW-1.12.1/Data
+lyracore config
+lyracore import
+```
+
+`config set client-data` checks and saves the path in `.lyracore/config.json`. `import` uses an
+explicit `--client-data PATH` first, then the saved path, then asks for one.
+
+With the realm running, `import` fetches the pinned cMaNGOS `classic-db` world data and combines
+it with your own 1.12.1 client's archives. It imports the supported Alliance early-game areas and
+Deadmines, including world content, DBCs, terrain, and navigation. It replaces the seeded content
+in the affected Import Families. You do not need a running MaNGOS installation.
+
+The command asks for consent on every run. For a scripted run:
+
+```bash
+lyracore import world --client-data /path/to/WoW-1.12.1/Data --accept
+```
+
+The default plan follows the recorded fixture topology. A sharded realm uses `alliance-eastern`,
+`alliance-kalimdor`, and `instances`; a single-Shard realm uses `alliance-single`. To name the
+destinations explicitly, supply all three sharded World Import Profile assignments:
+
+```bash
+lyracore import world \
+  --profile-shard alliance-eastern=lyracore \
+  --profile-shard alliance-kalimdor=lyracore-kalimdor \
+  --profile-shard instances=lyracore-instances
+```
+
+Each assignment must name a distinct Shard. `starting-eastern` and `starting-kalimdor` can replace
+their `alliance-*` counterparts to include the Horde starting areas. These assignments select
+Shard names on the local SpacetimeDB node; they do not select a remote host.
+
+The import checks each destination against its World Import Profile. World profiles require
+skinning content. The `instances` profile allows no skinnable creatures, as in Deadmines, but
+requires loot for every referenced skinning table.
+
+`lyracore import vmaps` imports exact model and WMO collision geometry into populated World Shards.
+It accepts the same client path and profile assignments, skips the Instance Pool, and does not
+enable exact collision checks. It reads your own archives without fetching game data, so it has
+no `--accept` option.
+
+## Manage Packages
+
+| Command | What it does |
+| --- | --- |
+| `packages list` | Show enabled and disabled Packages, their Package Sources, Content Identities, local changes, and registrations. |
+| `packages new NAME` | Create a Package from Core's `packages/example/` Reference Package and run preflight. |
+| `packages add FOLDER\|GIT-URL\|NAME` | Print a Trust Review, ask for confirmation, copy the Package into `packages/`, record its Package Source, and run preflight. |
+| `packages update [NAME]` | Update one Git-backed Package or all of them, including Official Package Sources. Refuse local changes, review the candidate, and restore the previous copy if preflight fails. |
+| `packages enable NAME` | Move a disabled Package back into `packages/`. |
+| `packages disable NAME` | Run Package Teardown when a dev node is recorded, then move the folder into `.lyracore/packages-disabled/`. |
+| `packages remove NAME` | Delete a disabled Package after confirmation. Refuse changes to its recorded Content Identity. |
+| `packages build` | Refresh typings, install pinned Bun dependencies, typecheck and run Datascripts, compile Runtime Scripts, and check the generated artifacts together. |
+| `packages check` | Check Package Deltas and Script Artifacts against their inputs, refreshing typings when needed. Preflight also runs this check. |
+| `packages replay` | Apply enabled Packages' spell Package Deltas and reconcile Runtime Scripts on each target Shard. |
+| `packages config NAME [KEY [VALUE]]` | List Package Config, read one key, or write one key on every recorded fixture Shard. |
+
+A bare name such as `playerbots` selects a Package from the
+[Official Package Collection](https://github.com/LyraCoreProject/packages). A Git Package Source
+must contain one Package at its root. Use `./my-package` to select a local folder explicitly.
+
+```bash
+lyracore packages add playerbots
+lyracore packages list
+lyracore packages replay --check
+```
+
+Adding, updating, enabling, or disabling a Package does not publish the Module or sync a client.
+Follow the next steps the command prints. Package Teardown deletes the Package's durable rows
+before disabling it on a recorded dev node, so the command asks first. Without a recorded node it
+moves the folder and reports any tables that still need teardown before publishing.
+
+`packages replay` uses the recorded fixture Shards unless you name destinations. `--check` prints
+the plan without changing Shards. Replays skip Import Families whose recorded inputs already
+match, so a retry resumes unfinished work; `--force-all` reapplies matching families too.
+`--client-data PATH` supplies the client archives needed for the spell family. An empty enabled
+Package set also reconciles state, removing Runtime Scripts and spell changes from disabled
+Packages.
+
+`packages config NAME KEY VALUE` changes a key the Package already seeded. Add `--new` to create
+a key. Reads report disagreements between Shards. Use `lyracore config` for the client path;
+Package Config holds the values a Package reads at runtime.
+
+Use `--yes` to answer the confirmation for `add`, `update`, `disable`, `remove`, or `replay` in
+advance. It does not bypass their checks. Bun is needed for authoring with `packages build`;
+applying a prebuilt Package does not require it.
+
+`packages build` records a Build Identity for each artifact it generates. Datascripts need a Base
+Snapshot from your client data; if it is missing, the command prints how to create it.
+`packages check` reports a missing Base Snapshot as unverifiable. Source-free prebuilt Script
+Artifacts still pass the Rust artifact checks without local authoring inputs.
+
+## Prepare client content
+
+```bash
+lyracore client sync
+lyracore client pack --out ./client-artifact --zip
+```
+
+`client sync` requires the saved client-data path. It builds `Data/patch-3.MPQ`, installs enabled
+Packages' addons into `Interface/AddOns/`, and clears the client's `WDB/` cache. Restart the
+client for MPQ changes or use `/reload` for addons. Addons left by a disabled or removed Package
+are reported when detected and remain on disk.
+
+`client pack` builds a separate Client Artifact from authored content in `client-patch/` and
+enabled Packages. It leaves the configured client alone and includes no base game assets.
+`--out` is relative to the Core checkout when it is not absolute. `--zip` also creates `DIR.zip`
+and requires the `zip` command. A nonempty output directory must be an earlier Client Artifact
+created by this command before it can be replaced.
+
+## Grant Character GM access
+
+```bash
+lyracore character gm Tester true
+lyracore character gm Tester false
+```
+
+The command searches the fixture's World Shards for the named Character and uses the coordinator
+credential to set GM level 3 for `true` or level 0 for `false`.
+
+## Update Core
+
+```bash
+lyracore update
+```
+
+This fetches `origin`, refuses tracked local changes, and resets the Core checkout to `origin/main`.
+It does not restart the realm. Review the reported change, then restart a local fixture with
+`lyracore dev down` followed by `lyracore dev up` to rebuild and republish. If the CLI pin changed,
+the Core launcher installs it on the next invocation.
+
+Runtime state lives in the target checkout's git-ignored `.lyracore/`: `state.json` records the
+processes the CLI started, `logs/` holds their output, and `config.json` holds the client path.
+When the CLI mints a local coordinator identity, `coordinator-token` stores its credential with
+mode `0600`.
 
 ## `preflight` — the offline deploy gate
 
@@ -44,8 +242,7 @@ this host had no SpacetimeDB login and the CLI minted a local identity.
 lyracore preflight
 ```
 
-The break class `cargo test` and `cargo check` cannot see. It touches **no node**: no publish, no
-call, no sql, no database, so it is safe to run against a live stack. Five checks:
+Preflight checks the build and schema without contacting a SpacetimeDB node. It runs six checks:
 
 | # | Check | The break it catches |
 | --- | --- | --- |
@@ -54,6 +251,7 @@ call, no sql, no database, so it is safe to run against a live stack. Five check
 | 2 | real, offline wasm schema extraction (`spacetime generate` into a scratch directory) | a `#[default(0)]` on a `u64`, which SpacetimeDB rejects at migration time and nothing in-tree validates |
 | 3 | every `#[client_visibility_filter]` names real tables and columns | a filter stored as raw text at publish, rejecting a gateway **subscription** at login time |
 | 4 | a script with a configurable `DB` target threads it into every tool it drives | an ETL writing to one database and asserting against another |
+| 5 | Package Delta and Script Artifact inputs match their Build Identities | stale Package content reaching a Shard |
 
 Every check runs even after one fails, so a run hands back every problem rather than one per
 attempt. Check 0 is an EXACT match, unlike `doctor`'s minimum-version floor: newer is not fine when
@@ -279,9 +477,9 @@ checkout's `.wire-harness-rev` (`<tag> <full sha>`), and this CLI owns the consu
 * the **sha** is what the checkout is then verified against, because a tag is a mutable ref and
   "pinned to a tag someone moved" is not pinned. A mismatch is reported as a supply-chain event, not
   a stale cache;
-* the clone lands in the git-ignored `.lyracore/wire-harness/<sha>/`, so it can never appear in the
-  server repo's `git status`. The repository is private, so the clone uses your existing git
-  credentials over ssh;
+* the clone lands in the git-ignored `.lyracore/wire-harness/<sha>/`. The
+  [wire-harness repository](https://github.com/LyraCoreProject/wire-harness) is public and fetched
+  over HTTPS, so no GitHub account or SSH key is needed;
 * `LYRACORE_WIRE_HARNESS_DIR=/path/to/wire-harness` overrides all of that with a local working tree.
   It is validated, and announced on stderr every time — a stale local checkout silently substituted
   for the pin is a measurement nobody can reproduce.
@@ -393,11 +591,9 @@ exists, the command reports success, and the login is refused forever.
 path, and bind names. Renaming those internals is a one-file change here, and no public command
 surface moves with it.
 
-The CLI drives a checkout through `Cargo.toml`, `rust-toolchain.toml`, `module/`, `scripts/*.sh` and
-`.wire-harness-rev` — it does **not** shell out to any script in the target repository. The
-guarantees that used to belong to `scripts/publish-module.sh` and `scripts/preflight.sh` are
-properties of `cmd/publish.rs` and `cmd/preflight.rs` here, so a checkout that ships without a
-`scripts/` or `adapters/` directory is still fully drivable.
+Publishing and preflight live in this CLI's `cmd/publish.rs` and `cmd/preflight.rs`. World import
+drives Core's importer binary and its `importer/scripts/` tools for the cMaNGOS fetch, class spells,
+and profile checks. `dev smoke` fetches the test code selected by Core's `.wire-harness-rev`.
 
 ## Host operations scripts
 
