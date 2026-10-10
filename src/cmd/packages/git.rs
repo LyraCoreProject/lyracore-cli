@@ -939,6 +939,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let tree = candidate(&tmp, "anything");
+        let script_ids = b"{\"version\":1,\"package\":\"greeter\",\"ids\":{\"welcome\":100300}}\n";
+        std::fs::write(tree.join("script-ids.json"), script_ids).unwrap();
         install(&project, &repository(&tree, FIRST));
 
         // The repository moves on.
@@ -954,6 +956,10 @@ mod tests {
         .unwrap();
 
         let installed = project.packages_dir().join("greeter");
+        assert_eq!(
+            std::fs::read(installed.join("script-ids.json")).unwrap(),
+            script_ids
+        );
         assert_eq!(
             std::fs::read_to_string(installed.join("src/mod.rs")).unwrap(),
             "pub fn greet_v2() {}\n"

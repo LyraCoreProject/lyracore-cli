@@ -313,11 +313,11 @@ does not replace scaffolded code.
 Rungs with Runtime Scripts or Datascripts need a lowercase Package name of at most 64 characters.
 Each `<name>.<script file stem>` must also fit the 64-character Runtime Script name limit.
 
-Generated artifacts are omitted because the renamed sources need new Build Identities. Before
-using a copy beside another, choose distinct `@id` values for Runtime Scripts or a distinct Package
-Spell ID in its Datascript. Run `packages apply` to build and activate the copy. A Datascript
-needs your own client data. Use `client sync` for a client half. Scaffolding requires network
-access to the collection.
+Generated artifacts and `script-ids.json` are omitted. The Runtime Script Toolchain assigns IDs
+for the new Package when it builds the renamed sources. Before using a Datascript copy beside
+another, choose distinct Package Spell IDs. Run `packages apply` to build and activate the copy.
+A Datascript needs your own client data. Use `client sync` for client content. Scaffolding requires
+network access to the collection.
 
 ## `packages enable`, `disable`, `remove` — taking a Package out of the build
 
@@ -478,10 +478,11 @@ with neither builds exactly as it did before those steps existed:
 5. Each enabled Package runs `datascripts/src/<name>/*.ts`, then
    `packages/<name>/datascripts/*.ts`. Each directory runs in file-name order, with one `bun run`
    subprocess per file. The first failure stops the build.
-6. Every enabled Package with a `scripts/` folder compiles its Runtime Scripts into one Script
-   Artifact, one `bun run` subprocess per Package, in folder-name order. The builder is handed the
+6. Every enabled Package with an immediate `.ts` or `.lua` file in `scripts/` compiles its Runtime
+   Scripts into one Script Artifact, one `bun run` subprocess per Package, in folder-name order.
+   The builder is handed the
    Module's Event Binding catalogue, read from `lyracore-delta-check --print-events`, so a mistyped
-   `@event` fails with the file that holds it. Fail-fast, the same way step 5 is.
+   Event Binding fails with the file that holds it. Fail-fast, the same way step 5 is.
 7. `lyracore-delta-check` traces every enabled Package's generated artifacts together, in one
    invocation, Package Deltas and Script Artifacts alike. This is the same authoritative Rust-side
    check `packages apply` runs before it writes to a Shard, so a Claim Conflict or a Runtime Script
@@ -491,13 +492,14 @@ with neither builds exactly as it did before those steps existed:
    the hashes `packages check` and preflight later recompute to tell whether it is still current.
    A source-free prebuilt Script Artifact has no local author inputs or sidecar; the authoritative
    checker still parses and traces it. Each kind records its own inputs — a Script Artifact's are
-   its `scripts/` sources and the Runtime Script Toolchain, not the Module typings or the Base
-   Snapshot.
+   its `scripts/` sources, optional Package-root `script-ids.json`, Runtime Script Toolchain and
+   Bun pin.
 
 A Package Delta this command emits is never committed: it is regenerated author-side on every
 build and installed from source, the same way `datascripts/generated/` itself is git-ignored. A
 Script Artifact is the one exception, since it is package-authored Lua with no client-derived
-data, so a Package may commit it under `data/.generated/` to ship its Runtime Scripts.
+data, so a Package may commit it under `data/.generated/` to ship its Runtime Scripts. Commit
+`script-ids.json` with the sources and Script Artifact so later builds keep the same IDs.
 
 Generating **first** is what gives the gate teeth. Rename a column in the Module, run
 `packages build`, and a Datascript still using the old name fails with the file and line to fix —
@@ -557,9 +559,10 @@ one in TypeScript or in Lua:
 
 ```text
 packages/fire_nova/
+  script-ids.json          stable IDs assigned by the Runtime Script Toolchain
   scripts/
     ember_echo.ts    compiled by the Runtime Script Toolchain
-    bonus.lua        shipped unchanged, for the author who would rather write Lua
+    bonus.lua        compiled for the author who writes Lua
   data/.generated/
     fire_nova.script.json   the Script Artifact. Committed in the Official Package Collection
 ```
@@ -567,51 +570,52 @@ packages/fire_nova/
 Runtime Script sources live in the Package's `scripts/` directory. Author-time Datascripts may
 live beside them in `datascripts/`.
 
-Every file opens with its **Script Directives**, `//` in TypeScript and `--` in Lua:
+Each source declares an ordinary named function and registers it for one typed Event Binding:
 
 ```ts
-// @event on_cast_resolved
-// @id 100200
-// @priority 10
-// @enabled false
-```
-
-`@event` and `@id` are required. `@priority` defaults to 0 and `@enabled` to true. The directives
-stop at the first line that is neither blank nor a comment, so ordinary comments below them are just
-comments. `@event` must name an event this build dispatches, or a Package Event of the shipping
-Package. `@id` must sit in the Package Script Range, 100,000 to 999,999.
-
-The identifier is **written down, not derived**. It is durable: `game_script` keys on it. Deriving
-it from a sorted file index would renumber every later script the moment an author added one
-alphabetically earlier, and two Packages would both start at the bottom of the band. The script
-*name* is derived, because there is one obvious answer: `<package>.<file stem>`.
-
-A TypeScript script declares its entry point and returns its Script Answer from it:
-
-```ts
-function script(): number | void {
-  const caster = event.actor;
-  if (!caster) return;
-  send_chat(caster, "the embers answer");
-  return caster.level;
+function welcome(event: PlayerLoginEvent): void {
+  send_chat(event.player, "Welcome to the realm.");
 }
+
+events.player.onLogin(welcome);
 ```
 
-The emitted Lua ends with `return script()`, because TypeScript has no top-level return and a Script
-Answer is the chunk's return value. A file without a `script` function is refused by name. Each file
-compiles as its own program, so two scripts in one Package may both declare `script`.
+Lua uses the same authoring shape:
 
-`datascripts/runtime-scripts/runtime-script.d.ts` is the hand-maintained Host API: the event, the
-Entity Handles it carries, and the Host Operations. A name outside that file is nil inside an
-Invocation. The event catalogue is deliberately **not** in it — the Module owns it, and a copy would
-drift; the build reads it from `lyracore-delta-check --print-events` instead.
+```lua
+local function welcome(event)
+  send_chat(event.player, "Welcome to the realm.")
+end
+
+events.player.onLogin(welcome)
+```
+
+Each file has one Event Binding. Registration selects the function the Invocation calls with its
+typed event. The toolchain captures registration in a local wrapper. It does not add Event Bindings
+at runtime. The generated Lua returns the function's Script Answer.
+
+The Runtime Script Toolchain assigns stable numeric IDs in the Package Script Range, 100,000 to
+999,999. It writes them to the Package-root `script-ids.json`. Keep that file and commit it with
+sources and the Script Artifact. Removed entries stay in the ledger so a later source does not
+reuse their IDs. The Runtime Script name is `<package>.<file stem>`, so renaming the handler keeps
+its name and ID.
+
+The builder still accepts legacy `@event` and `@id` Script Directives for migration. It preserves
+IDs from those directives or an existing Script Artifact with the same Runtime Script name. New
+sources use typed registration and let the toolchain manage IDs. Optional `@priority` and
+`@enabled` directives default to 0 and true. Use `//` comments in TypeScript and `--` in Lua.
+
+`datascripts/runtime-scripts/runtime-script.d.ts` declares the typed events, Entity Handles and
+Host Operations. `runtime-script.lua` provides Lua editor declarations from the same catalogue.
+The Module owns the event catalogue, and the build reads it from
+`lyracore-delta-check --print-events`.
 
 The emitter rewrites one call shape. piccolo 0.3.3 passes an inline table constructor's element
 count as an extra argument when the constructor is the last argument of a call, so `f({7, 8, 9})`
 arrives as `f(table, 3)`. Transpiler output meets that shape constantly. Every emitted file
 therefore opens with `local function ____tbl(t) return t end` and a trailing constructor is passed
 through it. `module/src/runtime_script.rs` pins both the fault and the fix. A hand-written `.lua`
-script ships unchanged, so its author avoids that call shape themselves.
+script must avoid that call shape.
 
 Syntax errors and failures raised through `error`, `assert`, or a Host Operation name a line of the
 **generated** Lua, the bytes the Shard holds, never a line of the TypeScript. There is no source
@@ -627,10 +631,10 @@ Build one Package's scripts by hand the way `packages build` does:
 bun run datascripts/runtime-scripts/build-scripts.ts fire_nova
 ```
 
-Script Artifacts are **committed** in the Official Package Collection, so an Operator installs
-prebuilt Lua and needs no Bun. In this checkout they are git-ignored output: the sources next to
-them are the repository content, and a committed copy would go stale the moment the Module schema or
-the pinned toolchain moved.
+The Official Package Collection commits sources, `script-ids.json` and Script Artifacts together.
+An Operator can install prebuilt Lua without Bun. In a Core checkout, Script Artifacts are
+git-ignored output and Build Identities detect changes to their author inputs. Keep
+`script-ids.json` with the Package sources.
 
 ## `packages apply`
 
@@ -696,8 +700,9 @@ specific input, the moment one no longer matches. `preflight` folds the same rep
 gate on `publish`'s behalf, so a stale artifact never reaches a Shard.
 
 A Package Delta always has a sidecar. A source-built Script Artifact has one for its `scripts/`
-sources, Runtime Script Toolchain, and Bun pin. A source-free prebuilt Script Artifact has no local
-author inputs or sidecar. `packages check` still sends every Script Artifact through the
+sources, optional Package-root `script-ids.json`, Runtime Script Toolchain, and Bun pin.
+A source-free prebuilt Script Artifact has no local author inputs or sidecar. `packages check`
+still sends every Script Artifact through the
 authoritative parser and tracer, so a malformed or conflicting prebuilt artifact never passes.
 
 `datascripts/generated/` is regenerated fresh, every run, with the same `spacetime generate`

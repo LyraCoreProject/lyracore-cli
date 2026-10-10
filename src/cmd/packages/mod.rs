@@ -801,6 +801,10 @@ pub fn new(
     let destination = project.packages_dir().join(name.as_str());
     let mut staged = StagedPackage::new(project, &name)?;
     copy_tree(&reference, staged.path())?;
+    let script_ids = staged.path().join("script-ids.json");
+    if script_ids.is_file() {
+        std::fs::remove_file(script_ids)?;
+    }
     let generated = staged.path().join("data/.generated");
     if generated.is_dir() {
         std::fs::remove_dir_all(generated)?;
@@ -914,12 +918,20 @@ fn activation_steps(package_dir: &Path) -> String {
 fn scaffold_next_steps(package_dir: &Path) -> String {
     let mut text = String::new();
     if package_dir.join("scripts").is_dir() || package_dir.join("datascripts").is_dir() {
-        text.push_str("Generated artifacts are omitted. Choose distinct Script IDs or Package Spell IDs \
-            before using this copy beside another. `packages apply` builds the renamed sources.\n\n");
+        text.push_str(
+            "Generated artifacts are omitted. `packages apply` builds the renamed sources.\n\n",
+        );
+    }
+    if package_dir.join("scripts").is_dir() {
+        text.push_str(
+            "`script-ids.json` is omitted. The Runtime Script Toolchain assigns new IDs. Commit \
+             it with the sources and Script Artifact.\n\n",
+        );
     }
     if package_dir.join("datascripts").is_dir() {
         text.push_str(
-            "The Datascript needs your own client data. Keep its generated Delta local.\n\n",
+            "The Datascript needs your own client data. Choose distinct Package Spell IDs before \
+             using this copy beside another. Keep its generated Delta local.\n\n",
         );
     }
     text.push_str(&activation_steps(package_dir));
@@ -1276,6 +1288,8 @@ pub(super) mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let source = candidate(&tmp, "greeter");
+        let script_ids = b"{\"version\":1,\"package\":\"greeter\",\"ids\":{\"welcome\":100300}}\n";
+        std::fs::write(source.join("script-ids.json"), script_ids).unwrap();
         let stack = FakeStack::new();
 
         add(
@@ -1289,6 +1303,10 @@ pub(super) mod tests {
 
         let installed = project.packages_dir().join("greeter");
         assert!(installed.join("src/mod.rs").is_file());
+        assert_eq!(
+            std::fs::read(installed.join("script-ids.json")).unwrap(),
+            script_ids
+        );
         let recorded = ProvenanceStamp::read(&installed).expect("no provenance stamp");
         assert_eq!(recorded.source_kind, stamp::SOURCE_LOCAL);
         assert_eq!(recorded.source, source.to_string_lossy());
@@ -1716,7 +1734,8 @@ pub(super) mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let stack = reference_collection(&tmp, DEFAULT_REFERENCE, &[
-            ("scripts/welcome.ts", b"// @event on_login\n// @id 100300\nfunction script() { send_chat(event.actor, \"example-script\"); }\n"),
+            ("scripts/welcome.ts", b"function welcome(event: PlayerLoginEvent): void { send_chat(event.player, \"example-script\"); }\nevents.player.onLogin(welcome);\n"),
+            ("script-ids.json", b"{\"version\":1,\"package\":\"example-script\",\"ids\":{\"welcome\":100300}}\n"),
             ("data/.generated/example-script.script.json", b"old generated artifact"),
             ("data/.generated/script.identity", b"old identity"),
         ]);
@@ -1727,6 +1746,7 @@ pub(super) mod tests {
         assert!(!source.contains("example-script"), "{source}");
         assert!(!scaffolded.join("src").exists());
         assert!(!scaffolded.join("data/.generated").exists());
+        assert!(!scaffolded.join("script-ids.json").exists());
         let readme = std::fs::read_to_string(scaffolded.join("README.md")).unwrap();
         assert!(readme.contains("packages apply"));
         assert!(readme.contains(&format!("/tree/{COLLECTION_REVISION}/example-script")));

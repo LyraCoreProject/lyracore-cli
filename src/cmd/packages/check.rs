@@ -496,6 +496,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_edited_script_id_ledger_makes_its_script_artifact_stale() {
+        let tmp = TempDir::new().unwrap();
+        let project = checked_out(&tmp);
+        let ledger = project.packages_dir().join("fire_nova/script-ids.json");
+        std::fs::write(
+            &ledger,
+            "{\"version\":1,\"package\":\"fire_nova\",\"ids\":{\"greet\":100001}}\n",
+        )
+        .unwrap();
+        with_built_script_artifact(&project);
+        std::fs::write(
+            ledger,
+            "{\"version\":1,\"package\":\"fire_nova\",\"ids\":{\"greet\":100002}}\n",
+        )
+        .unwrap();
+        let stack = FakeStack::new();
+
+        let error = run(&project, &stack.runner()).unwrap_err();
+
+        assert!(error.to_string().contains("script-ids.json"), "{error}");
+    }
+
     // ---- no-op checkouts ----
 
     #[test]

@@ -96,7 +96,7 @@ impl Input {
             Input::Artifact => {
                 "the artifact file itself (its bytes no longer match what was last built — hand-edited?)"
             }
-            Input::ScriptSource => "its Runtime Script sources under packages/<package>/scripts/",
+            Input::ScriptSource => "its Runtime Script sources under packages/<package>/scripts/ or script-ids.json",
             Input::Toolchain => {
                 "the pinned Runtime Script toolchain in datascripts/runtime-scripts/"
             }
@@ -393,7 +393,7 @@ pub fn write_all(project: &ProjectLayout, artifacts: &[super::artifact::Artifact
 
 // ---- the Script Artifact's own Build Identity ----
 
-/// What a Script Artifact was built from. Four inputs, not the Delta's nine: a Runtime Script reads
+/// What a Script Artifact was built from. Five inputs, not the Delta's nine: a Runtime Script reads
 /// no Base Snapshot, imports no authoring library, and never sees the Module schema typings.
 ///
 /// `artifact_hash` here is SHA-256 of the artifact file's raw bytes, not the Delta's BLAKE3
@@ -496,12 +496,18 @@ fn hash_dir_files(root: &Path) -> Result<String> {
 /// Compute the Build Identity of one Package's Script Artifact from the checkout on disk right now.
 ///
 /// `artifact_path` is the Script Artifact itself; the Package folder it sits in selects the
-/// `scripts/` sources, exactly as the Delta side derives its Datascript folder.
+/// `scripts/` sources and optional `script-ids.json`.
 pub fn compute_script(project: &ProjectLayout, artifact_path: &Path) -> Result<ScriptIdentity> {
     let dir = package_dir(project, artifact_path)?;
     let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    let mut sources = super::script::source_files(project, &name)?;
+    let script_ids = dir.join("script-ids.json");
+    if script_ids.is_file() {
+        sources.push(script_ids);
+    }
+    sources.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
     Ok(ScriptIdentity {
-        source_hash: hash_script_sources(&super::script::source_files(project, &name)?)?,
+        source_hash: hash_script_sources(&sources)?,
         toolchain_hash: hash_dir_files(&project.runtime_scripts_dir())?,
         bun_version: doctor::REQUIRED_BUN.to_string(),
         bun_lock_hash: hash_file(&project.datascripts_dir().join("bun.lock"))?,
@@ -509,7 +515,8 @@ pub fn compute_script(project: &ProjectLayout, artifact_path: &Path) -> Result<S
     })
 }
 
-/// SHA-256 over the exact Runtime Script source inventory, mirrored in `build-scripts.ts`.
+/// SHA-256 over Runtime Script sources and the optional ledger, sorted by basename.
+/// `build-scripts.ts` hashes the same names and bytes.
 fn hash_script_sources(files: &[PathBuf]) -> Result<String> {
     let mut hasher = Sha256::new();
     for path in files {
@@ -1017,6 +1024,17 @@ mod tests {
         assert_eq!(
             identity.source_hash,
             "sha256-script-sources-v1:8395ead00aad341a7daa23658447385da94dabf6932b406cbfbdb5e2fd664002"
+        );
+
+        std::fs::write(
+            project.packages_dir().join("fire_nova/script-ids.json"),
+            "{\"version\":1,\"package\":\"fire_nova\",\"ids\":{\"alpha\":100201,\"zeta\":100202}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            compute_script(&project, &artifact).unwrap().source_hash,
+            "sha256-script-sources-v1:fd57032ebeb5da4f7f9e8653d38faac1302af48f98e1608657aebe112c8b479d"
         );
     }
 }
