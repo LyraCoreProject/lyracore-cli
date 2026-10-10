@@ -78,10 +78,15 @@ pub(crate) fn shard_list(shards: &[String]) -> String {
     }
 }
 
-/// The folder name of the maintained reference Package, checked into every LyraCore checkout
-/// (including the public mirror) at `packages/example/`. `packages new` copies and renames it; see
-/// its own doc comment for what a Package's Rust half looks like.
-pub const REFERENCE_PACKAGE: &str = "example";
+/// The default Reference Package needs no Rust.
+pub const DEFAULT_REFERENCE: &str = "example-script";
+const REFERENCE_PACKAGES: &[&str] = &[
+    "example-script",
+    "example-client",
+    "example-data",
+    "example-rust",
+    "example-all",
+];
 
 /// A Package folder name the server build will accept.
 ///
@@ -779,39 +784,45 @@ pub(crate) fn shell_quote(path: &Path) -> String {
 //  `packages new`
 // =============================================================================================
 
-/// Scaffold a new Package by copying and renaming the reference Package (`packages/example/`,
-/// checked into this checkout). Fetching the template needs no network; the ordinary preflight at
-/// the end still uses Cargo's configured cache/network like `lyracore preflight` itself. Nothing
-/// came from outside the checkout, so unlike `add` there is no Package Source or trust review to
-/// show.
-pub fn new(project: &ProjectLayout, runner: &dyn ProcessRunner, name: &str) -> Result<()> {
+/// Copy a Reference Package from the collection tag matching this checkout's Package API.
+/// Generated artifacts are omitted because renaming their source invalidates their Build Identity.
+pub fn new(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    name: &str,
+    from: &str,
+) -> Result<()> {
     let name = PackageName::parse(name)?;
-    check_collision(project, &name)?;
-
-    let reference = project.packages_dir().join(REFERENCE_PACKAGE);
-    if !reference.is_dir() {
+    if !REFERENCE_PACKAGES.contains(&from) {
         return Err(Error::Usage(format!(
-            "no reference Package at {}. `packages new` scaffolds by copying `packages/{}/` out of \
-             this checkout, so a checkout missing it cannot scaffold — that is a broken or partial \
-             checkout, not a problem with the name '{}'.",
-            reference.display(),
-            REFERENCE_PACKAGE,
-            name.as_str()
+            "unknown Reference Package '{from}'. Choose one of: {}",
+            REFERENCE_PACKAGES.join(", ")
         )));
     }
-    // Validate the complete maintained tree with the same no-links/no-special-files policy as a
-    // local install, before an enabled destination exists.
+    let reference_name = PackageName::parse(from)?;
+    check_collision(project, &name)?;
+    let collection = official::fetch(project, runner)?;
+    let reference = official::resolve(collection.path(), &reference_name)?;
     stamp::content_identity(&reference)?;
     validate_shape(&reference)?;
 
     let destination = project.packages_dir().join(name.as_str());
     let mut staged = StagedPackage::new(project, &name)?;
     copy_tree(&reference, staged.path())?;
-    rewrite_reference_name(staged.path(), &name)?;
+    let generated = staged.path().join("data/.generated");
+    if generated.is_dir() {
+        std::fs::remove_dir_all(generated)?;
+    }
+    rewrite_reference_name(staged.path(), &reference_name, &name)?;
+    println!(
+        "{}",
+        review::TrustReview::scan(staged.path())?.render(&reference)
+    );
 
     let identity = stamp::content_identity(staged.path())?;
     ProvenanceStamp::scaffolded(
-        &format!("packages/{REFERENCE_PACKAGE}/ (the reference Package)"),
+        from,
+        collection.revision().to_string(),
         identity.clone(),
         stamp::now_unix(),
     )
@@ -819,66 +830,81 @@ pub fn new(project: &ProjectLayout, runner: &dyn ProcessRunner, name: &str) -> R
     let _claim = PackageClaim::acquire(project, &name)?;
     check_collision(project, &name)?;
     staged.install(&destination)?;
-    println!();
     println!("scaffolded {} -> {}", name.as_str(), destination.display());
-    println!("  from      packages/{REFERENCE_PACKAGE}/ (the reference Package)");
+    println!("  from      {from} in {}", official::COLLECTION_URL);
+    println!("  revision  {}", collection.revision());
     println!("  identity  {identity}");
 
-    println!();
-    println!("running preflight with the Package compiled in");
     preflight::run(project, runner).map_err(|e| {
         Error::Process(format!(
-            "preflight failed after '{}' was scaffolded, so it has NOT been published and the \
-             module on the node is unchanged.\n  The Package remains at {}. The failure below may \
-             be in its code or in another preflight prerequisite; fix the reported cause and \
-             re-run `lyracore preflight`, or undo the scaffold with:\n      rm -rf -- {}\n  ({e})",
+            "preflight failed after '{}' was scaffolded. Nothing was published.\n  The Package \
+             remains at {}. Fix the reported cause and re-run `lyracore preflight`, or remove \
+             the scaffold with:\n      rm -rf -- {}\n  ({e})",
             name.as_str(),
             destination.display(),
             shell_quote(&destination)
         ))
     })?;
 
-    println!();
-    println!(
-        "'{}' is scaffolded and preflight is green. It has no client/ directory yet, so:",
-        name.as_str()
-    );
-    println!("  lyracore publish       compile the Package into the module and publish it to every database");
-    println!(
-        "  lyracore client sync   nothing to install yet — add a client/ directory (addons under"
-    );
-    println!(
-        "                         client/addons/<Name>/, overrides under client/mpq/) and re-run"
-    );
-    println!(
-        "grow the Rust half in packages/{}/src/: wire more hooks from the catalog in",
-        name.as_str()
-    );
-    println!("module/src/hooks.rs, following the pattern already in its src/mod.rs.");
+    println!("'{}' is scaffolded and preflight is green.", name.as_str());
+    if destination.join("scripts").is_dir() || destination.join("datascripts").is_dir() {
+        println!("  Choose distinct Script IDs or Package Spell IDs before using this copy beside another.");
+        println!("  Run `lyracore packages build` to build artifacts for the renamed source.");
+        println!("  Datascripts need a Base Snapshot from your own client data.");
+    }
+    if destination.join("src").is_dir() {
+        println!("  Publish through the normal realm update to load the Rust half.");
+    }
+    if destination.join("client").is_dir() {
+        println!("  Run `lyracore client sync` to install the client half.");
+    }
     Ok(())
 }
 
-/// Replace the reference Package's own name inside the copied tree's file contents, so a scaffold
-/// named `greeter` does not keep saying `example` in its identifiers. The reference Package is
-/// maintained to use the literal word "example" ONLY inside an identifier, never in prose (see its
-/// own doc comment), so a whole-file substring replace is exact rather than approximate. A file that
-/// is not valid UTF-8 is left untouched — the reference Package ships none, and a future one that
-/// did would not be text this rewrite could safely touch anyway.
-fn rewrite_reference_name(destination: &Path, name: &PackageName) -> Result<()> {
-    let ident = name.rust_ident();
-    for entry in tree::collect(destination)? {
+/// Rename Package names, Rust identifiers and client filenames. Binary assets stay byte-identical.
+fn rewrite_reference_name(
+    destination: &Path,
+    reference: &PackageName,
+    name: &PackageName,
+) -> Result<()> {
+    let entries = tree::collect(destination)?;
+    for entry in &entries {
         if entry.kind != tree::EntryKind::File || entry.relative == Path::new(stamp::STAMP_FILE) {
             continue;
         }
         match std::fs::read_to_string(&entry.path) {
-            Ok(text) if text.contains(REFERENCE_PACKAGE) => {
-                std::fs::write(&entry.path, text.replace(REFERENCE_PACKAGE, &ident))?;
+            Ok(text) => {
+                let renamed = text
+                    .replace(&reference.rust_ident(), &name.rust_ident())
+                    .replace(reference.as_str(), name.as_str());
+                if text != renamed {
+                    std::fs::write(&entry.path, renamed)?;
+                }
             }
-            Ok(_) => {}
-            // A future reference may carry binary client assets; they have no textual identifier
-            // to rewrite and are copied byte-for-byte.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {}
             Err(error) => return Err(error.into()),
+        }
+    }
+    // Rename children before their containing directory.
+    for entry in entries.into_iter().rev() {
+        let filename = entry
+            .path
+            .file_name()
+            .and_then(|part| part.to_str())
+            .ok_or_else(|| {
+                Error::State("Package traversal returned an invalid filename".to_string())
+            })?;
+        let renamed = filename.replace(reference.as_str(), name.as_str());
+        if filename != renamed {
+            let target = entry.path.with_file_name(renamed);
+            if target.exists() {
+                return Err(Error::Usage(format!(
+                    "renaming {} would overwrite {}",
+                    entry.path.display(),
+                    target.display()
+                )));
+            }
+            std::fs::rename(&entry.path, target)?;
         }
     }
     Ok(())
@@ -932,7 +958,7 @@ pub fn list(project: &ProjectLayout) -> Result<()> {
 
 /// Where a Package came from and when, as `packages list` and the lifecycle verbs both print it. A
 /// Package with no stamp says so rather than printing blank fields, and one with no revision (a
-/// local folder, a scaffold) leaves that line out rather than printing an empty one.
+/// local folder) leaves that line out rather than printing an empty one.
 pub(crate) fn provenance_report(stamp: Option<&ProvenanceStamp>) -> String {
     match stamp {
         Some(recorded) => format!(
@@ -1606,46 +1632,48 @@ pub(super) mod tests {
 
     // ---- `packages new` ----
 
-    /// A checkout that also carries a reference Package, standing in for the real
-    /// `packages/example/` this CLI ships in the LyraCore repo. Its source deliberately spells the
-    /// literal word "example" only inside an identifier, matching the real reference Package's own
-    /// constraint, so a scaffold test can assert the rename actually happened.
-    fn checkout_with_reference(tmp: &TempDir) -> ProjectLayout {
-        let project = checkout(tmp);
-        let reference = project.packages_dir().join(REFERENCE_PACKAGE).join("src");
-        std::fs::create_dir_all(&reference).unwrap();
-        std::fs::write(
-            reference.join("mod.rs"),
-            "crate::game_hook!(on_group_invite, fn example_on_group_invite(_ctx, _payload) { });\n",
-        )
-        .unwrap();
-        project
+    const COLLECTION_REVISION: &str = "1234567890abcdef1234567890abcdef12345678";
+
+    fn reference_collection(tmp: &TempDir, rung: &str, files: &[(&str, &[u8])]) -> FakeStack {
+        let collection = tmp.path().join("collection");
+        for (name, bytes) in files {
+            let path = collection.join(rung).join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        FakeStack::new()
+            .with_git_clone(&collection)
+            .with_stdout("rev-parse HEAD", &format!("{COLLECTION_REVISION}\n"))
     }
 
     #[test]
-    fn a_scaffold_copies_the_reference_renames_it_stamps_it_and_stops_short_of_publishing() {
+    fn a_script_scaffold_renames_source_and_records_its_rung_and_revision() {
         let tmp = TempDir::new().unwrap();
-        let project = checkout_with_reference(&tmp);
-        let stack = FakeStack::new();
-
-        new(&project, &stack.runner(), "greeter").unwrap();
-
-        let scaffolded = project.packages_dir().join("greeter");
-        let source = std::fs::read_to_string(scaffolded.join("src/mod.rs")).unwrap();
-        assert!(
-            source.contains("greeter_on_group_invite"),
-            "the reference Package's own name must be renamed: {source}"
-        );
-        assert!(!source.contains("example_on_group_invite"), "{source}");
-
-        let recorded = ProvenanceStamp::read(&scaffolded).expect("no provenance stamp");
+        let project = checkout(&tmp);
+        let stack = reference_collection(&tmp, DEFAULT_REFERENCE, &[
+            ("scripts/welcome.ts", b"// @event on_login\n// @id 100300\nfunction script() { send_chat(event.actor, \"example-script\"); }\n"),
+            ("data/.generated/example-script.script.json", b"old generated artifact"),
+            ("data/.generated/script.identity", b"old identity"),
+        ]);
+        new(&project, &stack.runner(), "my-greeter", DEFAULT_REFERENCE).unwrap();
+        let scaffolded = project.packages_dir().join("my-greeter");
+        let source = std::fs::read_to_string(scaffolded.join("scripts/welcome.ts")).unwrap();
+        assert!(source.contains("my-greeter"), "{source}");
+        assert!(!source.contains("example-script"), "{source}");
+        assert!(!scaffolded.join("src").exists());
+        assert!(!scaffolded.join("data/.generated").exists());
+        let recorded = ProvenanceStamp::read(&scaffolded).unwrap();
         assert_eq!(recorded.source_kind, stamp::SOURCE_SCAFFOLD);
+        assert_eq!(recorded.source, "example-script");
+        assert_eq!(recorded.revision, COLLECTION_REVISION);
         assert_eq!(
             recorded.content_identity,
-            stamp::content_identity(&scaffolded).unwrap(),
-            "the stamp must record the identity of what was actually written"
+            stamp::content_identity(&scaffolded).unwrap()
         );
-        // The remaining steps are PRINTED, never run: nothing here may touch the node.
+        assert!(stack
+            .rendered()
+            .iter()
+            .any(|call| call.contains("refs/tags/api-v1")));
         for call in stack.rendered() {
             assert!(!call.contains("spacetime publish"), "{call}");
             assert!(!call.contains("--pack-client"), "{call}");
@@ -1653,50 +1681,103 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_scaffold_name_either_inventory_already_holds_is_refused_before_anything_is_written() {
-        let tmp = TempDir::new().unwrap();
-        let project = checkout_with_reference(&tmp);
-        std::fs::create_dir_all(project.packages_dir().join("greeter")).unwrap();
-
-        let error = new(&project, &FakeStack::new().runner(), "greeter").unwrap_err();
-
-        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
-        assert!(error.to_string().contains("enabled"), "{error}");
-    }
-
-    #[test]
-    fn an_invalid_scaffold_name_is_refused_before_anything_is_written() {
-        let tmp = TempDir::new().unwrap();
-        let project = checkout_with_reference(&tmp);
-
-        let error = new(&project, &FakeStack::new().runner(), "2fast").unwrap_err();
-
-        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
-        assert!(!project.packages_dir().join("2fast").exists(), "{error}");
-    }
-
-    #[test]
-    fn a_checkout_missing_the_reference_package_cannot_scaffold() {
-        // `checkout()`, not `checkout_with_reference()` — a checkout without `packages/example/` is
-        // exactly the broken/partial state this error names, not something `new` can paper over.
+    fn a_rust_scaffold_keeps_the_package_name_distinct_from_its_rust_identifier() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
-
-        let error = new(&project, &FakeStack::new().runner(), "greeter").unwrap_err();
-
-        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
-        assert!(error.to_string().contains("reference Package"), "{error}");
-        assert!(!project.packages_dir().join("greeter").exists(), "{error}");
+        let stack = reference_collection(
+            &tmp,
+            "example-all",
+            &[
+                (
+                    "src/mod.rs",
+                    b"const PACKAGE: &str = \"example-all\";\nfn example_all_on_login() {}\n",
+                ),
+                (
+                    "scripts/welcome.lua",
+                    b"-- @event example-all.welcome\n-- @id 100302\nreturn 1\n",
+                ),
+            ],
+        );
+        new(&project, &stack.runner(), "my-greeter", "example-all").unwrap();
+        let folder = project.packages_dir().join("my-greeter");
+        let source = std::fs::read_to_string(folder.join("src/mod.rs")).unwrap();
+        assert!(source.contains("\"my-greeter\""), "{source}");
+        assert!(source.contains("fn my_greeter_on_login"), "{source}");
+        assert!(std::fs::read_to_string(folder.join("scripts/welcome.lua"))
+            .unwrap()
+            .contains("@event my-greeter.welcome"));
     }
 
     #[test]
-    fn a_failed_preflight_after_scaffolding_publishes_nothing_and_says_how_to_undo_it() {
+    fn a_client_scaffold_renames_addon_paths_and_preserves_binary_assets() {
         let tmp = TempDir::new().unwrap();
-        let project = checkout_with_reference(&tmp);
-        let stack = FakeStack::new().fail_on("cargo check", "the scaffold does not compile");
+        let project = checkout(&tmp);
+        let stack = reference_collection(
+            &tmp,
+            "example-client",
+            &[
+                (
+                    "client/addons/example-client/example-client.toc",
+                    b"example-client.lua\n",
+                ),
+                (
+                    "client/addons/example-client/example-client.lua",
+                    b"print(\"example-client\")\n",
+                ),
+                ("client/art/image.blp", &[0xff, 0xfe, 1]),
+            ],
+        );
+        new(&project, &stack.runner(), "my-greeter", "example-client").unwrap();
+        let client = project.packages_dir().join("my-greeter/client");
+        assert_eq!(
+            std::fs::read_to_string(client.join("addons/my-greeter/my-greeter.toc")).unwrap(),
+            "my-greeter.lua\n"
+        );
+        assert!(client.join("addons/my-greeter/my-greeter.lua").is_file());
+        assert_eq!(
+            std::fs::read(client.join("art/image.blp")).unwrap(),
+            &[0xff, 0xfe, 1]
+        );
+    }
 
-        let error = new(&project, &stack.runner(), "greeter").unwrap_err();
+    #[test]
+    fn a_scaffold_collision_or_invalid_name_or_rung_never_fetches() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.packages_dir().join("greeter")).unwrap();
+        for (name, rung) in [
+            ("greeter", DEFAULT_REFERENCE),
+            ("2fast", DEFAULT_REFERENCE),
+            ("fresh", "dungeons"),
+        ] {
+            let stack = FakeStack::new();
+            let error = new(&project, &stack.runner(), name, rung).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+            assert!(stack.calls().is_empty());
+        }
+    }
 
+    #[test]
+    fn a_missing_collection_rung_leaves_no_scaffold() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = reference_collection(&tmp, "example-rust", &[("src/mod.rs", b"")]);
+        let error = new(&project, &stack.runner(), "greeter", DEFAULT_REFERENCE).unwrap_err();
+        assert!(error.to_string().contains("example-script"), "{error}");
+        assert!(!project.packages_dir().join("greeter").exists());
+    }
+
+    #[test]
+    fn a_failed_preflight_keeps_the_scaffold_and_explains_how_to_remove_it() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = reference_collection(
+            &tmp,
+            "example-rust",
+            &[("src/mod.rs", b"fn example_rust() {}")],
+        )
+        .fail_on("cargo check", "the scaffold does not compile");
+        let error = new(&project, &stack.runner(), "greeter", "example-rust").unwrap_err();
         let scaffolded = project.packages_dir().join("greeter");
         assert!(error.to_string().contains("preflight failed"), "{error}");
         assert!(
@@ -1705,10 +1786,7 @@ pub(super) mod tests {
                 .contains(&format!("rm -rf -- {}", shell_quote(&scaffolded))),
             "{error}"
         );
-        assert!(
-            scaffolded.is_dir(),
-            "the scaffold stays so it can be fixed in place"
-        );
+        assert!(scaffolded.is_dir());
     }
 
     // ---- `packages list` ----

@@ -69,7 +69,7 @@ lyracore packages config NAME [KEY [VALUE]] [--new]
 lyracore packages disable NAME [--yes]
 lyracore packages enable NAME
 lyracore packages list
-lyracore packages new NAME
+lyracore packages new NAME [--from RUNG]
 lyracore packages remove NAME [--yes]
 lyracore packages replay [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]
 lyracore packages update [NAME] [--yes]
@@ -102,7 +102,7 @@ lyracore update
 | `packages disable` | run Package Teardown on every Shard, then move the Package out of the build's sight, keeping it on disk |
 | `packages enable` | move a disabled Package back into the build |
 | `packages list` | every installed Package: enabled or disabled, where it came from, and whether it has drifted |
-| `packages new` | scaffold a new Package offline, by copying and renaming the reference Package this checkout ships |
+| `packages new` | copy and rename a Reference Package from the collection tag matching this checkout's Package API |
 | `packages remove` | delete a disabled Package, after a confirmation and a check for local changes |
 | `packages replay` | reapply every enabled Package's claims and Runtime Scripts onto the named Shards, or the whole recorded fixture topology by default |
 | `packages update` | advance a Git-backed Package, or every one of them, to the repository's current commit |
@@ -229,7 +229,8 @@ for you**, so a plain `./lyracore import` never asks twice.
 ./lyracore packages add https://host/greeter.git   # clone a repository whose root is one Package
 ./lyracore packages add greeter                # bare name: resolve from the Official Package Collection
 ./lyracore packages list
-./lyracore packages new my-package             # scaffold one from nothing but this checkout
+./lyracore packages new my-package             # start with example-script
+./lyracore packages new my-package --from example-rust
 ```
 
 A Package is a drop-in folder under `packages/<name>/`. `module/build.rs` discovers it and compiles
@@ -298,18 +299,21 @@ Identity, whether the tree on disk still matches it (`clean` or `LOCALLY DRIFTED
 registers. A Package with no stamp — dropped into `packages/` by hand, or installed before this
 command existed — renders as unrecorded rather than failing the listing.
 
-**`packages new NAME` scaffolds a Package with no network access and nothing external to review.**
-It copies `packages/example/` — the maintained reference Package every LyraCore checkout ships,
-including a fresh public clone — to `packages/NAME/`, renaming the reference's own identifiers into
-the new name, then writes a Provenance Stamp recording a **scaffold** origin rather than a Package
-Source (nothing external was installed, so there is nothing to name) and runs `preflight`. The same
-name and shape refusals as `add` apply before anything is written. The reference Package is
-Rust-only and inert. Its `src/mod.rs` carries one commented hook pattern, and the scaffold has no
-`client/` directory. The printed next steps say to add `client/addons/<Name>/` for addons or `client/mpq/`
-for client-file overrides, and that `client sync` will pack them in once you do. Growing the Rust
-half means wiring more hooks from the catalogue in `module/src/hooks.rs`, following the pattern
-`packages/NAME/src/mod.rs` already shows. A scaffold ships no Datascript: the authoring toolchain
-in `datascripts/` is checkout-wide today, not per-Package.
+`packages new NAME [--from RUNG]` fetches a Reference Package from the Official Package Collection.
+The checkout's Package API version selects its tag, as with `packages add`. The default is
+`example-script`, which needs no Rust. Other rungs are `example-client`, `example-data`,
+`example-rust` and `example-all`. A missing tag or rung leaves the Package Inventory unchanged.
+
+The command copies the source into `packages/NAME/`, renames Package names, Rust identifiers and
+client filenames, prints its Trust Review and runs `preflight`. The Provenance Stamp keeps the
+`scaffold` kind and records the chosen rung and exact collection revision. `packages update`
+does not replace scaffolded code.
+
+Generated artifacts are omitted because the renamed sources need new Build Identities. Before
+using a copy beside another, choose distinct `@id` values for Runtime Scripts or a distinct Package
+Spell ID in its Datascript. Run `packages build` after editing the sources. A Datascript also needs
+a Base Snapshot from your own client data. Replay the built artifacts through the normal realm
+update; use `client sync` for a client half. Scaffolding requires network access to the collection.
 
 ## `packages enable`, `disable`, `remove` — taking a Package out of the build
 

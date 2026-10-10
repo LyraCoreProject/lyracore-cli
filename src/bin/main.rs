@@ -128,8 +128,8 @@ fn run(args: &[String]) -> Result<i32> {
         )
         .map(|_| EXIT_OK),
         Command::PackagesList => cmd::packages::list(&ProjectLayout::discover()?).map(|_| EXIT_OK),
-        Command::PackagesNew { name } => {
-            cmd::packages::new(&ProjectLayout::discover()?, &runner, &name).map(|_| EXIT_OK)
+        Command::PackagesNew { name, from } => {
+            cmd::packages::new(&ProjectLayout::discover()?, &runner, &name, &from).map(|_| EXIT_OK)
         }
         Command::PackagesBuild => {
             cmd::packages::build::run(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)

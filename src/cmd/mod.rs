@@ -177,12 +177,12 @@ USAGE:
                                                Package Source, its recorded content identity,
                                                whether the installed copy has drifted from it,
                                                and what it registers
-  lyracore packages new NAME                   scaffold from the maintained reference Package in
-                                               this checkout (packages/example/), without fetching
-                                               a template. Refuses enabled/disabled collisions,
-                                               then runs ordinary preflight (whose Cargo checks may
-                                               use its configured cache/network). No client content;
-                                               the printed next steps explain how to add it
+  lyracore packages new NAME [--from RUNG]      copy a Reference Package from the collection tag for
+                                               this checkout's Package API. Defaults to example-script.
+                                               Other rungs: example-client, example-data, example-rust,
+                                               example-all. Records the rung and revision, renames
+                                               source and runs preflight. Build new artifacts with
+                                               `packages build` after choosing distinct IDs
   lyracore production status --server URI --gateway-log PATH --realm-core DB DATABASE ...
                                                read-only production topology, schema, connection,
                                                realm-core and listener verdicts
@@ -263,6 +263,7 @@ pub enum Command {
     PackagesList,
     PackagesNew {
         name: String,
+        from: String,
     },
     PackagesBuild,
     PackagesCheck,
@@ -419,15 +420,7 @@ impl Command {
             ["packages", "list", other, ..] => Err(Error::Usage(format!(
                 "`packages list` takes no arguments (got '{other}')"
             ))),
-            ["packages", "new", name] => Ok(Command::PackagesNew {
-                name: (*name).to_string(),
-            }),
-            ["packages", "new"] => Err(Error::Usage(
-                "`packages new` needs a name, e.g. `packages new my-package`".to_string(),
-            )),
-            ["packages", "new", _name, other, ..] => Err(Error::Usage(format!(
-                "`packages new` takes one name (got a second argument: '{other}')"
-            ))),
+            ["packages", "new", rest @ ..] => parse_packages_new(rest),
             ["packages", "replay", rest @ ..] => parse_packages_replay(rest),
             ["packages", "config", rest @ ..] => parse_packages_config(rest),
             ["packages", "build"] => Ok(Command::PackagesBuild),
@@ -691,6 +684,41 @@ fn parse_packages_replay(args: &[&str]) -> Result<Command> {
         }
     }
     Ok(Command::PackagesReplay(options))
+}
+
+fn parse_packages_new(args: &[&str]) -> Result<Command> {
+    let mut name = None;
+    let mut from = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match *arg {
+            "--from" if from.is_none() => {
+                from = Some(
+                    args.next()
+                        .filter(|value| !value.starts_with('-'))
+                        .ok_or_else(|| {
+                            Error::Usage("`--from` needs a Reference Package name".to_string())
+                        })?
+                        .to_string(),
+                );
+            }
+            option if option.starts_with('-') => {
+                return Err(Error::Usage(format!(
+                    "unknown or repeated `packages new` option '{option}'; use NAME [--from RUNG]"
+                )))
+            }
+            value if name.is_none() => name = Some(value.to_string()),
+            value => {
+                return Err(Error::Usage(format!(
+                    "`packages new` takes one name, got '{value}' too"
+                )))
+            }
+        }
+    }
+    Ok(Command::PackagesNew {
+        name: name.ok_or_else(|| Error::Usage("`packages new` needs a name".to_string()))?,
+        from: from.unwrap_or_else(|| packages::DEFAULT_REFERENCE.to_string()),
+    })
 }
 
 /// `client pack --out DIR [--zip]`.
@@ -1692,13 +1720,37 @@ mod tests {
             parse("packages new greeter").unwrap(),
             Command::PackagesNew {
                 name: "greeter".to_string(),
+                from: packages::DEFAULT_REFERENCE.to_string(),
             }
         );
     }
 
     #[test]
+    fn packages_new_accepts_from_on_either_side_of_the_name() {
+        for line in [
+            "packages new greeter --from example-rust",
+            "packages new --from example-rust greeter",
+        ] {
+            assert_eq!(
+                parse(line).unwrap(),
+                Command::PackagesNew {
+                    name: "greeter".to_string(),
+                    from: "example-rust".to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn packages_new_refuses_no_name_and_a_second_argument() {
-        for line in ["packages new", "packages new greeter extra"] {
+        for line in [
+            "packages new",
+            "packages new greeter extra",
+            "packages new greeter --from",
+            "packages new greeter --from --bad",
+            "packages new greeter --from example-rust --from example-data",
+            "packages new --bad greeter",
+        ] {
             let error = parse(line).unwrap_err();
             assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{line}");
         }

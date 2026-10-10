@@ -863,7 +863,8 @@ pub(crate) mod tests {
 
         // A scaffold was copied out of this checkout and renamed. Re-adding it would not bring
         // back the Package that is being deleted.
-        let scaffold = ProvenanceStamp::scaffolded("packages/example/", String::new(), 0);
+        let scaffold =
+            ProvenanceStamp::scaffolded("example-script", "abcdef".to_string(), String::new(), 0);
         let name = PackageName::parse("greeter").unwrap();
         assert!(recovery_note(&name, Some(&scaffold)).contains("final"));
         assert!(recovery_note(&name, Some(&missing_kind)).contains("final"));

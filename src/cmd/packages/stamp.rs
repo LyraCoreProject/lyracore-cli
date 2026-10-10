@@ -29,10 +29,8 @@ pub const SOURCE_LOCAL: &str = "local";
 /// is the repository URL and its [`revision`](ProvenanceStamp::revision) is the exact commit that
 /// was installed, which is what `packages update` advances from.
 pub const SOURCE_GIT: &str = "git";
-/// The kind `packages new` records. A scaffolded Package has no Package Source — nothing the
-/// operator chose and could drift from — so this is a distinct kind from [`SOURCE_LOCAL`] rather
-/// than a `local()` stamp pointed at the reference Package, which would wrongly claim the operator
-/// picked and reviewed a source folder.
+/// A scaffold records its Reference Package and collection revision. It is authored locally after
+/// copying, so `packages update` must not replace it from the collection.
 pub const SOURCE_SCAFFOLD: &str = "scaffold";
 /// The kind an install from the Official Package Collection records. Its
 /// [`source`](ProvenanceStamp::source) is the collection repository's URL (see
@@ -51,11 +49,10 @@ pub const SOURCE_OFFICIAL: &str = "official";
 pub struct ProvenanceStamp {
     /// [`SOURCE_LOCAL`], [`SOURCE_GIT`], [`SOURCE_SCAFFOLD`] or [`SOURCE_OFFICIAL`].
     pub source_kind: String,
-    /// The absolute folder the Package was copied FROM, or the repository URL it was cloned from.
+    /// The source folder, repository URL, or Reference Package rung for a scaffold.
     pub source: String,
     /// The exact commit a Git Package Source or an Official Package Source was installed at. Empty
-    /// for a local folder and a scaffold: neither has a revision, so there is nothing for
-    /// `packages update` to advance from and nothing to report.
+    /// for a local folder. A scaffold records its collection revision but cannot be updated.
     pub revision: String,
     /// [`content_identity`] of the copied tree at install time.
     pub content_identity: String,
@@ -106,14 +103,17 @@ impl ProvenanceStamp {
         }
     }
 
-    /// The stamp a scaffold (`packages new`) writes. `reference` names what it was scaffolded from
-    /// (e.g. `"packages/example/ (the reference Package)"`) — descriptive text, not a location the
-    /// operator chose, which is what [`SOURCE_LOCAL`] would wrongly imply.
-    pub fn scaffolded(reference: &str, content_identity: String, now: u64) -> Self {
+    /// A scaffold retains the Reference Package name and exact collection revision.
+    pub fn scaffolded(
+        reference: &str,
+        revision: String,
+        content_identity: String,
+        now: u64,
+    ) -> Self {
         Self {
             source_kind: SOURCE_SCAFFOLD.to_string(),
             source: reference.to_string(),
-            revision: String::new(),
+            revision,
             content_identity,
             installed_at: utc_rfc3339(now),
         }
@@ -138,8 +138,7 @@ impl ProvenanceStamp {
         Ok(())
     }
 
-    /// The file's own text. `revision` is written only when there is one, so a local install and a
-    /// scaffold keep the four keys they have always had rather than gaining an empty fifth.
+    /// Write `revision` only when one is recorded. Local folders have no revision.
     pub fn render(&self) -> String {
         let written_by = match self.source_kind.as_str() {
             SOURCE_LOCAL => "`lyracore packages add`",
@@ -338,7 +337,8 @@ mod tests {
     fn a_scaffold_stamp_is_a_distinct_kind_from_a_local_install() {
         let tmp = TempDir::new().unwrap();
         let stamp = ProvenanceStamp::scaffolded(
-            "packages/example/ (the reference Package)",
+            "example-rust",
+            "1234567890abcdef".to_string(),
             "fnv1a64-tree-v1:0123456789abcdef".to_string(),
             1_756_000_000,
         );
@@ -348,7 +348,8 @@ mod tests {
         assert_eq!(ProvenanceStamp::read(tmp.path()), Some(stamp.clone()));
         assert_eq!(stamp.source_kind, SOURCE_SCAFFOLD);
         assert_ne!(stamp.source_kind, SOURCE_LOCAL);
-        assert_eq!(stamp.source, "packages/example/ (the reference Package)");
+        assert_eq!(stamp.source, "example-rust");
+        assert_eq!(stamp.revision, "1234567890abcdef");
     }
 
     #[test]
@@ -412,7 +413,8 @@ mod tests {
     fn the_rendered_stamp_names_the_command_that_actually_wrote_it() {
         // A scaffold was never installed by `packages add` — the file's own header must say so,
         // not just its `source_kind` key, since the header is what a human reads first.
-        let scaffolded = ProvenanceStamp::scaffolded("packages/example/", String::new(), 0);
+        let scaffolded =
+            ProvenanceStamp::scaffolded("example-script", "abcdef".to_string(), String::new(), 0);
         assert!(scaffolded.render().contains("lyracore packages new"));
         assert!(!scaffolded.render().contains("lyracore packages add"));
 
