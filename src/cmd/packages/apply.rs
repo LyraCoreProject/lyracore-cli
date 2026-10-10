@@ -1,26 +1,17 @@
-//! `lyracore packages replay [DATABASE …] [--check] [--yes] [--force-all]` — reapply every enabled
-//! Package's artifacts to every Shard that holds a copy of the catalogues they claim.
-//!
-//! Two Import Families travel here. **spell** claims columns of rows a base import owns, so it
-//! replays as the last stage of that import. **script** owns whole `game_script` rows with no base
-//! import behind it, so its apply goes straight to `apply_package_deltas` and IS the reconciliation
-//! — an empty plan is still applied, because that is how a disabled Package's scripts leave a Shard.
-//!
-//! Over calling the module per Shard, this verb adds: preflight (every artifact read, digested, and
-//! traced once, before any write), resume (a Shard whose per-family provenance already matches this
-//! checkout is skipped for that family), and an honest report naming what completed, what failed,
-//! and what was never touched.
-//!
-//! Fail-fast, never rollback: a half-applied Realm is recoverable by re-running, but one that
-//! reported success while half-applied is not.
+//! Prepare and activate installed Packages on explicitly named Shards or the development topology.
+//! Sources build when artifacts are missing or stale. Rust Packages and pending Package Teardown
+//! require a Module publish and schedule repair. Artifact provenance skips completed families.
+//! Confirmation precedes all Realm writes. Failures stop the run and identify the remaining work.
 
 use std::path::Path;
 
 use crate::cmd::import::{self, Prompt};
 use crate::cmd::packages::artifact::{self, Artifact, SPELL_FAMILY};
 use crate::cmd::packages::script::{self, ScriptArtifact, SCRIPT_FAMILY};
+use crate::cmd::packages::{check, inventory};
 use crate::cmd::packages::{recorded_databases, shard_list};
 use crate::cmd::publish::validate_database;
+use crate::cmd::{preflight, publish};
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::ProjectLayout;
 use crate::{Error, Result};
@@ -28,19 +19,18 @@ use crate::{Error, Result};
 /// The reducer that applies one family's whole enabled plan in one transaction.
 const APPLY_REDUCER: &str = "apply_package_deltas";
 
-/// What `packages replay` was asked to do.
+/// What `packages apply` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ReplayOptions {
-    /// The Shards to replay onto. Empty means the recorded development topology — never a guessed
+pub struct ApplyOptions {
+    /// The Shards to apply onto. Empty means the recorded development topology — never a guessed
     /// production list.
     pub databases: Vec<String>,
     pub client_data: Option<String>,
-    /// Run the whole plan and write nothing: preflight, then the importer's own check mode per
-    /// Shard. No confirmation, because nothing changes.
+    /// Prepare locally and check the plan without Realm writes.
     pub check: bool,
     /// Answer the confirmation in advance.
     pub yes: bool,
-    /// Replay every named Shard, including ones whose provenance already matches.
+    /// Apply every named Shard, including ones whose provenance already matches.
     pub force_all: bool,
 }
 
@@ -70,7 +60,7 @@ impl Target {
 }
 
 /// The verb name this module's refusals quote back at the operator.
-pub const VERB: &str = "packages replay";
+pub const VERB: &str = "packages apply";
 
 /// Validate the Shard names given on the command line.
 ///
@@ -86,7 +76,7 @@ pub fn databases(args: &[String]) -> Result<Vec<String>> {
 /// The single-Shard contract this verb orchestrates: reimport the spell family from the client's
 /// `Spell.dbc`, then reapply the enabled Packages' Deltas over it. Without `--apply` the importer
 /// prints the plan and writes nothing.
-fn replay_command(
+fn apply_command(
     project: &ProjectLayout,
     database: &str,
     client_data: &Path,
@@ -124,7 +114,7 @@ fn rows(output: &str, columns: &[&str]) -> Vec<Vec<String>> {
 /// One read of one Shard, with the diagnosis a failure needs.
 ///
 /// A failed query is not an empty result — conflating them would read a dead node as "never
-/// applied" and replay a Realm this verb cannot actually see.
+/// applied" and apply a Realm this verb cannot actually see.
 fn ask(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
@@ -136,7 +126,7 @@ fn ask(
         .map_err(|e| {
             Error::Process(format!(
                 "could not read Package artifact provenance from '{database}': {e}\n  A failed \
-                 query is not an empty result, so nothing was replayed. Check that the node is up \
+                 query is not an empty result, so nothing was applied. Check that the node is up \
                  and '{database}' is published (`lyracore dev status`), and that its module is \
                  current — `game_package_import` only exists once the Package artifact apply stage \
                  has been published to this Shard."
@@ -225,7 +215,7 @@ fn read_base_stamp(
 /// Matches when every enabled Package is recorded with a matching digest, no other Package is
 /// recorded, and — when `base` is `Some` — every row sits on the Shard's current base stamp (a claim
 /// recorded against a replaced import is stale; the script family has no base import, so it passes
-/// `None`). Any mismatch means replay; a total match returns the reason it is complete.
+/// `None`). Any mismatch means apply; a total match returns the reason it is complete.
 fn already_complete(
     family: &str,
     digests: &[(&str, &str)],
@@ -306,8 +296,8 @@ fn refusal(error: &Error) -> String {
 }
 
 /// The command that resumes this run — the same one, because resume is what re-running does.
-fn resume_command(shards: &[String], options: &ReplayOptions) -> String {
-    let mut line = format!("lyracore packages replay {}", shards.join(" "));
+fn resume_command(shards: &[String], options: &ApplyOptions) -> String {
+    let mut line = format!("lyracore packages apply {}", shards.join(" "));
     if let Some(path) = &options.client_data {
         line.push_str(&format!(" --client-data {path}"));
     }
@@ -320,12 +310,12 @@ fn resume_command(shards: &[String], options: &ReplayOptions) -> String {
     line
 }
 
-/// Replay every enabled Package's Delta across the named Shards.
+/// Apply every enabled Package's Delta across the named Shards.
 pub fn run(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     prompt: &dyn Prompt,
-    options: &ReplayOptions,
+    options: &ApplyOptions,
 ) -> Result<()> {
     let shards = if options.databases.is_empty() {
         recorded_databases(project)?
@@ -334,11 +324,16 @@ pub fn run(
     };
     if shards.is_empty() {
         return Err(Error::Usage(
-            "no Shard to replay onto. Name the databases explicitly, e.g. `lyracore packages \
-             replay lyracore lyracore-kalimdor`."
+            "no Shard to apply onto. Name the databases explicitly, e.g. `lyracore packages \
+             apply lyracore lyracore-kalimdor`."
                 .to_string(),
         ));
     }
+    databases(&shards)?;
+    check::prepare(project, runner, prompt, options.client_data.as_deref())?;
+    let has_rust = inventory(project)?
+        .iter()
+        .any(|package| package.dir.join("src/mod.rs").is_file());
 
     // ---- preflight: the artifacts, once, before any target is touched ----
     let root = project.packages_dir();
@@ -348,7 +343,7 @@ pub fn run(
     let conflicts = artifact::conflicts(artifacts);
     if !conflicts.is_empty() {
         return Err(Error::Usage(format!(
-            "{} claim conflict(s) between enabled Packages — nothing was replayed:\n{}\nResolve \
+            "{} claim conflict(s) between enabled Packages — nothing was applied:\n{}\nResolve \
              them by disabling a Package (`lyracore packages disable NAME`) or by changing what one \
              of them claims. The module refuses the same plan.",
             conflicts.len(),
@@ -362,7 +357,7 @@ pub fn run(
     let collisions = script::collisions(scripts);
     if !collisions.is_empty() {
         return Err(Error::Usage(format!(
-            "{} Runtime Script collision(s) between enabled Packages — nothing was replayed:\n{}\n\
+            "{} Runtime Script collision(s) between enabled Packages — nothing was applied:\n{}\n\
              A script belongs to one Package outright, so there is nothing to merge and no priority \
              to break the tie with. Resolve them by disabling a Package (`lyracore packages disable \
              NAME`) or by renumbering or renaming one script. The module refuses the same plan.",
@@ -417,7 +412,17 @@ pub fn run(
     let delta_digests = delta_digests(artifacts);
     let script_digests = script_digests(scripts);
     let mut targets = Vec::with_capacity(shards.len());
+    let mut publish_shards = Vec::new();
     for database in &shards {
+        let teardown = ask(
+            project,
+            runner,
+            database,
+            "SELECT package_name FROM game_package_teardown",
+        )?;
+        if has_rust || !rows(&teardown, &["package_name"]).is_empty() {
+            publish_shards.push(database.clone());
+        }
         let spell_rows = read_spell_provenance(project, runner, database)?;
         let base = read_base_stamp(project, runner, database, SPELL_FAMILY)?;
         let script_rows = read_script_provenance(project, runner, database)?;
@@ -436,6 +441,12 @@ pub fn run(
         };
         report_target(&target);
         targets.push(target);
+    }
+    if !publish_shards.is_empty() {
+        println!(
+            "  publish Module and repair schedules: {}",
+            shard_list(&publish_shards)
+        );
     }
 
     let wanted: Vec<&Target> = targets.iter().filter(|t| t.wanted()).collect();
@@ -460,6 +471,10 @@ pub fn run(
     };
 
     if options.check {
+        if !publish_shards.is_empty() {
+            preflight::run(project, runner)?;
+            publish::require_loot_roll_upgrade_ready(project, runner, &publish_shards)?;
+        }
         println!();
         println!("=== check: the plan, per Shard, writing nothing ===");
         if spell_check_wanted {
@@ -475,7 +490,7 @@ pub fn run(
                             .to_string(),
                     )
                 })?;
-                runner.run_streaming(&replay_command(
+                runner.run_streaming(&apply_command(
                     project,
                     &target.database,
                     client_data,
@@ -491,11 +506,11 @@ pub fn run(
             );
         }
         println!();
-        println!("check only — nothing was written. Re-run without --check to apply.");
+        println!("check only: no Realm changes. Re-run without --check to apply.");
         return Ok(());
     }
 
-    if wanted.is_empty() {
+    if wanted.is_empty() && publish_shards.is_empty() {
         println!();
         println!(
             "every named Shard already holds these {} Package Delta(s) on its current base import, \
@@ -504,16 +519,27 @@ pub fn run(
             script_count(scripts),
             shard_list(&skipped)
         );
-        println!("nothing to replay. Use --force-all to reapply anyway.");
+        println!("nothing to apply. Use --force-all to reapply anyway.");
         return Ok(());
     }
 
     let pending: Vec<String> = wanted.iter().map(|t| t.database.clone()).collect();
+    let mut confirmation = if wanted.is_empty() {
+        String::new()
+    } else {
+        question(&wanted, artifacts, scripts, &pending)
+    };
+    if !publish_shards.is_empty() {
+        confirmation = format!(
+            "Publish this checkout's Module and repair schedules on {}. {confirmation}",
+            shard_list(&publish_shards)
+        );
+    }
     println!();
     crate::cmd::packages::confirm(
         prompt,
-        &question(&wanted, artifacts, scripts, &pending),
-        "Nothing was replayed.",
+        &format!("{confirmation} Proceed?"),
+        "Nothing was applied.",
         options.yes,
     )?;
 
@@ -522,18 +548,45 @@ pub fn run(
     if wanted.iter().any(|t| t.spell.is_none()) {
         runner.run_streaming(&import::build_importer_command(project))?;
     }
+    if !publish_shards.is_empty() {
+        preflight::run(project, runner)?;
+        publish::require_loot_roll_upgrade_ready(project, runner, &publish_shards)?;
+    }
 
     let mut completed = Vec::new();
+    let mut published = Vec::new();
+    let pending_targets: Vec<_> = targets
+        .iter()
+        .filter(|target| target.wanted() || publish_shards.contains(&target.database))
+        .collect();
     let stop_context = StopContext {
         targets: &targets,
-        wanted: &wanted,
+        wanted: &pending_targets,
         shards: &shards,
         options,
     };
 
-    for (index, target) in wanted.iter().enumerate() {
+    for (index, target) in pending_targets.iter().enumerate() {
         println!();
-        println!("==> replaying {}", target.database);
+        println!("==> applying {}", target.database);
+        if publish_shards.contains(&target.database) {
+            publish::publish_and_repair(project, runner, &target.database).map_err(|error| {
+                let remaining: Vec<_> = pending_targets[index + 1..]
+                    .iter()
+                    .map(|target| target.database.clone())
+                    .collect();
+                Error::Process(format!(
+                    "{error}\n  Published and repaired: {}\n  Completed artifacts:\n    \
+                     spell: {}\n    script: {}\n  Not attempted: {}\n  Retry with:\n    {}",
+                    shard_list(&published),
+                    shard_list(&completed_in(&completed, SPELL_FAMILY)),
+                    shard_list(&completed_in(&completed, SCRIPT_FAMILY)),
+                    shard_list(&remaining),
+                    resume_command(&shards, options)
+                ))
+            })?;
+            published.push(target.database.clone());
+        }
 
         match &target.spell {
             Some(reason) => println!("  {SPELL_FAMILY}: already complete — {reason}"),
@@ -544,7 +597,7 @@ pub fn run(
                             .to_string(),
                     )
                 })?;
-                let command = replay_command(project, &target.database, client_data, true)?;
+                let command = apply_command(project, &target.database, client_data, true)?;
                 if let Err(error) = runner.run_streaming(&command) {
                     return Err(stopped(
                         &target.database,
@@ -552,6 +605,7 @@ pub fn run(
                         index,
                         &error.to_string(),
                         &completed,
+                        &published,
                         &stop_context,
                     ));
                 }
@@ -575,6 +629,7 @@ pub fn run(
                         index,
                         &refusal(&error),
                         &completed,
+                        &published,
                         &stop_context,
                     ));
                 }
@@ -584,10 +639,14 @@ pub fn run(
     }
 
     println!();
-    println!("replayed:");
+    println!(
+        "Module published and schedules repaired: {}",
+        shard_list(&published)
+    );
+    println!("applied artifacts:");
     println!(
         "{}",
-        replayed(
+        applied(
             SPELL_FAMILY,
             &format!("{} enabled Package Delta(s)", artifacts.len()),
             &written(&wanted, |t| t.spell.is_none()),
@@ -595,7 +654,7 @@ pub fn run(
     );
     println!(
         "{}",
-        replayed(
+        applied(
             SCRIPT_FAMILY,
             &format!(
                 "{} Runtime Script(s) from {} Package(s)",
@@ -607,7 +666,7 @@ pub fn run(
     );
     if !skipped.is_empty() {
         println!(
-            "already complete in both families, untouched: {}",
+            "artifact families already complete: {}",
             shard_list(&skipped)
         );
     }
@@ -618,10 +677,10 @@ struct StopContext<'a, 'target> {
     targets: &'a [Target],
     wanted: &'a [&'target Target],
     shards: &'a [String],
-    options: &'a ReplayOptions,
+    options: &'a ApplyOptions,
 }
 
-/// Report a stopped replay by Import Family, including a family that completed on the Shard where
+/// Report a stopped apply by Import Family, including a family that completed on the Shard where
 /// a later family refused its plan.
 fn stopped(
     failed: &str,
@@ -629,6 +688,7 @@ fn stopped(
     index: usize,
     cause: &str,
     completed: &[(String, &'static str)],
+    published: &[String],
     context: &StopContext<'_, '_>,
 ) -> Error {
     let completed_spell = completed_in(completed, SPELL_FAMILY);
@@ -641,13 +701,14 @@ fn stopped(
         .collect::<Vec<_>>();
 
     Error::Process(format!(
-        "{cause}\n  replay stopped at: {failed} ({family} family)\n  completed this run:\n    \
+        "{cause}\n  Module published and schedules repaired: {published}\n  apply stopped at: {failed} ({family} family)\n  completed this run:\n    \
          {SPELL_FAMILY}: {completed_spell}\n    {SCRIPT_FAMILY}: {completed_script}\n  already complete \
          before this run:\n    {SPELL_FAMILY}: {skipped_spell}\n    {SCRIPT_FAMILY}: \
-         {skipped_script}\n  untouched Shards: {untouched}\n\n  The failed Shard wrote nothing \
-         for the {family} family. That apply is one transaction, so it lands whole or not at all. \
-         Any family that completed earlier stays applied. Fix the cause and re-run the SAME command. \
+         {skipped_script}\n  unattempted artifact Shards: {untouched}\n\n  Earlier completed \
+         families stay applied. Script reconciliation is one transaction. A failed spell import \
+         may already have replaced base rows. Fix the cause and re-run the SAME command. \
          Provenance makes completed families skip:\n    {resume}",
+        published = shard_list(published),
         completed_spell = shard_list(&completed_spell),
         completed_script = shard_list(&completed_script),
         skipped_spell = shard_list(&skipped_spell),
@@ -684,7 +745,7 @@ fn written(wanted: &[&Target], needed: impl Fn(&Target) -> bool) -> Vec<String> 
 
 /// One family's closing line: what it applied and where, or that it had nothing to do. A family
 /// every named Shard already held must not read as a family this run reapplied.
-fn replayed(family: &str, what: &str, written: &[String]) -> String {
+fn applied(family: &str, what: &str, written: &[String]) -> String {
     if written.is_empty() {
         format!("  {family}: nothing — every named Shard was already complete")
     } else {
@@ -701,7 +762,7 @@ fn report_target(target: &Target) {
     ] {
         let state = match complete {
             Some(reason) => format!("already complete — {reason}"),
-            None => "replay".to_string(),
+            None => "apply".to_string(),
         };
         // The Shard is named once, on the first line, so two families of one Shard read as one
         // entry rather than two.
@@ -735,7 +796,7 @@ fn question(
                 .to_string()
         } else {
             format!(
-                "reimport Spell.dbc and replay {} enabled Package Delta(s) over it",
+                "reimport Spell.dbc and apply {} enabled Package Delta(s) over it",
                 artifacts.len()
             )
         });
@@ -753,7 +814,7 @@ fn question(
         });
     }
     format!(
-        "Replaying will {} on {}. Proceed?",
+        "Applying will {} on {}.",
         clauses.join(", and "),
         shard_list(pending)
     )
@@ -789,6 +850,12 @@ mod tests {
                 std::fs::write(data.join(archive), "").unwrap();
             }
             let project = ProjectLayout::from_root(root).unwrap();
+            std::fs::create_dir_all(project.datascripts_dir()).unwrap();
+            for name in ["tsconfig.json", "package.json", "bun.lock"] {
+                std::fs::write(project.datascripts_dir().join(name), "{}").unwrap();
+            }
+            std::fs::create_dir_all(project.datascript_types_dir()).unwrap();
+            std::fs::write(project.base_snapshot_file(), "{}").unwrap();
             Self { tmp, project }
         }
 
@@ -816,6 +883,14 @@ mod tests {
                 ),
             )
             .unwrap();
+            for artifact in self
+                .enabled()
+                .deltas
+                .iter()
+                .filter(|a| a.package == package)
+            {
+                super::super::identity::write(&self.project, artifact).unwrap();
+            }
             self
         }
 
@@ -858,8 +933,8 @@ mod tests {
             script::pack(&self.enabled().scripts)
         }
 
-        fn options(&self, shards: &[&str]) -> ReplayOptions {
-            ReplayOptions {
+        fn options(&self, shards: &[&str]) -> ApplyOptions {
+            ApplyOptions {
                 databases: shards.iter().map(|s| (*s).to_string()).collect(),
                 client_data: Some(self.client_data()),
                 yes: true,
@@ -867,8 +942,8 @@ mod tests {
             }
         }
 
-        fn options_without_client_data(&self, shards: &[&str]) -> ReplayOptions {
-            ReplayOptions {
+        fn options_without_client_data(&self, shards: &[&str]) -> ApplyOptions {
+            ApplyOptions {
                 databases: shards.iter().map(|s| (*s).to_string()).collect(),
                 yes: true,
                 ..Default::default()
@@ -983,7 +1058,7 @@ mod tests {
     // ---- the run ----
 
     #[test]
-    fn every_named_shard_is_replayed_in_order() {
+    fn every_named_shard_is_applied_in_order() {
         let checkout = Checkout::new();
         checkout.with_package("bolt", 133, 1500);
         let mut stack = FakeStack::new();
@@ -1038,7 +1113,7 @@ mod tests {
         let message = error.to_string();
         assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE);
         assert!(
-            message.contains("replay stopped at: lyracore-kalimdor"),
+            message.contains("apply stopped at: lyracore-kalimdor"),
             "{message}"
         );
         assert!(
@@ -1046,12 +1121,12 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("untouched Shards: lyracore-instances"),
+            message.contains("unattempted artifact Shards: lyracore-instances"),
             "{message}"
         );
         assert!(
             message
-                .contains("lyracore packages replay lyracore lyracore-kalimdor lyracore-instances"),
+                .contains("lyracore packages apply lyracore lyracore-kalimdor lyracore-instances"),
             "the resume command is the same command: {message}"
         );
         assert!(
@@ -1098,7 +1173,7 @@ mod tests {
         checkout.with_package("bolt", 133, 1500);
         let hash = checkout.artifact_hash("bolt");
         let stack = applied_shard(FakeStack::new(), "lyracore-kalimdor", "bolt", &hash);
-        let options = ReplayOptions {
+        let options = ApplyOptions {
             force_all: true,
             ..checkout.options(&["lyracore-kalimdor"])
         };
@@ -1117,7 +1192,7 @@ mod tests {
     /// A Shard stamped from a DIFFERENT base import is not complete, whatever its artifact digests
     /// say: the claims sit on rows the base import has since replaced.
     #[test]
-    fn a_shard_on_a_different_base_import_is_replayed_even_though_its_digests_match() {
+    fn a_shard_on_a_different_base_import_is_applied_even_though_its_digests_match() {
         let checkout = Checkout::new();
         checkout.with_package("bolt", 133, 1500);
         let hash = checkout.artifact_hash("bolt");
@@ -1142,12 +1217,12 @@ mod tests {
         assert_eq!(applies(&stack).len(), 1, "{:?}", applies(&stack));
     }
 
-    /// Removing a Package must replay every affected target with the REMAINING set. The payload is
+    /// Removing a Package must apply every affected target with the REMAINING set. The payload is
     /// built by the importer from the enabled inventory, so the proof is that the disabled
     /// Package's artifact is no longer in the tree the importer is pointed at, and that the Shard
     /// still holding its provenance row is not treated as complete.
     #[test]
-    fn a_shard_still_recording_a_disabled_package_is_replayed_with_the_remaining_set() {
+    fn a_shard_still_recording_a_disabled_package_is_applied_with_the_remaining_set() {
         let checkout = Checkout::new();
         checkout.with_package("bolt", 133, 1500);
         let bolt = checkout.artifact_hash("bolt");
@@ -1177,7 +1252,7 @@ mod tests {
         assert_eq!(
             applied.len(),
             1,
-            "an extra provenance row forces a replay: {applied:?}"
+            "an extra provenance row forces a apply: {applied:?}"
         );
         assert!(
             !std::fs::read_dir(checkout.project.packages_dir())
@@ -1195,7 +1270,7 @@ mod tests {
         for shard in ["lyracore", "lyracore-kalimdor"] {
             stack = fresh_shard(stack, shard);
         }
-        let options = ReplayOptions {
+        let options = ApplyOptions {
             check: true,
             yes: false,
             ..checkout.options(&["lyracore", "lyracore-kalimdor"])
@@ -1227,7 +1302,7 @@ mod tests {
         checkout.with_package("bolt", 133, 1500);
         let hash = checkout.artifact_hash("bolt");
         let stack = applied_shard(FakeStack::new(), "lyracore-kalimdor", "bolt", &hash);
-        let options = ReplayOptions {
+        let options = ApplyOptions {
             check: true,
             ..checkout.options(&["lyracore-kalimdor"])
         };
@@ -1253,7 +1328,7 @@ mod tests {
     /// importer clears the Package spell range for it. It must never be an accident, so the
     /// confirmation names the consequence rather than counting Packages.
     #[test]
-    fn an_empty_enabled_inventory_states_what_it_clears_before_it_replays() {
+    fn an_empty_enabled_inventory_states_what_it_clears_before_it_applies() {
         let checkout = Checkout::new();
         // Nothing enabled, but the Shard still records a Package from an earlier run.
         let stack = applied_shard(FakeStack::new(), "lyracore", "bolt", "stale-digest");
@@ -1263,7 +1338,7 @@ mod tests {
             &checkout.project,
             &stack.runner(),
             &prompt,
-            &ReplayOptions {
+            &ApplyOptions {
                 yes: false,
                 ..checkout.options(&["lyracore"])
             },
@@ -1296,7 +1371,7 @@ mod tests {
             &checkout.project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            &ReplayOptions {
+            &ApplyOptions {
                 yes: false,
                 ..checkout.options(&["lyracore"])
             },
@@ -1324,8 +1399,11 @@ mod tests {
         assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
         assert!(error.to_string().contains("claim conflict"), "{error}");
         assert!(
-            stack.rendered().is_empty(),
-            "nothing may run before the artifacts are cleared: {:?}",
+            stack
+                .rendered()
+                .iter()
+                .all(|call| !call.contains("spacetime sql")),
+            "no Shard may be read before the artifacts are cleared: {:?}",
             stack.rendered()
         );
     }
@@ -1354,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_confirmation_replays_nothing() {
+    fn a_refused_confirmation_applies_nothing() {
         let checkout = Checkout::new();
         checkout.with_package("bolt", 133, 1500);
         let stack = fresh_shard(FakeStack::new(), "lyracore");
@@ -1363,17 +1441,14 @@ mod tests {
             &checkout.project,
             &stack.runner(),
             &ScriptedPrompt::new(&["no"]),
-            &ReplayOptions {
+            &ApplyOptions {
                 yes: false,
                 ..checkout.options(&["lyracore"])
             },
         )
         .unwrap_err();
 
-        assert!(
-            error.to_string().contains("Nothing was replayed"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("Nothing was applied"), "{error}");
         assert!(applies(&stack).is_empty(), "{:?}", stack.rendered());
     }
 
@@ -1396,8 +1471,8 @@ mod tests {
             .into_iter()
             .filter(|r| r.contains("spacetime sql"))
             .collect();
-        // The spell family's base stamp and provenance, then the script family's provenance.
-        assert_eq!(queries.len(), 3, "{queries:?}");
+        // Package Teardown and each artifact family are read before writes.
+        assert_eq!(queries.len(), 4, "{queries:?}");
         for query in &queries {
             assert!(!query.contains("ORDER BY"), "{query}");
             assert!(!query.contains(" IN ("), "{query}");
@@ -1514,7 +1589,7 @@ mod tests {
             "bolt",
             &hash,
         );
-        let options = ReplayOptions {
+        let options = ApplyOptions {
             force_all: true,
             ..checkout.options(&["lyracore"])
         };
@@ -1547,7 +1622,7 @@ mod tests {
             &checkout.project,
             &stack.runner(),
             &prompt,
-            &ReplayOptions {
+            &ApplyOptions {
                 yes: false,
                 ..checkout.options(&["lyracore"])
             },
@@ -1581,7 +1656,7 @@ mod tests {
             &checkout.project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            &ReplayOptions {
+            &ApplyOptions {
                 yes: false,
                 ..checkout.options(&["lyracore"])
             },
@@ -1615,7 +1690,7 @@ mod tests {
         let message = error.to_string();
         assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE);
         assert!(
-            message.contains("replay stopped at: lyracore-kalimdor (script family)"),
+            message.contains("apply stopped at: lyracore-kalimdor (script family)"),
             "{message}"
         );
         assert!(message.contains("nothing applied"), "{message}");
@@ -1624,7 +1699,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("untouched Shards: lyracore-instances"),
+            message.contains("unattempted artifact Shards: lyracore-instances"),
             "{message}"
         );
         assert!(
@@ -1682,8 +1757,11 @@ mod tests {
             "{error}"
         );
         assert!(
-            stack.rendered().is_empty(),
-            "nothing may run before the artifacts are cleared: {:?}",
+            stack
+                .rendered()
+                .iter()
+                .all(|call| !call.contains("spacetime sql")),
+            "no Shard may be read before the artifacts are cleared: {:?}",
             stack.rendered()
         );
     }
@@ -1694,7 +1772,7 @@ mod tests {
         checkout.with_script("bolt", 100_001, "bolt.greet");
         checkout.remove_client_data();
         let stack = fresh_shard(FakeStack::new(), "lyracore");
-        let options = ReplayOptions {
+        let options = ApplyOptions {
             check: true,
             yes: false,
             ..checkout.options_without_client_data(&["lyracore"])
@@ -1764,7 +1842,7 @@ mod tests {
             &checkout.project,
             &stack.runner(),
             &ScriptedPrompt::new(&[]),
-            &ReplayOptions {
+            &ApplyOptions {
                 yes: false,
                 ..checkout.options_without_client_data(&["lyracore"])
             },
@@ -1805,7 +1883,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("Any family that completed earlier stays applied."),
+            message.contains("Earlier completed families stay applied."),
             "{message}"
         );
     }
@@ -1814,7 +1892,7 @@ mod tests {
     /// and none of its Runtime Scripts, which is what every Realm looks like the first time a
     /// Package ships a script.
     #[test]
-    fn a_shard_complete_for_one_family_is_still_replayed_for_the_other() {
+    fn a_shard_complete_for_one_family_is_still_applied_for_the_other() {
         let checkout = Checkout::new();
         checkout.with_package("bolt", 133, 1500);
         checkout.with_script("bolt", 100_001, "bolt.greet");
@@ -1840,5 +1918,445 @@ mod tests {
             "the script family is not: {:?}",
             stack.rendered()
         );
+    }
+    impl Checkout {
+        fn with_module(&self) -> &Self {
+            use crate::proc::fake::{FAKE_RUST_VERSION, FAKE_SPACETIME_VERSION};
+            let root = &self.project.root;
+            std::fs::write(
+                root.join(ProjectLayout::RUST_TOOLCHAIN),
+                format!("[toolchain]\nchannel = \"{FAKE_RUST_VERSION}\"\n"),
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("module/src")).unwrap();
+            std::fs::write(
+                root.join("module/Cargo.toml"),
+                format!("spacetimedb = {{ version = \"={FAKE_SPACETIME_VERSION}\" }}\n"),
+            )
+            .unwrap();
+            std::fs::write(root.join("module/src/lib.rs"),
+                "#[client_visibility_filter]\nconst RLS: Filter = Filter::Sql(\"SELECT * FROM game_character WHERE owner_identity = :sender\");\n").unwrap();
+            self
+        }
+
+        fn with_rust(&self) -> &Self {
+            self.with_module();
+            let dir = self.project.packages_dir().join("greeter/src");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("mod.rs"), "pub fn register() {}\n").unwrap();
+            self
+        }
+
+        fn with_script_source(&self) -> &Self {
+            let dir = self.project.package_scripts_dir("greeter");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("welcome.ts"),
+                "// @id 100300\n// @event on_login\n",
+            )
+            .unwrap();
+            self
+        }
+    }
+
+    /// Substitutes only the compiler and snapshot extractor subprocesses. Artifact discovery,
+    /// Build Identity checks, preparation, and activation use the real command implementation.
+    struct PackageCompiler<'a> {
+        checkout: &'a Checkout,
+        stack: FakeStack,
+    }
+
+    impl ProcessRunner for PackageCompiler<'_> {
+        fn run_and_wait(&self, cmd: &CommandSpec) -> Result<String> {
+            self.stack.runner().run_and_wait(cmd)
+        }
+        fn run_capturing_stderr(&self, cmd: &CommandSpec) -> Result<String> {
+            self.stack.runner().run_capturing_stderr(cmd)
+        }
+        fn run_with_secret_stdin(&self, cmd: &CommandSpec, secret: &[u8]) -> Result<String> {
+            self.stack.runner().run_with_secret_stdin(cmd, secret)
+        }
+        fn spawn_logged(&self, cmd: &CommandSpec, log: &Path) -> Result<u32> {
+            self.stack.runner().spawn_logged(cmd, log)
+        }
+        fn terminate(&self, pid: u32) -> Result<()> {
+            self.stack.runner().terminate(pid)
+        }
+        fn run_streaming(&self, cmd: &CommandSpec) -> Result<()> {
+            self.stack.runner().run_streaming(cmd)?;
+            if cmd.args().iter().any(|arg| arg == "--spell-snapshot") {
+                std::fs::write(self.checkout.project.base_snapshot_file(), "{}")?;
+            }
+            if cmd.program() == "bun" {
+                if cmd
+                    .args()
+                    .iter()
+                    .any(|arg| arg.ends_with("build-scripts.ts"))
+                {
+                    self.checkout
+                        .with_script("greeter", 100300, "greeter.login");
+                    std::fs::rename(
+                        self.checkout.generated("greeter").join("script.json"),
+                        self.checkout
+                            .generated("greeter")
+                            .join("greeter.script.json"),
+                    )?;
+                }
+                if cmd
+                    .args()
+                    .iter()
+                    .any(|arg| arg.ends_with("datascripts/spells.ts"))
+                {
+                    self.checkout.with_package("greeter", 133, 2000);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn missing_script_artifacts_build_and_activate_in_one_command() {
+        let checkout = Checkout::new();
+        checkout.with_script_source();
+        let stack = FakeStack::new().with_stdout("bun --version", "1.3.7");
+        run(
+            &checkout.project,
+            &PackageCompiler {
+                checkout: &checkout,
+                stack: stack.clone(),
+            },
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one"]),
+        )
+        .unwrap();
+        assert_eq!(checkout.enabled().scripts.len(), 1);
+        assert!(
+            script::stale(&checkout.project, &checkout.enabled().script_paths())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(script_applies(&stack)[0].contains("greeter.login"));
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|call| call.contains("spacetime publish")));
+    }
+
+    #[test]
+    fn changed_script_sources_rebuild_before_activation() {
+        let checkout = Checkout::new();
+        checkout
+            .with_script_source()
+            .with_script("greeter", 100299, "greeter.old");
+        super::super::identity::write_script_identities(
+            &checkout.project,
+            &checkout.enabled().script_paths(),
+        )
+        .unwrap();
+        std::fs::write(
+            checkout
+                .project
+                .package_scripts_dir("greeter")
+                .join("welcome.ts"),
+            "// changed\n",
+        )
+        .unwrap();
+        let stack = FakeStack::new().with_stdout("bun --version", "1.3.7");
+        run(
+            &checkout.project,
+            &PackageCompiler {
+                checkout: &checkout,
+                stack: stack.clone(),
+            },
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one"]),
+        )
+        .unwrap();
+        assert!(script_applies(&stack)[0].contains("greeter.login"));
+        assert!(!script_applies(&stack)[0].contains("greeter.old"));
+    }
+
+    #[test]
+    fn current_source_built_scripts_need_neither_bun_nor_publish() {
+        let checkout = Checkout::new();
+        checkout
+            .with_script_source()
+            .with_script("greeter", 100300, "greeter.login");
+        super::super::identity::write_script_identities(
+            &checkout.project,
+            &checkout.enabled().script_paths(),
+        )
+        .unwrap();
+        let stack = FakeStack::new();
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one"]),
+        )
+        .unwrap();
+        assert_eq!(script_applies(&stack).len(), 1);
+        assert!(stack.rendered().iter().all(|call| !call.starts_with("bun ")
+            && !call.contains("spacetime publish")
+            && !call.contains("spacetime generate")));
+    }
+
+    #[test]
+    fn datascript_sources_extract_a_missing_snapshot_then_build_and_apply() {
+        let checkout = Checkout::new();
+        let dir = checkout.project.packages_dir().join("greeter/datascripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("spells.ts"), "// trusted Datascript\n").unwrap();
+        std::fs::remove_file(checkout.project.base_snapshot_file()).unwrap();
+        let stack = FakeStack::new().with_stdout("bun --version", "1.3.7");
+        run(
+            &checkout.project,
+            &PackageCompiler {
+                checkout: &checkout,
+                stack: stack.clone(),
+            },
+            &ScriptedPrompt::new(&[]),
+            &checkout.options(&["one"]),
+        )
+        .unwrap();
+        assert!(checkout.project.base_snapshot_file().is_file());
+        assert_eq!(checkout.enabled().deltas.len(), 1);
+        assert_eq!(applies(&stack).len(), 1);
+    }
+
+    #[test]
+    fn a_build_failure_leaves_every_shard_untouched() {
+        let checkout = Checkout::new();
+        checkout.with_script_source();
+        let stack = FakeStack::new()
+            .with_stdout("bun --version", "1.3.7")
+            .fail_on("build-scripts.ts", "invalid event");
+        let error = run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one"]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid event"), "{error}");
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|call| call.starts_with("spacetime sql")
+                || call.starts_with("spacetime call")
+                || call.starts_with("spacetime publish")));
+    }
+
+    #[test]
+    fn rust_packages_publish_and_repair_each_shard_even_without_artifacts() {
+        let checkout = Checkout::new();
+        checkout.with_rust();
+        let stack = FakeStack::new();
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one", "two"]),
+        )
+        .unwrap();
+        let writes: Vec<_> = stack
+            .rendered()
+            .into_iter()
+            .filter(|call| {
+                call.starts_with("spacetime publish") || call.contains("debug_repair_after_publish")
+            })
+            .collect();
+        assert_eq!(writes.len(), 4, "{writes:?}");
+        assert!(writes[0].ends_with("one") && writes[1].contains("one debug_repair_after_publish"));
+        assert!(writes[2].ends_with("two") && writes[3].contains("two debug_repair_after_publish"));
+    }
+
+    #[test]
+    fn pending_teardown_publishes_after_the_last_rust_folder_was_removed() {
+        let checkout = Checkout::new();
+        checkout.with_module();
+        let stack = FakeStack::new().with_stdout(
+            "SELECT package_name FROM game_package_teardown",
+            " package_name\n greeter\n",
+        );
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one"]),
+        )
+        .unwrap();
+        assert!(stack
+            .rendered()
+            .iter()
+            .any(|call| call.starts_with("spacetime publish")));
+    }
+
+    #[test]
+    fn check_and_declined_confirmation_never_publish_rust_packages() {
+        for check in [false, true] {
+            let checkout = Checkout::new();
+            checkout.with_rust();
+            let stack = FakeStack::new();
+            let mut options = checkout.options_without_client_data(&["one"]);
+            options.check = check;
+            options.yes = false;
+            let result = run(
+                &checkout.project,
+                &stack.runner(),
+                &ScriptedPrompt::new(&["no"]),
+                &options,
+            );
+            assert_eq!(result.is_ok(), check, "{result:?}");
+            assert!(!stack
+                .rendered()
+                .iter()
+                .any(|call| call.starts_with("spacetime publish")
+                    || call.starts_with("spacetime call")));
+        }
+    }
+
+    #[test]
+    fn publish_failure_keeps_prior_shards_complete_and_stops() {
+        let checkout = Checkout::new();
+        checkout
+            .with_rust()
+            .with_script("greeter", 100300, "greeter.login");
+        let stack = FakeStack::new().fail_on("--yes two", "migration refused");
+        let error = run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one", "two", "three"]),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Published and repaired: one")
+                && message.contains("Not attempted: three"),
+            "{message}"
+        );
+        assert!(stack
+            .rendered()
+            .iter()
+            .any(|call| call.contains("one debug_repair_after_publish")));
+        assert_eq!(script_applies(&stack).len(), 1);
+        assert!(
+            message.contains("lyracore packages apply one two three"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn schedule_repair_failure_reports_the_published_shard_and_stops() {
+        let checkout = Checkout::new();
+        checkout.with_rust();
+        let stack = FakeStack::new().fail_on("one debug_repair_after_publish", "operator only");
+        let error = run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one", "two"]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("'one' was published, but schedule repair failed"),
+            "{error}"
+        );
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|call| call.starts_with("spacetime publish") && call.ends_with("two")));
+    }
+    #[test]
+    fn artifact_failure_leaves_later_shards_unpublished() {
+        let checkout = Checkout::new();
+        checkout
+            .with_rust()
+            .with_script("greeter", 100300, "greeter.login");
+        let stack = FakeStack::new().fail_on("one apply_package_deltas", "script refused");
+        let error = run(
+            &checkout.project,
+            &stack.runner(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options_without_client_data(&["one", "two"]),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Module published and schedules repaired: one"),
+            "{message}"
+        );
+        assert!(
+            message.contains("unattempted artifact Shards: two"),
+            "{message}"
+        );
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|call| call.starts_with("spacetime publish") && call.ends_with("two")));
+    }
+
+    #[test]
+    fn script_build_preserves_a_source_free_delta_without_a_snapshot() {
+        let checkout = Checkout::new();
+        checkout
+            .with_package("imported", 133, 1500)
+            .with_script_source();
+        let sidecar = checkout
+            .generated("imported")
+            .join(super::super::identity::IDENTITY_FILE);
+        let identity = std::fs::read(&sidecar).unwrap();
+        std::fs::remove_file(checkout.project.base_snapshot_file()).unwrap();
+        let stack = FakeStack::new().with_stdout("bun --version", "1.3.7");
+        run(
+            &checkout.project,
+            &PackageCompiler {
+                checkout: &checkout,
+                stack: stack.clone(),
+            },
+            &ScriptedPrompt::new(&[]),
+            &checkout.options(&["one"]),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(sidecar).unwrap(), identity);
+        assert!(!checkout.project.base_snapshot_file().exists());
+        assert_eq!(applies(&stack).len(), 1);
+        assert_eq!(script_applies(&stack).len(), 1);
+    }
+
+    #[test]
+    fn a_new_snapshot_cannot_certify_a_source_free_delta() {
+        let checkout = Checkout::new();
+        std::fs::write(checkout.project.base_snapshot_file(), "snapshot A").unwrap();
+        checkout.with_package("imported", 134, 1500);
+        let sidecar = checkout
+            .generated("imported")
+            .join(super::super::identity::IDENTITY_FILE);
+        let identity = std::fs::read(&sidecar).unwrap();
+        std::fs::remove_file(checkout.project.base_snapshot_file()).unwrap();
+        let dir = checkout.project.packages_dir().join("greeter/datascripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("spells.ts"), "// new Datascript").unwrap();
+        let stack = FakeStack::new().with_stdout("bun --version", "1.3.7");
+        let error = run(
+            &checkout.project,
+            &PackageCompiler {
+                checkout: &checkout,
+                stack: stack.clone(),
+            },
+            &ScriptedPrompt::new(&[]),
+            &checkout.options(&["one"]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Base Snapshot"), "{error}");
+        assert_eq!(std::fs::read(sidecar).unwrap(), identity);
+        assert!(applies(&stack).is_empty());
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|call| call.starts_with("spacetime publish")));
     }
 }

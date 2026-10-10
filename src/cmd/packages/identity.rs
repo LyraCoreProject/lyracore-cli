@@ -20,7 +20,7 @@
 //! `PackageDelta::parse` (the engine crate `artifact.rs` mirrors) refuses an unknown member, and
 //! `game_package_import.artifact_hash` is BLAKE3 over exactly the artifact's four canonical fields.
 //! Folding the Build Identity into the artifact would move that hash on every Bun or tsconfig bump
-//! that changes nothing about what the artifact CLAIMS — and `packages replay` treats a moved hash
+//! that changes nothing about what the artifact CLAIMS — and `packages apply` treats a moved hash
 //! as a Shard needing every claim reapplied. The two questions ("what does this artifact say" and
 //! "is this artifact still current") stay two files for exactly that reason.
 //!

@@ -26,7 +26,7 @@
 //!
 //! A source-built artifact without a sidecar is stale. A source-free artifact without one is
 //! prebuilt Lua: there is no source tree in this checkout to compare, and an Operator can install
-//! and replay it without Bun.
+//! and apply it without Bun.
 
 use crate::cmd::packages::artifact::{self, Artifact};
 use crate::cmd::packages::build;
@@ -34,6 +34,92 @@ use crate::cmd::packages::{identity, script};
 use crate::proc::ProcessRunner;
 use crate::project::ProjectLayout;
 use crate::{Error, Result};
+
+/// Prepare installed sources before applying them. Source-free Deltas must already have a
+/// current Build Identity; rebuilding another Package must not certify stale imported artifacts.
+pub(crate) fn prepare(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    prompt: &dyn crate::cmd::import::Prompt,
+    client_data: Option<&str>,
+) -> Result<()> {
+    use crate::cmd::import;
+    use crate::proc::CommandSpec;
+
+    super::inventory(project)?;
+    script::refuse_stale_transition(project)?;
+    let enabled = artifact::read_enabled(&project.packages_dir())?;
+    let datascripts = build::packages_with_datascripts(project)?;
+    let scripts = script::packages_with_scripts(project)?;
+    let missing = || {
+        datascripts
+            .iter()
+            .any(|name| !enabled.deltas.iter().any(|a| &a.package == name))
+            || scripts
+                .iter()
+                .any(|name| !enabled.scripts.iter().any(|a| &a.package == name))
+    };
+    let mut rebuild = missing() || !script::stale(project, &enabled.script_paths())?.is_empty();
+    if !enabled.deltas.is_empty() {
+        runner.run_streaming(&build::typegen_command(project))?;
+        for delta in &enabled.deltas {
+            let (problems, _) = check_one(project, delta)?;
+            if problems.is_empty() {
+                continue;
+            }
+            if !datascripts.contains(&delta.package) {
+                return Err(Error::Process(format!(
+                    "cannot rebuild Package '{}': no Datascript source is installed.\n{}\n\
+                     Install current source or a current artifact before applying.",
+                    delta.package,
+                    problems.join("\n")
+                )));
+            }
+            rebuild = true;
+        }
+    }
+    if rebuild {
+        if !datascripts.is_empty() && !project.base_snapshot_file().is_file() {
+            let data = import::resolve_client_data(project, prompt, client_data)?;
+            runner.run_streaming(&import::build_importer_command(project))?;
+            runner.run_streaming(
+                &CommandSpec::new(project.importer_bin().display().to_string())
+                    .arg("--dbc")
+                    .arg(data.display().to_string())
+                    .arg("--spell-snapshot")
+                    .arg(project.base_snapshot_file().display().to_string())
+                    .cwd(project.root.clone()),
+            )?;
+        }
+        println!("preparing installed Package sources");
+        build::run(project, runner)?;
+        // A newly extracted Base Snapshot can reveal drift in a source-free Delta. Its identity
+        // was preserved by the build, so compare it again before any Realm write.
+        run(project, runner)?;
+        let built = artifact::read_enabled(&project.packages_dir())?;
+        for (names, emitted) in [
+            (
+                &datascripts,
+                built.deltas.iter().map(|a| &a.package).collect::<Vec<_>>(),
+            ),
+            (
+                &scripts,
+                built.scripts.iter().map(|a| &a.package).collect::<Vec<_>>(),
+            ),
+        ] {
+            for name in names {
+                if !emitted.contains(&name) {
+                    return Err(Error::Process(format!(
+                        "Package '{name}' built without emitting its artifact. Nothing was applied."
+                    )));
+                }
+            }
+        }
+    } else {
+        build::validate_generated_artifacts(project, runner, None)?;
+    }
+    Ok(())
+}
 
 /// One artifact's problems, and whether its Base Snapshot comparison had to be skipped.
 fn check_one(project: &ProjectLayout, artifact: &Artifact) -> Result<(Vec<String>, bool)> {

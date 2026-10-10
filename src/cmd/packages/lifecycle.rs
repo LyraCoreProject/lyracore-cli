@@ -61,15 +61,8 @@ pub fn enable(project: &ProjectLayout, name: &str) -> Result<()> {
     print!("{moved}");
     print!("{}", super::provenance_report(package.stamp.as_ref()));
 
-    let review = TrustReview::scan(&destination)?;
     println!();
-    println!(
-        "'{}' is back in the build. Three steps remain, and this command ran none of them:",
-        name.as_str()
-    );
-    println!("  lyracore preflight     compile the module with the Package in it and run the offline gate");
-    println!("  lyracore publish       publish the rebuilt module to every database of this realm");
-    println!("  {}", client_sync_step(&review));
+    print!("{}", super::activation_steps(&destination));
     println!();
     println!(
         "undo this move with `lyracore packages disable {}`.",
@@ -129,28 +122,8 @@ pub fn disable(project: &ProjectLayout, realm: &Realm, name: &str, yes: bool) ->
     print!("{moved}");
     print!("{}", super::provenance_report(package.stamp.as_ref()));
 
-    let mut steps = vec![
-        "lyracore publish       publish the module WITHOUT the Package to every database of this \
-         realm"
-            .to_string(),
-    ];
-    if !review.runtime_scripts.is_empty() {
-        steps.push(
-            "lyracore packages replay\n                         remove the Package's Runtime Scripts from every Shard"
-                .to_string(),
-        );
-    }
-    steps.push(client_sync_step(&review));
     println!();
-    println!(
-        "'{}' is out of the build and still on disk. {} steps remain, and this command ran none \
-         of them:",
-        name.as_str(),
-        steps.len()
-    );
-    for step in steps {
-        println!("  {step}");
-    }
+    print!("{}", super::activation_steps(&destination));
     println!();
     println!(
         "undo this move with `lyracore packages enable {}`.",
@@ -419,20 +392,6 @@ fn recovery_note(name: &PackageName, stamp: Option<&stamp::ProvenanceStamp>) -> 
         _ => "Nothing outside this checkout is recorded as holding a copy of this Package. \
               Deleting it is final.\n"
             .to_string(),
-    }
-}
-
-/// The `client sync` line, which says whether there is any client content to sync at all.
-fn client_sync_step(review: &TrustReview) -> String {
-    if review.addons.is_empty() && review.client_overrides == 0 {
-        "lyracore client sync   not needed: this Package ships no client content".to_string()
-    } else {
-        format!(
-            "lyracore client sync   repack the client for its {} addon(s) and {} client \
-             override(s)",
-            review.addons.len(),
-            review.client_overrides
-        )
     }
 }
 

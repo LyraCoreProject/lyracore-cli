@@ -242,7 +242,7 @@ fn parse_count(database: &str, state: &str, output: &str) -> Result<u64> {
     })
 }
 
-fn require_loot_roll_upgrade_ready(
+pub(crate) fn require_loot_roll_upgrade_ready(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     databases: &[String],
@@ -338,6 +338,26 @@ pub fn run(
         );
         println!("      refuses logons on the ones left behind. See docs/danger-zones.md §3.");
     }
+    Ok(())
+}
+
+/// Publish one preflighted Shard and repair its schedules before other activation steps.
+/// The caller must gate all targets with preflight and the Loot Roll upgrade check first.
+pub(crate) fn publish_and_repair(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    database: &str,
+) -> Result<()> {
+    runner
+        .run_streaming(&publish_command(project, database)?)
+        .map_err(|error| {
+            Error::Process(format!("Module publish failed at '{database}': {error}"))
+        })?;
+    runner.run_and_wait(&import::call_command(project, database, "debug_repair_after_publish"))
+        .map_err(|error| Error::Process(format!(
+            "'{database}' was published, but schedule repair failed: {error}\n  \
+             Repair it with `spacetime call -s local {database} debug_repair_after_publish` before retrying."
+        )))?;
     Ok(())
 }
 

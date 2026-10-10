@@ -36,7 +36,7 @@
 //!    Package's generated artifacts TOGETHER, in one invocation, Package Deltas and Script
 //!    Artifacts alike. A Claim Conflict and a Runtime Script collision are both BETWEEN Packages,
 //!    so checking one artifact at a time could only ever prove that one artifact parses. This is
-//!    the authoritative Rust-side check — the same trace `packages replay` runs before it writes to
+//!    the authoritative Rust-side check — the same trace `packages apply` runs before it writes to
 //!    a Shard — so what a build just emitted is validated by the code that also decides whether it
 //!    may apply, not by a second, looser implementation of the same rules.
 //! 8. A Build Identity sidecar (`packages::identity`) is written next to each source-built artifact
@@ -143,7 +143,7 @@ fn verify_bun(runner: &dyn ProcessRunner) -> Result<()> {
 // ---- Datascript emission and validation ----
 
 /// Enabled Packages with entry scripts in either supported Datascript location.
-fn packages_with_datascripts(project: &ProjectLayout) -> Result<Vec<String>> {
+pub(crate) fn packages_with_datascripts(project: &ProjectLayout) -> Result<Vec<String>> {
     let packages_dir = project.packages_dir();
     if !packages_dir.is_dir() {
         return Ok(Vec::new());
@@ -280,12 +280,12 @@ fn run_datascripts(
 
 /// The Rust-side authoritative check: every enabled Package's generated artifacts, of both kinds,
 /// traced together in one `lyracore-delta-check` invocation. Discovered the same way `packages
-/// replay` discovers them — a folder listing, not a re-parse by this command — so build-time
-/// validation and replay-time preflight can never disagree about which files are in play.
+/// apply` discovers them — a folder listing, not a re-parse by this command — so build-time
+/// validation and apply-time preflight can never disagree about which files are in play.
 ///
 /// Returns what it discovered and validated, so step 8 can write each artifact's Build Identity
 /// without re-reading a tree this step just finished checking.
-fn validate_generated_artifacts(
+pub(crate) fn validate_generated_artifacts(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     transition: Option<&script::BuildArtifactTransition>,
@@ -430,6 +430,9 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
         );
     }
     if datascript_packages.is_empty() && script_packages.is_empty() {
+        if project.packages_dir().is_dir() {
+            validate_generated_artifacts(project, runner, None)?;
+        }
         return Ok(());
     }
 
@@ -466,7 +469,12 @@ pub fn run(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
             return Err(error);
         }
     };
-    if let Err(error) = identity::write_all(project, &enabled.deltas) {
+    let identities = enabled
+        .deltas
+        .iter()
+        .filter(|delta| datascript_packages.contains(&delta.package))
+        .try_for_each(|delta| identity::write(project, delta));
+    if let Err(error) = identities {
         transition.rollback()?;
         return Err(error);
     }
@@ -522,7 +530,7 @@ mod tests {
 
     /// The artifact a Datascript's own `bun run` would have written. `FakeStack` records a `bun
     /// run` call but does not execute Bun, so a test that needs one on disk (to exercise step 6,
-    /// the validator) writes it directly — the same way `packages/replay.rs`'s tests do.
+    /// the validator) writes it directly — the same way `packages/apply.rs`'s tests do.
     fn with_generated_artifact(project: &ProjectLayout, package: &str) {
         let dir = project.packages_dir().join(package).join("data/.generated");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1055,7 +1063,7 @@ mod tests {
         let enabled = artifact::read_enabled(&project.packages_dir()).unwrap();
         assert!(
             enabled.scripts.is_empty(),
-            "a later replay must see no old Lua"
+            "a later apply must see no old Lua"
         );
     }
 
