@@ -814,6 +814,16 @@ pub fn new(
         std::fs::remove_dir_all(generated)?;
     }
     rewrite_reference_name(staged.path(), &reference_name, &name)?;
+    let next_steps = scaffold_next_steps(staged.path());
+    std::fs::write(
+        staged.path().join("README.md"),
+        format!(
+            "# {}\n\nScaffolded from [{}]({}/tree/{}/{}) at the collection revision matching this \
+             checkout's Package API. Read that Reference Package for how its code works.\n\n\
+             This Package is already installed locally. Edit the source in this folder.\n\n{next_steps}",
+            name.as_str(), from, official::COLLECTION_URL, collection.revision(), from
+        ),
+    )?;
     println!(
         "{}",
         review::TrustReview::scan(staged.path())?.render(&reference)
@@ -847,18 +857,31 @@ pub fn new(
     })?;
 
     println!("'{}' is scaffolded and preflight is green.", name.as_str());
-    if destination.join("scripts").is_dir() || destination.join("datascripts").is_dir() {
-        println!("  Choose distinct Script IDs or Package Spell IDs before using this copy beside another.");
-        println!("  Run `lyracore packages build` to build artifacts for the renamed source.");
-        println!("  Datascripts need a Base Snapshot from your own client data.");
-    }
-    if destination.join("src").is_dir() {
-        println!("  Publish through the normal realm update to load the Rust half.");
-    }
-    if destination.join("client").is_dir() {
-        println!("  Run `lyracore client sync` to install the client half.");
-    }
+    print!("{next_steps}");
     Ok(())
+}
+
+fn scaffold_next_steps(package_dir: &Path) -> String {
+    let mut text = String::new();
+    if package_dir.join("scripts").is_dir() || package_dir.join("datascripts").is_dir() {
+        text.push_str("Generated artifacts are omitted. Choose distinct Script IDs or Package Spell IDs \
+            before using this copy beside another. Run `lyracore packages build` to build artifacts \
+            for the renamed source, then apply them with `lyracore packages replay` on your development \
+            topology.\n\n");
+    }
+    if package_dir.join("datascripts").is_dir() {
+        text.push_str(
+            "The Datascript needs a Base Snapshot from your own client data. Keep its \
+            generated Delta local.\n\n",
+        );
+    }
+    if package_dir.join("src").is_dir() {
+        text.push_str("Publish through the normal realm update to load the Rust half.\n\n");
+    }
+    if package_dir.join("client").is_dir() {
+        text.push_str("Run `lyracore client sync` to install the client half.\n\n");
+    }
+    text
 }
 
 /// Rename Package names, Rust identifiers and client filenames. Binary assets stay byte-identical.
@@ -1662,6 +1685,11 @@ pub(super) mod tests {
         assert!(!source.contains("example-script"), "{source}");
         assert!(!scaffolded.join("src").exists());
         assert!(!scaffolded.join("data/.generated").exists());
+        let readme = std::fs::read_to_string(scaffolded.join("README.md")).unwrap();
+        assert!(readme.contains("packages build"));
+        assert!(readme.contains(&format!("/tree/{COLLECTION_REVISION}/example-script")));
+        assert!(!readme.contains("packages add"));
+
         let recorded = ProvenanceStamp::read(&scaffolded).unwrap();
         assert_eq!(recorded.source_kind, stamp::SOURCE_SCAFFOLD);
         assert_eq!(recorded.source, "example-script");
