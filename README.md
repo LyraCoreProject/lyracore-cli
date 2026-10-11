@@ -146,7 +146,9 @@ The import checks each destination against its World Import Profile. World profi
 skinning content. The `instances` profile allows no skinnable creatures, as in Deadmines, but
 requires loot for every referenced skinning table.
 
-`lyracore import vmaps` imports exact model and WMO collision geometry into populated World Shards.
+`lyracore import world` automatically imports required WMO geometry for Deeprun Tram and Deadmines
+before completing content. `lyracore import vmaps` refreshes model and WMO collision geometry in
+populated World Shards.
 It accepts the same client path and profile assignments, skips the Instance Pool, and does not
 enable exact collision checks. It reads your own archives without fetching game data, so it has
 no `--accept` option.

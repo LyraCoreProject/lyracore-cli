@@ -273,9 +273,9 @@ impl WorldProfile {
 
     fn map_ids(self) -> &'static [u32] {
         match self {
-            Self::AllianceEastern | Self::StartingEastern => &[0],
+            Self::AllianceEastern | Self::StartingEastern => &[0, 369],
             Self::AllianceKalimdor | Self::StartingKalimdor => &[1],
-            Self::AllianceSingle => &[0, 1, 36],
+            Self::AllianceSingle => &[0, 1, 36, 369],
             Self::Instances => &[36],
         }
     }
@@ -1061,6 +1061,15 @@ fn world_etl_commands(
                 .arg("--apply"),
             ),
         ]);
+    }
+
+    if profile.includes_eastern_corridors() || profile.includes_instances() {
+        commands.push((
+            "WMO map geometry (Deeprun Tram and Deadmines where owned)",
+            "Reads wmo.MPQ and model.MPQ. The profile must include collision geometry for every \
+             WMO map; a failure leaves the destination unavailable for play.",
+            vmap_command(project, destination, client_data),
+        ));
     }
 
     commands.extend([
@@ -2346,7 +2355,7 @@ pub(crate) mod tests {
         assert_eq!(
             calls,
             vec![
-                format!("{prefix} lyracore check_world_content [0]"),
+                format!("{prefix} lyracore check_world_content [0,369]"),
                 format!("{prefix} lyracore-kalimdor check_world_content [1]"),
                 format!("{prefix} lyracore-instances check_world_content [36]")
             ]
@@ -2389,7 +2398,7 @@ pub(crate) mod tests {
         run_check(&project, &stack.runner(), &FakeHttp::new(), &[]).unwrap();
         assert!(rendered(&stack)
             .iter()
-            .any(|command| command.ends_with("check_world_content [0,1,36]")));
+            .any(|command| command.ends_with("check_world_content [0,1,36,369]")));
     }
 
     #[test]
@@ -2415,7 +2424,7 @@ pub(crate) mod tests {
         let requests = http.requests();
         assert_eq!(requests.len(), 3);
         for (request, shard, body) in [
-            (requests[0].clone(), "custom-east", "[[0]]"),
+            (requests[0].clone(), "custom-east", "[[0,369]]"),
             (requests[1].clone(), "custom-west", "[[1]]"),
             (requests[2].clone(), "custom-pool", "[[36]]"),
         ] {
@@ -2467,7 +2476,7 @@ pub(crate) mod tests {
         .unwrap();
         let calls = rendered(&stack);
         for (shard, maps) in [
-            ("lyracore", "[0]"),
+            ("lyracore", "[0,369]"),
             ("lyracore-kalimdor", "[1]"),
             ("lyracore-instances", "[36]"),
         ] {
@@ -2910,12 +2919,69 @@ pub(crate) mod tests {
         }));
         assert!(!rendered.iter().any(|command| command.contains("--terrain")));
         assert!(!rendered.iter().any(|command| command.contains("--nav")));
-        for mode in ["--talents", "--spells"] {
+        for mode in ["--vmap", "--talents", "--spells"] {
             assert!(rendered.iter().any(|command| command.contains(mode)));
         }
         assert!(!rendered
             .iter()
             .any(|command| command.contains("import-class-spells.sh")));
+    }
+
+    #[test]
+    fn required_wmo_geometry_runs_only_for_profiles_that_own_wmo_maps() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        for (profile, expected) in [
+            (WorldProfile::AllianceEastern, true),
+            (WorldProfile::StartingEastern, true),
+            (WorldProfile::AllianceKalimdor, false),
+            (WorldProfile::StartingKalimdor, false),
+            (WorldProfile::AllianceSingle, true),
+            (WorldProfile::Instances, true),
+        ] {
+            let commands = world_etl_commands(
+                &project,
+                &data,
+                &ImportDestination {
+                    shard: "world".into(),
+                    profile,
+                },
+            );
+            assert_eq!(
+                commands
+                    .iter()
+                    .any(|(_, _, command)| command.args().iter().any(|arg| arg == "--vmap")),
+                expected,
+                "{}",
+                profile.name()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_required_wmo_geometry_leaves_content_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let stack = healthy().fail_on("--vmap", "missing Tram WMO");
+        let error = run_world(
+            &project,
+            &stack.runner(),
+            &FakeHttp::new(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("missing Tram WMO"), "{error}");
+        let calls = rendered(&stack);
+        assert!(calls
+            .iter()
+            .any(|command| command.contains("begin_world_import")));
+        assert!(!calls
+            .iter()
+            .any(|command| command.contains("complete_world_import")));
     }
 
     #[test]
@@ -3011,6 +3077,7 @@ pub(crate) mod tests {
             ),
             format!("{importer} --db {db} --server {server} --terrain {data} --world-profile alliance-single --apply"),
             format!("{importer} --db {db} --server {server} --nav {data} --world-profile alliance-single --apply"),
+            format!("{importer} --db {db} --server {server} --vmap {data} --world-profile alliance-single --apply"),
             format!("{importer} --db {db} --server {server} --dbc {data} --apply"),
             format!("{importer} --db {db} --server {server} --dbc {data} --talents --apply"),
             format!("{importer} --db {db} --server {server} --dbc {data} --spells --apply"),
@@ -3047,6 +3114,7 @@ pub(crate) mod tests {
             "--dump",
             "--terrain",
             "--nav",
+            "--vmap",
             "--talents",
             "--spells --apply",
             "debug_repair_after_publish",

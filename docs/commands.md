@@ -155,11 +155,11 @@ The sharded destination plan is fixed:
 
 | Destination | Profile | Spatial result |
 | --- | --- | --- |
-| `lyracore` | `alliance-eastern` | Human corridor, Dun Morogh and Loch Modan on map 0 |
+| `lyracore` | `alliance-eastern` | Human corridor, Dun Morogh and Loch Modan on map 0, plus Deeprun Tram map 369 |
 | `lyracore-kalimdor` | `alliance-kalimdor` | Teldrassil and Darkshore on map 1 |
-| `lyracore-instances` | `instances` | whole map 36, with no open-world terrain or navigation pass |
+| `lyracore-instances` | `instances` | whole map 36 with required WMO geometry, no open-world terrain or navigation pass |
 
-The single topology uses `alliance-single`, the union of those bounded continent slices and map 36.
+The single topology uses `alliance-single`, the union of those bounded continent slices and maps 36 and 369.
 Every importer child names its destination and loopback SpacetimeDB endpoint. The full
 Spell.dbc catalogue already supplies caster spells, so Verification derives every referenced
 caster spell from `game_creature_cast` and `game_creature_spell` instead of maintaining an
@@ -169,7 +169,9 @@ If a mode fails, later modes and later destinations do not start. The error name
 profile and mode. Fix the cause and rerun the full command. Import families use clear-and-reload, so
 the rerun repairs a partial family; the complete multi-destination operation is not atomic.
 
-After `import world`, run `./lyracore import vmaps` when exact model/WMO collision data is needed.
+`import world` automatically imports canonical Vmap geometry for profiles that own Deeprun Tram
+or Deadmines before recording content completion. Run `./lyracore import vmaps` to refresh
+World Shard collision data afterward.
 It follows the World Shard profiles and skips the Instance Pool. Importing vmaps does not enable
 exact rays. Enabling them is a separate Operator decision after `docs/verification/vmap-rollout.md` Verification.
 
@@ -185,8 +187,8 @@ trigger center for diagnostics; the center need not have a floor when the suppor
 entered the trigger volume.
 This establishes static geometry suitability, not actual Character movement. The private fixture
 must exercise the ordinary Core route before the attended client check. Selected WMO groups that
-reference active doodads are also refused until their nested transforms are supported. `./lyracore
-import vmaps` does not send this slice to the Instance Pool yet. Map 36 terrain and Navigation
+reference active doodads are also refused until their nested transforms are supported. `import world` applies this slice to the Instance Pool; the separate `import vmaps` refresh
+command still visits World Shards only. Map 36 terrain and Navigation
 Coverage remain unavailable until archive-derived evidence supports a representation that preserves
 its floors.
 
