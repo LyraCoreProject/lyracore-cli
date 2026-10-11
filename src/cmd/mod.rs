@@ -22,21 +22,20 @@ use import::{ImportOptions, VmapOptions};
 /// Everything else — the commands you only need once you're developing LyraCore itself — lives in
 /// [`USAGE_ALL`], reached with `lyracore help --all`.
 pub const USAGE: &str = "\
-lyracore — run a local LyraCore vanilla WoW server
+lyracore: run a local LyraCore vanilla WoW Realm
 
 USAGE:
-  lyracore doctor          check whether your machine has what `dev up` needs
-  lyracore dev up          start the local server (or reconnect to one already running)
+  lyracore doctor          check the prerequisites for `dev up`
+  lyracore dev up          publish and start the local Realm for setup
   lyracore account create USER
-                           create a login account so you can connect a 1.12.1 client
-  lyracore dev status      show whether the server is running
-  lyracore dev down        stop the server
-  lyracore import          replace the placeholder starter data with the real game
-                           world — every Alliance early-game corridor — from public
-                           game data and your own 1.12.1 client
+                           provision an Account with your chosen password
+  lyracore import          import world content from public game data and
+                           your own 1.12.1 client before play
+  lyracore dev check       check imported content on every playable Shard
+  lyracore dev status      report the running processes and published Shards
+  lyracore dev down        stop the local Realm
 
-Run `lyracore help --all` to see every command, including the ones for working on
-LyraCore itself.";
+Run `lyracore help --all` to see every command.";
 
 /// The full command surface, including the contributor-facing corners `USAGE` leaves out.
 pub const USAGE_ALL: &str = "\
@@ -65,12 +64,15 @@ USAGE:
   lyracore dev status                          report each component's state, and each
                                                database's own published/connected verdict
   lyracore dev logs [spacetime|gateway]        show a component's log file
-  lyracore dev smoke                           run the pinned wire harness's login smoke
+  lyracore dev check                           check imported content on World Shards and the
+                                               Instance Pool, without changing their content
+  lyracore dev smoke ACCOUNT CHARACTER [--password-stdin]
+                                               check content, then run the pinned Headless Client
+                                               with your Account password
   lyracore dev down [--forget]                 stop the processes this CLI started
   lyracore account create USER [--password-stdin]
                                                provision an account's SRP6 credentials
-  lyracore import [--client-data PATH]         build the REAL world in place of the seed
-                                               fixture: every Alliance early-game corridor
+  lyracore import [--client-data PATH]         import the playable world: Alliance early-game corridors
                                                in Eastern Kingdoms and Kalimdor, plus the
                                                instance maps. Pulls cmangos' classic-db,
                                                reads your own 1.12.1 client's Data/ archives,
@@ -86,6 +88,9 @@ USAGE:
   lyracore import world --accept               the same command by its full name (`import`
                                                is its alias), with the consent answered in
                                                advance (scripted runs)
+  lyracore import check [--profile-shard PROFILE=SHARD ...]
+                                               check imported content at the same destinations
+                                               selected by `import world`
   lyracore import vmaps [--client-data PATH]   exact model/WMO collision triangles for each
                                                populated World Shard, including Kalimdor,
                                                read from your own client's archives — nothing
@@ -212,7 +217,15 @@ pub enum Command {
     },
     DevStatus,
     DevLogs(Option<Component>),
-    DevSmoke,
+    DevCheck,
+    DevSmoke {
+        account: String,
+        character: String,
+        source: PasswordSource,
+    },
+    ImportCheck {
+        profile_shards: Vec<String>,
+    },
     DevDown {
         forget: bool,
     },
@@ -319,7 +332,14 @@ impl Command {
 
             ["dev", "up", rest @ ..] => parse_dev_up(rest),
             ["dev", "status"] => Ok(Command::DevStatus),
-            ["dev", "smoke"] => Ok(Command::DevSmoke),
+            ["dev", "check"] => Ok(Command::DevCheck),
+            ["dev", "smoke", account, character] if !account.trim().is_empty() && !character.trim().is_empty() && !account.starts_with('-') && !character.starts_with('-') => Ok(Command::DevSmoke {
+                account: (*account).to_string(), character: (*character).to_string(), source: PasswordSource::Tty,
+            }),
+            ["dev", "smoke", account, character, "--password-stdin"] if !account.trim().is_empty() && !character.trim().is_empty() && !account.starts_with('-') && !character.starts_with('-') => Ok(Command::DevSmoke {
+                account: (*account).to_string(), character: (*character).to_string(), source: PasswordSource::Stdin,
+            }),
+            ["dev", "smoke", ..] => Err(Error::Usage("`dev smoke` needs ACCOUNT CHARACTER [--password-stdin]".to_string())),
             ["dev", "down"] => Ok(Command::DevDown { forget: false }),
             ["dev", "down", "--forget"] => Ok(Command::DevDown { forget: true }),
             ["dev", "logs"] => Ok(Command::DevLogs(None)),
@@ -331,10 +351,10 @@ impl Command {
                     ))
                 }),
             ["dev"] => Err(Error::Usage(
-                "`dev` needs a subcommand: up, status, logs, smoke, down".to_string(),
+                "`dev` needs a subcommand: up, status, check, logs, smoke, down".to_string(),
             )),
             ["dev", other, ..] => Err(Error::Usage(format!(
-                "unknown `dev` subcommand '{other}' — expected up, status, logs, smoke, or down"
+                "unknown `dev` subcommand '{other}' — expected up, status, check, logs, smoke, or down"
             ))),
 
             ["account", "create", user] => Ok(Command::AccountCreate {
@@ -356,6 +376,7 @@ impl Command {
             // `import` is an ALIAS of `import world` rather than a separate arm: this parser is
             // literal slice-matching, so the alias is one line, the two spellings cannot drift,
             // and the command bare `import` has meant since it existed keeps meaning that.
+            ["import", "check", rest @ ..] => parse_import_check(rest),
             ["import", "world", rest @ ..] => parse_import_world(rest),
             ["import", "vmaps", rest @ ..] => parse_import_vmaps(rest),
             // ...and `import` still takes no positional arguments. A bare path is the shape
@@ -879,6 +900,24 @@ fn parse_packages_name_and_yes(verb: &str, args: &[&str]) -> Result<(String, boo
     })
 }
 
+fn parse_import_check(args: &[&str]) -> Result<Command> {
+    let mut profile_shards = Vec::new();
+    let mut rest = args;
+    while let ["--profile-shard", assignment, tail @ ..] = rest {
+        if assignment.starts_with('-') {
+            break;
+        }
+        profile_shards.push((*assignment).to_string());
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        return Err(Error::Usage(
+            "`import check` accepts only --profile-shard PROFILE=SHARD".to_string(),
+        ));
+    }
+    Ok(Command::ImportCheck { profile_shards })
+}
+
 /// `dev up [--single] [--lan <IP>]`, in either order.
 ///
 /// The two options are orthogonal — `--single` chooses how many databases, `--lan` chooses who can
@@ -1031,6 +1070,34 @@ mod tests {
     }
 
     #[test]
+    fn check_and_smoke_require_explicit_valid_arguments() {
+        for command in [
+            "dev check extra",
+            "dev smoke",
+            "dev smoke ALICE",
+            "dev smoke --bad Ginger",
+            "import check --accept",
+            "import check --profile-shard",
+        ] {
+            assert!(parse(command).is_err(), "{command}");
+        }
+        assert_eq!(
+            parse("import check --profile-shard instances=pool").unwrap(),
+            Command::ImportCheck {
+                profile_shards: vec!["instances=pool".into()]
+            }
+        );
+        assert_eq!(
+            parse("dev smoke ALICE Ginger --password-stdin").unwrap(),
+            Command::DevSmoke {
+                account: "ALICE".into(),
+                character: "Ginger".into(),
+                source: PasswordSource::Stdin,
+            }
+        );
+    }
+
+    #[test]
     fn the_documented_surface_parses() {
         assert_eq!(parse("doctor").unwrap(), Command::Doctor);
         assert_eq!(
@@ -1041,7 +1108,15 @@ mod tests {
             }
         );
         assert_eq!(parse("dev status").unwrap(), Command::DevStatus);
-        assert_eq!(parse("dev smoke").unwrap(), Command::DevSmoke);
+        assert_eq!(parse("dev check").unwrap(), Command::DevCheck);
+        assert_eq!(
+            parse("dev smoke ALICE Ginger").unwrap(),
+            Command::DevSmoke {
+                account: "ALICE".into(),
+                character: "Ginger".into(),
+                source: PasswordSource::Tty,
+            }
+        );
         assert_eq!(parse("dev logs").unwrap(), Command::DevLogs(None));
         assert_eq!(
             parse("dev down").unwrap(),
@@ -1349,10 +1424,7 @@ mod tests {
         assert!(USAGE_ALL.contains("lyracore import vmaps"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--client-data"), "{USAGE_ALL}");
         assert!(USAGE_ALL.contains("--accept"), "{USAGE_ALL}");
-        assert!(
-            USAGE.contains("every Alliance early-game corridor"),
-            "{USAGE}"
-        );
+        assert!(USAGE.contains("before play"), "{USAGE}");
         assert!(
             USAGE_ALL.contains("Eastern Kingdoms and Kalimdor"),
             "{USAGE_ALL}"

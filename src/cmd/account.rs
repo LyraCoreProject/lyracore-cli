@@ -60,11 +60,7 @@ pub fn create(
     // account is written somewhere the logon path never looks.
     let topology = RuntimeState::load(&project.state_file())?.topology();
 
-    let password = match source {
-        PasswordSource::Stdin => read_line_secret(&mut std::io::stdin().lock())?,
-        PasswordSource::Tty => read_password_from_tty()?,
-    };
-    validate(&password)?;
+    let password = read_password(source)?;
 
     runner.run_with_secret_stdin(
         &provision_command(project, user, credential.token(), topology),
@@ -105,7 +101,16 @@ fn provision_command(
     )
 }
 
-fn validate(password: &[u8]) -> Result<()> {
+pub fn read_password(source: PasswordSource) -> Result<Zeroizing<Vec<u8>>> {
+    let password = match source {
+        PasswordSource::Stdin => read_line_secret(&mut std::io::stdin().lock())?,
+        PasswordSource::Tty => read_password_from_tty()?,
+    };
+    validate(&password)?;
+    Ok(password)
+}
+
+pub(crate) fn validate(password: &[u8]) -> Result<()> {
     if password.is_empty() {
         return Err(Error::Usage(
             "the password was empty — nothing was provisioned".to_string(),
@@ -161,7 +166,7 @@ fn read_password_from_tty() -> Result<Zeroizing<Vec<u8>>> {
         )
     })?;
 
-    eprint!("Password for the new account: ");
+    eprint!("Account password: ");
     std::io::stderr().flush()?;
 
     let echo_was_off = set_tty_echo(false).is_ok();

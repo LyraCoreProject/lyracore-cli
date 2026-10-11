@@ -332,7 +332,6 @@ impl ProjectLayout {
     /// provision, and this CLI deliberately does not address it.
     pub const IMPORTER_SCRIPTS_DIR: &'static str = "importer/scripts";
     pub const PULL_CLASSIC_DB_SCRIPT: &'static str = "importer/scripts/pull-classic-db.sh";
-    pub const IMPORT_CLASS_SPELLS_SCRIPT: &'static str = "importer/scripts/import-class-spells.sh";
     /// The FLOOR_* count minimums the post-import assertions compare against. A DATA file the
     /// core repo tunes per dump — the CLI sources it fresh on every run rather than baking the
     /// numbers in, so retuning a floor never needs a CLI release.
@@ -395,11 +394,8 @@ impl ProjectLayout {
     /// Paths INSIDE a harness checkout. `dev smoke` drives the generic login smoke through the
     /// harness's own adapter seam; a release that also carries a suite entrypoint is preferred.
     pub const HARNESS_SMOKE_SEAM: &'static str = "adapters/lyracore/wire.sh";
-    pub const HARNESS_SUITE_SCRIPT: &'static str = "adapters/lyracore/run-suite.sh";
     pub const HARNESS_CLIENT_BIN: &'static str = "vanilla-wire";
     /// The fixture account and character the login smoke signs in as.
-    pub const SMOKE_ACCOUNT: &'static str = "TEST";
-    pub const SMOKE_CHARACTER: &'static str = "Ginger";
 
     // The database is loopback in every mode. Only the two client-facing ports follow the
     // `ClientBind` chosen by `dev up [--lan IP]`.
@@ -576,10 +572,6 @@ impl ProjectLayout {
 
     pub fn pull_classic_db_script(&self) -> PathBuf {
         self.root.join(Self::PULL_CLASSIC_DB_SCRIPT)
-    }
-
-    pub fn import_class_spells_script(&self) -> PathBuf {
-        self.root.join(Self::IMPORT_CLASS_SPELLS_SCRIPT)
     }
 
     pub fn import_manifest_script(&self) -> PathBuf {

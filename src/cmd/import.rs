@@ -29,8 +29,7 @@
 //!   from the network — so it carries no consent gate.
 //!
 //! What still shells to bash, on purpose: `pull-classic-db.sh` (the pinned, checksum-verified dump
-//! fetch — its lockfile discipline lives with the lock it reads) and `import-class-spells.sh` (the
-//! curated overlay whose spell-id lists are core-repo data). `import-manifest.sh` is sourced, not
+//! fetch, with its lockfile discipline). `import-manifest.sh` is sourced, not
 //! run: it is a data file of floors the core repo tunes per dump, read fresh on every import so a
 //! retuned floor never needs a CLI release.
 //!
@@ -38,6 +37,8 @@
 //! floors per content destination: six on `dev up --single`, twelve on the sharded fixture. See
 //! [`import_destinations`].
 
+use crate::cmd::dev::call_as_operator;
+use crate::http::HttpClient;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::{ProjectLayout, Topology};
 use crate::state::RuntimeState;
@@ -117,7 +118,8 @@ impl TtyPrompt {
 
     pub const fn packages_apply() -> Self {
         Self {
-            no_terminal_remedy: "pass --yes to confirm the application in advance, or --check to see \
+            no_terminal_remedy:
+                "pass --yes to confirm the application in advance, or --check to see \
                                  the plan without writing",
         }
     }
@@ -269,6 +271,15 @@ impl WorldProfile {
         matches!(self, Self::AllianceSingle | Self::Instances)
     }
 
+    fn map_ids(self) -> &'static [u32] {
+        match self {
+            Self::AllianceEastern | Self::StartingEastern => &[0],
+            Self::AllianceKalimdor | Self::StartingKalimdor => &[1],
+            Self::AllianceSingle => &[0, 1, 36],
+            Self::Instances => &[36],
+        }
+    }
+
     fn open_world_maps(self) -> &'static [i64] {
         match self {
             Self::AllianceEastern | Self::StartingEastern => &[0],
@@ -292,6 +303,7 @@ struct ImportDestination {
 pub fn run_world(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
+    http: &dyn HttpClient,
     prompt: &dyn Prompt,
     options: &ImportOptions,
 ) -> Result<()> {
@@ -312,7 +324,6 @@ pub fn run_world(
 
     for script in [
         project.pull_classic_db_script(),
-        project.import_class_spells_script(),
         project.import_manifest_script(),
     ] {
         if !script.exists() {
@@ -335,6 +346,9 @@ pub fn run_world(
         CONSUMED_FLOORS.len(),
         ProjectLayout::IMPORT_MANIFEST_SCRIPT
     );
+
+    let credential = crate::token::resolve_existing(runner, &project.token_file())?;
+    let owner_config = temporary_owner_config(&credential)?;
 
     // Three fixed stages, then the modes + the re-arm + the floors per destination.
     let total = 3 + 3 * destinations.len() as u8;
@@ -404,6 +418,17 @@ pub fn run_world(
             "instance creatures, loot, gameobjects, spells"
         };
 
+        call_as_operator(
+            project,
+            runner,
+            http,
+            &credential,
+            database,
+            "begin_world_import",
+            &[],
+        )
+        .map_err(|error| content_failure(destination, error))?;
+
         // ---- the importer's modes, in the bash flow's order ----------------------------------
         stage(
             n,
@@ -420,6 +445,7 @@ pub fn run_world(
         for (what, advice, command) in world_etl_commands(project, &client_data, destination) {
             println!();
             println!("   -> {what}");
+            let command = with_owner_config(command, owner_config.as_ref());
             runner.run_streaming(&command).map_err(|e| {
                 stage_failure(&format!("{what} for {database} ({profile})"), advice, e)
             })?;
@@ -433,19 +459,19 @@ pub fn run_world(
         stage(
             n + 1,
             total,
-            &format!("re-arming {database} (creature tick, fixtures, gather pools)"),
+            &format!("re-arming {database} (runtime schedules and gather pools)"),
         );
         for reducer in ["debug_repair_after_publish", "arm_all_pools"] {
-            runner
-                .run_and_wait(&call_command(project, database, reducer))
-                .map_err(|e| {
+            call_as_operator(project, runner, http, &credential, database, reducer, &[]).map_err(
+                |e| {
                     stage_failure(
                         &format!("{reducer} for {database} ({profile})"),
                         "Both reducers are operator-gated — `lyracore dev up` publishes the \
                          module and claims the operator; is the stack up (`lyracore dev status`)?",
                         e,
                     )
-                })?;
+                },
+            )?;
         }
 
         // ---- the FLOOR_* assertions ------------------------------------------------------------
@@ -454,21 +480,123 @@ pub fn run_world(
             total,
             &format!("asserting the import floors on {database} (the FLOOR_* manifest)"),
         );
-        assert_floors(project, runner, database, destination.profile, &floors).map_err(
-            |error| {
-                Error::Process(format!(
-                    "asserting import floors for {database} ({profile}) failed: {error}"
-                ))
-            },
-        )?;
+        assert_floors(
+            project,
+            runner,
+            database,
+            destination.profile,
+            &floors,
+            owner_config.as_ref().map(|file| file.path()),
+        )
+        .map_err(|error| {
+            Error::Process(format!(
+                "asserting import floors for {database} ({profile}) failed: {error}"
+            ))
+        })?;
+        let args = [serde_json::json!(destination.profile.map_ids())];
+        call_as_operator(
+            project,
+            runner,
+            http,
+            &credential,
+            database,
+            "complete_world_import",
+            &args,
+        )
+        .map_err(|error| content_failure(destination, error))?;
+        call_as_operator(
+            project,
+            runner,
+            http,
+            &credential,
+            database,
+            "check_world_content",
+            &args,
+        )
+        .map_err(|error| content_failure(destination, error))?;
     }
 
     println!();
     println!(
-        "import complete. The realm now holds the imported world rather than the seed fixture."
+        "import complete. Every selected World Shard and Instance Pool passed the content checks."
     );
     println!("Nothing produced here is redistributable — see the notice this command opened with.");
     Ok(())
+}
+
+const SPACETIME_CONFIG_VAR: &str = "LYRACORE_SPACETIME_CONFIG_PATH";
+
+fn temporary_owner_config(
+    credential: &crate::token::Credential,
+) -> Result<Option<tempfile::NamedTempFile>> {
+    if !credential.is_server_issued() {
+        return Ok(None);
+    }
+    let mut file = tempfile::NamedTempFile::new()?;
+    let token = serde_json::to_string(credential.token())
+        .map_err(|error| Error::Process(error.to_string()))?;
+    writeln!(file, "spacetimedb_token = {token}")?;
+    file.flush()?;
+    Ok(Some(file))
+}
+
+fn with_owner_config(
+    command: CommandSpec,
+    config: Option<&tempfile::NamedTempFile>,
+) -> CommandSpec {
+    match config {
+        Some(file) => command.env(
+            SPACETIME_CONFIG_VAR,
+            file.path().to_string_lossy().to_string(),
+        ),
+        None => command.env_remove(SPACETIME_CONFIG_VAR),
+    }
+}
+
+pub fn run_check(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    http: &dyn HttpClient,
+    profile_shards: &[String],
+) -> Result<()> {
+    let destinations = import_destinations(
+        RuntimeState::load(&project.state_file())?.topology(),
+        profile_shards,
+    )?;
+    let credential = crate::token::resolve_existing(runner, &project.token_file())?;
+    let mut failures = Vec::new();
+    for destination in destinations {
+        match call_as_operator(
+            project,
+            runner,
+            http,
+            &credential,
+            &destination.shard,
+            "check_world_content",
+            &[serde_json::json!(destination.profile.map_ids())],
+        ) {
+            Ok(_) => println!(
+                "  {} ({}) content ready",
+                destination.shard,
+                destination.profile.name()
+            ),
+            Err(error) => failures.push(content_failure(&destination, error).to_string()),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(Error::Process(failures.join("\n")));
+    }
+    Ok(())
+}
+
+fn content_failure(destination: &ImportDestination, error: Error) -> Error {
+    Error::Process(format!(
+        "{} ({}) content is not ready for play: {error}\n  \
+         Run `lyracore import world` with the same World Import Profile assignments, \
+         then `lyracore import check`.",
+        destination.shard,
+        destination.profile.name(),
+    ))
 }
 
 /// Content destinations, in import order. The importer owns every profile's spatial facts; the CLI
@@ -637,6 +765,14 @@ pub fn run_vmaps(
         RuntimeState::load(&project.state_file())?.topology(),
         &options.profile_shards,
     )?;
+    let owner_config = if project.token_file().is_file() {
+        temporary_owner_config(&crate::token::resolve_existing(
+            runner,
+            &project.token_file(),
+        )?)?
+    } else {
+        None
+    };
     let world_shards: Vec<ImportDestination> = destinations
         .into_iter()
         .filter(|destination| destination.profile.has_bounded_slices())
@@ -647,7 +783,10 @@ pub fn run_vmaps(
         println!();
         println!("==> {shard}: vmap extract + import ({profile})");
         runner
-            .run_streaming(&vmap_command(project, destination, &data))
+            .run_streaming(&with_owner_config(
+                vmap_command(project, destination, &data),
+                owner_config.as_ref(),
+            ))
             .map_err(|e| {
                 stage_failure(
                     &format!("importing vmaps for {shard} ({profile})"),
@@ -864,17 +1003,14 @@ pub(crate) fn importer_command(project: &ProjectLayout, database: &str) -> Comma
         .arg(database)
         .arg("--server")
         .arg(ProjectLayout::stdb_uri())
+        .env("LYRACORE_DEFER_CONTENT_READY", "1")
         .cwd(project.root.clone())
 }
 
 /// The world ETL: the importer's modes, in `import-world.sh`'s order, each with the advice its
 /// failure needs. One list so the ordering is a fact in one place — the ordering IS the port.
 ///
-/// Two deliberate differences from the bash flow: nothing is piped through a reporting `grep`
-/// (the child's full output streams, and its exit status is checked mode by mode — the bash ran
-/// every mode even after one failed and let the assertions catch the fallout), and the curated
-/// class-spell overlay therefore runs exactly ONCE (the old façade ran it twice because the bash
-/// swallowed its exit status inside that grep).
+/// Stream each mode and stop on failure before completing the destination import.
 fn world_etl_commands(
     project: &ProjectLayout,
     client_data: &Path,
@@ -930,8 +1066,7 @@ fn world_etl_commands(
     commands.extend([
         (
             "character-creation + faction DBC tables",
-            "Reads dbc.MPQ. Without this pass non-Warrior classes inherit the Warrior loadout — \
-             it must not be skipped.",
+            "Reads dbc.MPQ. Missing starting outfits block Character creation.",
             importer_command(project, database)
                 .arg("--dbc")
                 .arg(&data)
@@ -939,8 +1074,7 @@ fn world_etl_commands(
         ),
         (
             "real talent trees (TalentTab.dbc + Talent.dbc)",
-            "Reads dbc.MPQ. Without this the demo talent ids do not match what the 5875 client \
-             sends, and talent clicks silently no-op.",
+            "Reads dbc.MPQ. Referenced talent spells must exist in the imported catalogue.",
             importer_command(project, database)
                 .arg("--dbc")
                 .arg(&data)
@@ -957,28 +1091,8 @@ fn world_etl_commands(
                 .arg("--spells")
                 .arg("--apply"),
         ),
-        (
-            "curated class spells (all nine classes)",
-            "This reads Spell.dbc out of the client archives and writes trainer offerings. A \
-             \"requested N ids but matched M\" warning names ids your client build does not have.",
-            class_spells_command(project, client_data, database),
-        ),
     ]);
     commands
-}
-
-/// The class-spell import takes the client path as its argument, the destination from `DB`, and the
-/// node from `SPACETIME_SERVER`. Pass all three explicitly so no Shard or node comes from ambient
-/// shell state.
-fn class_spells_command(
-    project: &ProjectLayout,
-    client_data: &Path,
-    database: &str,
-) -> CommandSpec {
-    from_root(project, project.import_class_spells_script())
-        .arg(client_data.to_string_lossy().to_string())
-        .env("DB", database)
-        .env("SPACETIME_SERVER", ProjectLayout::stdb_uri())
 }
 
 /// `spacetime call`, pinned to the loopback node — bare `spacetime call` inherits the CLI's
@@ -996,7 +1110,22 @@ pub(crate) fn call_command(project: &ProjectLayout, database: &str, reducer: &st
 
 /// `spacetime sql`, pinned to the loopback node for the same #440 reason as [`call_command`].
 pub(crate) fn sql_command(project: &ProjectLayout, database: &str, query: &str) -> CommandSpec {
-    CommandSpec::new("spacetime")
+    sql_command_with_config(project, database, query, None)
+}
+
+fn sql_command_with_config(
+    project: &ProjectLayout,
+    database: &str,
+    query: &str,
+    config: Option<&Path>,
+) -> CommandSpec {
+    let mut command = CommandSpec::new("spacetime");
+    if let Some(path) = config {
+        command = command
+            .arg("--config-path")
+            .arg(path.to_string_lossy().to_string());
+    }
+    command
         .arg("sql")
         .arg("--server")
         .arg(ProjectLayout::stdb_uri())
@@ -1273,6 +1402,7 @@ struct Assertions<'a> {
     runner: &'a dyn ProcessRunner,
     database: &'a str,
     floors: &'a Floors,
+    owner_config: Option<&'a Path>,
     failed: usize,
 }
 
@@ -1282,7 +1412,12 @@ impl Assertions<'_> {
     /// FAILs — so the first failure aborts the whole pass instead of reading as a count of 0.
     fn sql(&self, query: &str) -> Result<String> {
         self.runner
-            .run_and_wait(&sql_command(self.project, self.database, query))
+            .run_and_wait(&sql_command_with_config(
+                self.project,
+                self.database,
+                query,
+                self.owner_config,
+            ))
             .map_err(|e| {
                 Error::Process(format!(
                     "a verification query against '{db}' failed — a failed query is NOT zero \
@@ -1661,12 +1796,14 @@ fn assert_floors(
     database: &str,
     profile: WorldProfile,
     floors: &Floors,
+    owner_config: Option<&Path>,
 ) -> Result<()> {
     let mut a = Assertions {
         project,
         runner,
         database,
         floors,
+        owner_config,
         failed: 0,
     };
     println!("   assertions ({} → {database}):", profile.name());
@@ -2087,6 +2224,7 @@ fn assert_floors(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::http::fake::FakeHttp;
     use crate::proc::fake::{Call, FakeStack};
     use std::cell::RefCell;
     use tempfile::TempDir;
@@ -2128,11 +2266,7 @@ pub(crate) mod tests {
         std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         let dir = tmp.path().join(ProjectLayout::IMPORTER_SCRIPTS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
-        for name in [
-            "pull-classic-db.sh",
-            "import-class-spells.sh",
-            "import-manifest.sh",
-        ] {
+        for name in ["pull-classic-db.sh", "import-manifest.sh"] {
             std::fs::write(dir.join(name), "#!/usr/bin/env bash\n").unwrap();
         }
         let import_dir = tmp.path().join(".import");
@@ -2198,6 +2332,232 @@ pub(crate) mod tests {
             .unwrap_or_else(|| panic!("{needle} was never run: {calls:?}"))
     }
 
+    #[test]
+    fn check_reads_world_shards_and_instance_pool_without_changing_content() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = healthy();
+        run_check(&project, &stack.runner(), &FakeHttp::new(), &[]).unwrap();
+        let calls: Vec<String> = rendered(&stack)
+            .into_iter()
+            .filter(|command| command.contains("check_world_content"))
+            .collect();
+        let prefix = format!("spacetime call --server {}", ProjectLayout::stdb_uri());
+        assert_eq!(
+            calls,
+            vec![
+                format!("{prefix} lyracore check_world_content [0]"),
+                format!("{prefix} lyracore-kalimdor check_world_content [1]"),
+                format!("{prefix} lyracore-instances check_world_content [36]")
+            ]
+        );
+        assert_eq!(stack.calls().len(), 4);
+    }
+
+    #[test]
+    fn check_reports_every_missing_destination_with_module_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = healthy().fail_on("check_world_content", "no completed world import for map");
+        let error = run_check(&project, &stack.runner(), &FakeHttp::new(), &[])
+            .unwrap_err()
+            .to_string();
+        for name in [
+            "alliance-eastern",
+            "alliance-kalimdor",
+            "instances",
+            "no completed world import",
+            "lyracore import world",
+        ] {
+            assert!(error.contains(name), "{error}");
+        }
+        assert_eq!(
+            rendered(&stack)
+                .iter()
+                .filter(|command| command.contains("check_world_content"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn single_check_includes_continents_and_instances() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        set_topology(&project, Topology::Single);
+        let stack = healthy();
+        run_check(&project, &stack.runner(), &FakeHttp::new(), &[]).unwrap();
+        assert!(rendered(&stack)
+            .iter()
+            .any(|command| command.ends_with("check_world_content [0,1,36]")));
+    }
+
+    #[test]
+    fn check_uses_persisted_operator_and_explicit_destinations() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.token_file().parent().unwrap()).unwrap();
+        std::fs::write(project.token_file(), crate::proc::fake::FAKE_TOKEN).unwrap();
+        let stack = healthy();
+        let http = FakeHttp::new();
+        run_check(
+            &project,
+            &stack.runner(),
+            &http,
+            &[
+                "starting-eastern=custom-east".into(),
+                "starting-kalimdor=custom-west".into(),
+                "instances=custom-pool".into(),
+            ],
+        )
+        .unwrap();
+        assert!(stack.calls().is_empty());
+        let requests = http.requests();
+        assert_eq!(requests.len(), 3);
+        for (request, shard, body) in [
+            (requests[0].clone(), "custom-east", "[[0]]"),
+            (requests[1].clone(), "custom-west", "[[1]]"),
+            (requests[2].clone(), "custom-pool", "[[36]]"),
+        ] {
+            assert!(request.url.contains(shard));
+            assert_eq!(request.body, body);
+            assert_eq!(
+                request.bearer.as_deref(),
+                Some(crate::proc::fake::FAKE_TOKEN)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_import_never_completes_the_destination() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let stack = healthy().fail_on("--spells --apply", "Spell catalogue parse failed");
+        run_world(
+            &project,
+            &stack.runner(),
+            &FakeHttp::new(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap_err();
+        let calls = rendered(&stack);
+        assert!(calls
+            .iter()
+            .any(|command| command.contains("begin_world_import")));
+        assert!(!calls
+            .iter()
+            .any(|command| command.contains("complete_world_import")));
+    }
+
+    #[test]
+    fn import_completes_each_profile_only_after_its_checks() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let stack = healthy();
+        run_world(
+            &project,
+            &stack.runner(),
+            &FakeHttp::new(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap();
+        let calls = rendered(&stack);
+        for (shard, maps) in [
+            ("lyracore", "[0]"),
+            ("lyracore-kalimdor", "[1]"),
+            ("lyracore-instances", "[36]"),
+        ] {
+            let begin = pos(&calls, &format!("{shard} begin_world_import"));
+            let first = pos(&calls, &format!("--db {shard} --server"));
+            let complete = pos(&calls, &format!("{shard} complete_world_import {maps}"));
+            let check = pos(&calls, &format!("{shard} check_world_content {maps}"));
+            assert!(begin < first && first < complete && complete < check);
+            let last_query = calls
+                .iter()
+                .rposition(|command| command.contains(&format!("{shard} SELECT")))
+                .unwrap();
+            assert!(last_query < complete);
+        }
+        for call in stack.calls() {
+            if let Call::Stream(command) = call {
+                if command.render().contains("--db") {
+                    assert_eq!(command.env_value("LYRACORE_DEFER_CONTENT_READY"), Some("1"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn minted_operator_imports_use_a_private_temporary_cli_config() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        std::fs::create_dir_all(project.token_file().parent().unwrap()).unwrap();
+        std::fs::write(project.token_file(), crate::proc::fake::FAKE_TOKEN).unwrap();
+        let stack = healthy().with_stdout("sql --server", SQL_ROWS);
+        run_world(
+            &project,
+            &stack.runner(),
+            &FakeHttp::new(),
+            &ScriptedPrompt::new(&[]),
+            &accepted(&data),
+        )
+        .unwrap();
+        let mut paths = BTreeSet::new();
+        for call in stack.calls() {
+            let (Call::Stream(command) | Call::Wait(command)) = call else {
+                continue;
+            };
+            assert!(!command.render().contains(crate::proc::fake::FAKE_TOKEN));
+            if command.render().contains("--db") {
+                paths.insert(
+                    command
+                        .env_value(SPACETIME_CONFIG_VAR)
+                        .expect("importer needs the claimed identity")
+                        .to_string(),
+                );
+            }
+            if command.program() == "spacetime" {
+                assert_eq!(command.args()[0], "--config-path");
+                paths.insert(command.args()[1].clone());
+            }
+        }
+        assert_eq!(paths.len(), 1);
+        assert!(!Path::new(paths.iter().next().unwrap()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cli_config_contains_the_operator_token_and_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.token_file().parent().unwrap()).unwrap();
+        std::fs::write(project.token_file(), crate::proc::fake::FAKE_TOKEN).unwrap();
+        let credential =
+            crate::token::resolve_existing(&healthy().runner(), &project.token_file()).unwrap();
+        let config = temporary_owner_config(&credential).unwrap().unwrap();
+        assert_eq!(
+            std::fs::metadata(config.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(config.path()).unwrap(),
+            format!(
+                "spacetimedb_token = \"{}\"\n",
+                crate::proc::fake::FAKE_TOKEN
+            )
+        );
+    }
+
     // ---- consent ----
 
     #[test]
@@ -2227,7 +2587,14 @@ pub(crate) mod tests {
                 client_data: Some(data.to_string_lossy().to_string()),
                 profile_shards: vec![],
             };
-            let error = run_world(&project, &stack.runner(), &prompt, &options).unwrap_err();
+            let error = run_world(
+                &project,
+                &stack.runner(),
+                &FakeHttp::new(),
+                &prompt,
+                &options,
+            )
+            .unwrap_err();
             assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{answer:?}");
             assert!(
                 stack.calls().is_empty(),
@@ -2250,7 +2617,14 @@ pub(crate) mod tests {
                 client_data: Some(data.to_string_lossy().to_string()),
                 profile_shards: vec![],
             };
-            run_world(&project, &stack.runner(), &prompt, &options).unwrap();
+            run_world(
+                &project,
+                &stack.runner(),
+                &FakeHttp::new(),
+                &prompt,
+                &options,
+            )
+            .unwrap();
             assert!(
                 rendered(&stack).iter().any(|c| c.contains("--dump")),
                 "{answer:?} should have run the ETL"
@@ -2267,7 +2641,14 @@ pub(crate) mod tests {
         // No answers at all: this prompt errors if it is asked anything.
         let prompt = ScriptedPrompt::new(&[]);
 
-        run_world(&project, &stack.runner(), &prompt, &accepted(&data)).unwrap();
+        run_world(
+            &project,
+            &stack.runner(),
+            &FakeHttp::new(),
+            &prompt,
+            &accepted(&data),
+        )
+        .unwrap();
         assert!(prompt.asked().is_empty(), "--accept must not prompt");
     }
 
@@ -2296,21 +2677,6 @@ pub(crate) mod tests {
                             .expect("dump command has no profile");
                         (args[1].clone(), profile)
                     })
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Every `(script name, DB=)` pair the run handed out, in order.
-    fn imported_databases(stack: &FakeStack) -> Vec<(String, String)> {
-        stack
-            .calls()
-            .into_iter()
-            .filter_map(|call| match call {
-                Call::Stream(spec) | Call::Wait(spec) => {
-                    let script = spec.args().first()?.rsplit('/').next()?.to_string();
-                    Some((script, spec.env_value("DB")?.to_string()))
                 }
                 _ => None,
             })
@@ -2346,6 +2712,7 @@ pub(crate) mod tests {
             run_world(
                 &project,
                 &stack.runner(),
+                &FakeHttp::new(),
                 &ScriptedPrompt::new(&[]),
                 &accepted(&data),
             )
@@ -2357,14 +2724,9 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|command| command.contains(" --dump "))
                 .all(|command| !command.contains("--include-creatures")));
-            let expected_shards: Vec<String> =
-                want.iter().map(|(shard, _)| shard.clone()).collect();
-            let spells: Vec<String> = imported_databases(&stack)
-                .into_iter()
-                .filter(|(script, _)| script == "import-class-spells.sh")
-                .map(|(_, db)| db)
-                .collect();
-            assert_eq!(spells, expected_shards, "{topology:?}");
+            assert!(!rendered(&stack)
+                .iter()
+                .any(|command| command.contains("import-class-spells.sh")));
         }
     }
 
@@ -2387,6 +2749,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &options,
         )
@@ -2438,6 +2801,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &options,
         )
@@ -2497,6 +2861,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -2548,12 +2913,9 @@ pub(crate) mod tests {
         for mode in ["--talents", "--spells"] {
             assert!(rendered.iter().any(|command| command.contains(mode)));
         }
-        let spells = pool
+        assert!(!rendered
             .iter()
-            .find(|(what, _, _)| what.contains("class spells"))
-            .map(|(_, _, c)| c)
-            .expect("the pool's mode list lost the class-spell overlay");
-        assert_eq!(spells.env_value("DB"), Some(ProjectLayout::INSTANCE_POOL));
+            .any(|command| command.contains("import-class-spells.sh")));
     }
 
     #[test]
@@ -2583,9 +2945,15 @@ pub(crate) mod tests {
             client_data: Some(data.to_string_lossy().to_string()),
             profile_shards: vec![],
         };
-        let error = run_world(&project, &stack.runner(), &prompt, &options)
-            .unwrap_err()
-            .to_string();
+        let error = run_world(
+            &project,
+            &stack.runner(),
+            &FakeHttp::new(),
+            &prompt,
+            &options,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("Nothing was fetched"), "{error}");
     }
 
@@ -2601,7 +2969,14 @@ pub(crate) mod tests {
             client_data: Some(data.to_string_lossy().to_string()),
             profile_shards: vec![],
         };
-        assert!(run_world(&project, &stack.runner(), &prompt, &options).is_err());
+        assert!(run_world(
+            &project,
+            &stack.runner(),
+            &FakeHttp::new(),
+            &prompt,
+            &options
+        )
+        .is_err());
         assert!(stack.calls().is_empty());
     }
 
@@ -2619,6 +2994,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -2656,6 +3032,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -2671,7 +3048,7 @@ pub(crate) mod tests {
             "--terrain",
             "--nav",
             "--talents",
-            "import-class-spells.sh",
+            "--spells --apply",
             "debug_repair_after_publish",
             "arm_all_pools",
             "spacetime sql",
@@ -2684,12 +3061,10 @@ pub(crate) mod tests {
                 pair[1]
             );
         }
-        // The curated overlay follows the full Spell.dbc catalogue and adds trainer bindings.
-        assert!(pos(&calls, "--spells --apply") < pos(&calls, "import-class-spells.sh"));
         // The long children stream; the bookkeeping ones are captured.
         for call in stack.calls() {
             match call {
-                Call::Stream(spec) | Call::Wait(spec) => {
+                Call::Stream(spec) | Call::Wait(spec) if !spec.render().contains("login show") => {
                     assert_eq!(
                         spec.cwd_value(),
                         Some(project.root.as_path()),
@@ -2697,6 +3072,7 @@ pub(crate) mod tests {
                         spec.render()
                     );
                 }
+                Call::Wait(spec) if spec.render().contains("login show") => {}
                 other => panic!("unexpected call kind: {other:?}"),
             }
         }
@@ -2716,6 +3092,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -2752,6 +3129,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -2776,6 +3154,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -2789,13 +3168,7 @@ pub(crate) mod tests {
                 other => panic!("unexpected call kind: {other:?}"),
             })
             .collect();
-        for (needle, shipped) in [
-            ("pull-classic-db.sh", ProjectLayout::PULL_CLASSIC_DB_SCRIPT),
-            (
-                "import-class-spells.sh",
-                ProjectLayout::IMPORT_CLASS_SPELLS_SCRIPT,
-            ),
-        ] {
+        for (needle, shipped) in [("pull-classic-db.sh", ProjectLayout::PULL_CLASSIC_DB_SCRIPT)] {
             let spec = specs
                 .iter()
                 .find(|s| s.render().contains(needle))
@@ -2828,6 +3201,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -2850,21 +3224,12 @@ pub(crate) mod tests {
             }
             // Every spacetime query/call is pinned to the loopback node (#440) and the fixture
             // database.
-            if render.starts_with("spacetime") {
+            if render.starts_with("spacetime") && !render.contains("login show") {
                 assert!(
                     render.contains(&format!("--server {}", ProjectLayout::stdb_uri())),
                     "{render}"
                 );
                 assert!(render.contains(ProjectLayout::DATABASE), "{render}");
-            }
-            // The class-spell overlay takes the client path as its argument and the database from
-            // env — both explicit, because its DB default is how spells once landed elsewhere.
-            if render.contains("import-class-spells.sh") {
-                assert_eq!(
-                    spec.args().last().map(String::as_str),
-                    Some(canonical.as_str())
-                );
-                assert_eq!(spec.env_value("DB"), Some(ProjectLayout::DATABASE));
             }
         }
     }
@@ -2880,6 +3245,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -2901,11 +3267,7 @@ pub(crate) mod tests {
                 assert!(shards.contains(&spec.args()[1].as_str()), "{render}");
                 assert_eq!(&spec.args()[2..4], &["--server", server.as_str()]);
             }
-            if render.contains("import-class-spells.sh") {
-                assert!(shards.contains(&spec.env_value("DB").unwrap_or("")));
-                assert_eq!(spec.env_value("SPACETIME_SERVER"), Some(server.as_str()));
-            }
-            if render.starts_with("spacetime") {
+            if render.starts_with("spacetime") && !render.contains("login show") {
                 assert!(render.contains(&format!("--server {server}")), "{render}");
                 assert!(
                     shards.contains(&spec.args().get(3).map(String::as_str).unwrap_or_default()),
@@ -2960,6 +3322,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -2983,6 +3346,7 @@ pub(crate) mod tests {
         let error = run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -3009,6 +3373,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &prompt,
             &ImportOptions::default(),
         )
@@ -3034,6 +3399,7 @@ pub(crate) mod tests {
         let error = run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &options,
         )
@@ -3105,6 +3471,7 @@ pub(crate) mod tests {
         let error = run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &prompt,
             &ImportOptions::default(),
         )
@@ -3131,6 +3498,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&flagged),
         )
@@ -3160,6 +3528,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &prompt,
             &ImportOptions::default(),
         )
@@ -3184,6 +3553,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &prompt,
             &ImportOptions::default(),
         )
@@ -3213,6 +3583,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &prompt,
             &ImportOptions::default(),
         )
@@ -3251,9 +3622,9 @@ pub(crate) mod tests {
             ),
             ("--terrain", "self-check bail", "terrain", "--nav"),
             (
-                "import-class-spells.sh",
-                "requested 31 ids but matched 30",
-                "class spells",
+                "--spells --apply",
+                "client spell parse failed",
+                "full Spell.dbc",
                 "debug_repair_after_publish",
             ),
         ] {
@@ -3261,6 +3632,7 @@ pub(crate) mod tests {
             let error = run_world(
                 &project,
                 &stack.runner(),
+                &FakeHttp::new(),
                 &ScriptedPrompt::new(&[]),
                 &accepted(&data),
             )
@@ -3291,6 +3663,7 @@ pub(crate) mod tests {
         let error = run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -3321,6 +3694,7 @@ pub(crate) mod tests {
         let error = run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -3332,11 +3706,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_checkout_without_the_import_tooling_says_so_before_consent_is_spent() {
-        for missing in [
-            "pull-classic-db.sh",
-            "import-class-spells.sh",
-            "import-manifest.sh",
-        ] {
+        for missing in ["pull-classic-db.sh", "import-manifest.sh"] {
             let tmp = TempDir::new().unwrap();
             let project = checkout(&tmp);
             std::fs::remove_file(
@@ -3352,6 +3722,7 @@ pub(crate) mod tests {
             let error = run_world(
                 &project,
                 &stack.runner(),
+                &FakeHttp::new(),
                 &ScriptedPrompt::new(&[]),
                 &accepted(&data),
             )
@@ -3378,6 +3749,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -3404,6 +3776,7 @@ pub(crate) mod tests {
                 let error = run_world(
                     &project,
                     &stack.runner(),
+                    &FakeHttp::new(),
                     &ScriptedPrompt::new(&[]),
                     &accepted(&data),
                 )
@@ -3437,6 +3810,7 @@ pub(crate) mod tests {
             let error = run_world(
                 &project,
                 &stack.runner(),
+                &FakeHttp::new(),
                 &ScriptedPrompt::new(&[]),
                 &accepted(&data),
             )
@@ -3465,6 +3839,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -3485,6 +3860,7 @@ pub(crate) mod tests {
             let error = run_world(
                 &project,
                 &stack.runner(),
+                &FakeHttp::new(),
                 &ScriptedPrompt::new(&[]),
                 &accepted(&data),
             )
@@ -3512,6 +3888,7 @@ pub(crate) mod tests {
         let error = run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -3536,6 +3913,7 @@ pub(crate) mod tests {
         let error = run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -3563,6 +3941,7 @@ pub(crate) mod tests {
         let error = run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )
@@ -3585,6 +3964,7 @@ pub(crate) mod tests {
         run_world(
             &project,
             &stack.runner(),
+            &FakeHttp::new(),
             &ScriptedPrompt::new(&[]),
             &accepted(&data),
         )

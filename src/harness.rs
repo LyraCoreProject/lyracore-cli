@@ -57,14 +57,6 @@ impl Harness {
         self.dir.join(ProjectLayout::HARNESS_SMOKE_SEAM)
     }
 
-    /// A full-suite entrypoint, if the release carries one. Historically this script lived in the
-    /// SERVER repo (`adapters/lyracore/run-suite.sh`); a release that has absorbed it is preferred
-    /// over driving the seam directly, because then the harness owns its own orchestration.
-    pub fn suite_script(&self) -> Option<PathBuf> {
-        let path = self.dir.join(ProjectLayout::HARNESS_SUITE_SCRIPT);
-        path.is_file().then_some(path)
-    }
-
     pub fn manifest(&self) -> PathBuf {
         self.dir.join("Cargo.toml")
     }

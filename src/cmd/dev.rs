@@ -1,6 +1,6 @@
 //! The local realm lifecycle: `dev up | status | logs | smoke | down`.
 //!
-//! Scope is the seeded loopback fixture, which since #11 is **sharded by default**: four databases
+//! Scope is the local Realm, which since #11 is **sharded by default**: four databases
 //! — the default world shard, the map-1 shard, the instance pool (#108) and realm-core
 //! (`Topology::Sharded`), one per production tier in core `docs/architecture.md` §3.1. `dev up
 //! --single` is the pre-#11 one-database fixture, unchanged down to the hard unset of every
@@ -21,8 +21,9 @@
 //! database rather than the default one.
 
 use crate::cmd::{
+    account,
     gateway_log::{connected_shards, CONNECTED_MARKER},
-    preflight, publish,
+    import, preflight, publish,
 };
 use crate::harness::{self, Harness};
 use crate::http::HttpClient;
@@ -198,12 +199,26 @@ impl DevManager {
             &ProjectLayout::stdb_uri(),
         )?;
         self.claim_operator(runner, http, &credential)?;
+        for shard in self.topology.databases() {
+            call_as_operator(
+                &self.project,
+                runner,
+                http,
+                &credential,
+                shard,
+                "debug_repair_after_publish",
+                &[],
+            )
+            .map_err(|error| operator_call_failure(&self.project, shard, error))?;
+        }
+        self.provision_realm(runner, http, &credential)?;
         self.ensure_gateway(runner, inspector, &gateway, &credential)?;
 
         // Before the verification, so a realm that came up wrong is still one `dev down` can stop.
         self.state.save(&self.project.state_file())?;
         self.verify_topology()?;
-        println!("✓ dev stack is up.");
+        println!("✓ dev stack is up for Account provisioning and world import.");
+        println!("  Before play, run `lyracore import`, then `lyracore dev check`.");
         if let ClientBind::Lan(ip) = &self.bind {
             println!(
                 "  LAN mode: clients on this network use realmlist {ip}. SpacetimeDB stays on \
@@ -394,6 +409,36 @@ impl DevManager {
             })?;
         }
         Ok(())
+    }
+
+    fn provision_realm(
+        &self,
+        runner: &dyn ProcessRunner,
+        http: &dyn HttpClient,
+        credential: &Credential,
+    ) -> Result<()> {
+        let shard = ProjectLayout::DATABASE;
+        call_as_operator(
+            &self.project,
+            runner,
+            http,
+            credential,
+            shard,
+            "provision_realm",
+            &[
+                serde_json::json!(1),
+                serde_json::json!("LyraCore"),
+                serde_json::json!(ProjectLayout::realm_address(&self.bind)),
+                serde_json::json!(0),
+                serde_json::json!(1),
+            ],
+        )
+        .map_err(|error| operator_call_failure(&self.project, shard, error))?;
+        Ok(())
+    }
+
+    pub fn check(&self, runner: &dyn ProcessRunner, http: &dyn HttpClient) -> Result<()> {
+        import::run_check(&self.project, runner, http, &[])
     }
 
     // ---- the realised topology ----
@@ -728,19 +773,16 @@ impl DevManager {
 
     // ---- smoke ----
 
-    /// Hand off to the pinned wire harness's generic login smoke (#246): logon → world handshake →
-    /// character enumerate → enter world, against the running fixture.
-    ///
-    /// The harness is a separate, server-agnostic repository consumed as the RELEASE pinned in
-    /// `.wire-harness-rev`, and everything below the seam — the fixtures, the scenarios, the
-    /// assertions — belongs to it. What changed with the CLI absorbing the lifecycle scripts is
-    /// only WHERE the seam is resolved from: the pinned harness checkout in `.lyracore/`, not a
-    /// `adapters/` directory in the server repo. The server repo's copy was the last thing making
-    /// `dev smoke` depend on a directory the public mirror does not carry.
+    /// Check imported content, then run login and world entry through the pinned Headless Client.
+    /// Request the Account password only after the local processes, content and client build pass.
     pub fn smoke(
         &self,
         runner: &dyn ProcessRunner,
         inspector: &dyn ProcessInspector,
+        http: &dyn HttpClient,
+        account_name: &str,
+        character: &str,
+        password: impl FnOnce() -> Result<zeroize::Zeroizing<Vec<u8>>>,
     ) -> Result<()> {
         for component in Component::ALL {
             match self.status_for(component, inspector) {
@@ -761,6 +803,8 @@ impl DevManager {
             }
         }
 
+        self.check(runner, http)?;
+
         // Resolved AFTER the stack check, so a `dev smoke` against a stopped stack does not clone
         // a harness release to tell you to run `dev up`.
         let harness = harness::resolve(
@@ -772,16 +816,21 @@ impl DevManager {
         println!("· building the wire client from the pinned harness...");
         runner.run_and_wait(&client_build_command(&harness))?;
 
-        println!("· running the pinned wire harness's login smoke...");
-        runner
-            .run_streaming(&smoke_command(&self.project, &harness, &self.bind))
-            .map_err(|e| {
+        println!("· running the pinned Headless Client's login smoke...");
+        let password = password()?;
+        account::validate(&password)?;
+        let output = runner
+            .run_with_secret_stdin(
+                &smoke_command(&harness, &self.bind, account_name, character),
+                &password,
+            )
+            .map_err(|error| {
                 Error::Process(format!(
-                "{e}\n  The smoke test signs in as the fixture account. If it failed to log in, \
-                 provision it first:\n    printf 'test123' | ./lyracore account create TEST \
-                 --password-stdin"
-            ))
+                    "{error}\n  Check the Account credentials and imported start content. \
+             Provision the Account with `lyracore account create {account_name}`."
+                ))
             })?;
+        print!("{output}");
         println!("✓ smoke passed.");
         Ok(())
     }
@@ -916,11 +965,7 @@ fn gateway_command(
         .env("LYRACORE_SPACETIMEDB_URL", ProjectLayout::stdb_uri())
         .env("LYRACORE_LOGON_BIND", ProjectLayout::logon_bind(bind))
         .env("LYRACORE_WORLD_BIND", ProjectLayout::world_bind(bind))
-        // The realm list is answered from the seeded `game_realm` row, which says 127.0.0.1 — a
-        // client that reached the logon tier over the LAN would be sent to its OWN loopback for
-        // the world tier. This override is what makes `--lan` a working realm rather than a
-        // working handshake. It is set in loopback mode too, so the advertised address is a
-        // property of how the CLI launched the gateway and not of a row someone may have edited.
+        // The advertised address follows the client listener in loopback and LAN modes.
         .env("LYRACORE_REALM_ADDRESS", ProjectLayout::realm_address(bind))
         .env("LYRACORE_AOI", "1")
         .env("MALLOC_ARENA_MAX", "2")
@@ -947,6 +992,34 @@ pub(crate) fn reducer_url(database: &str, reducer: &str) -> String {
         "{}/v1/database/{database}/call/{reducer}",
         ProjectLayout::stdb_uri()
     )
+}
+
+pub(crate) fn call_as_operator(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    http: &dyn HttpClient,
+    credential: &Credential,
+    shard: &str,
+    reducer: &str,
+    args: &[serde_json::Value],
+) -> Result<String> {
+    if credential.is_server_issued() {
+        let body =
+            serde_json::to_string(args).map_err(|error| Error::Process(error.to_string()))?;
+        return http.post_json(
+            &reducer_url(shard, reducer),
+            Some(credential.token()),
+            &body,
+        );
+    }
+    let mut command = import::call_command(project, shard, reducer);
+    for value in args {
+        command = command.arg(match value {
+            serde_json::Value::String(text) => text.clone(),
+            value => value.to_string(),
+        });
+    }
+    runner.run_and_wait(&command)
 }
 
 /// What to do about a failed call to an operator-gated reducer, keeping the node's own message.
@@ -1012,35 +1085,23 @@ fn client_build_command(harness: &Harness) -> CommandSpec {
         .arg(ProjectLayout::HARNESS_CLIENT_BIN)
 }
 
-/// `dev smoke` — the pinned harness's own seam, told which database and gateway this fixture is
-/// and (in LAN mode) which host to connect to. Everything below it belongs to the harness.
-///
-/// A release that carries its own suite entrypoint is driven through that; otherwise the generic
-/// login smoke is driven straight through the adapter seam, which is precisely what the server
-/// repo's `run-suite.sh --smoke` did with the flags it was given.
-fn smoke_command(project: &ProjectLayout, harness: &Harness, bind: &ClientBind) -> CommandSpec {
-    let base = match harness.suite_script() {
-        Some(suite) => CommandSpec::new("bash")
-            .arg(suite.to_string_lossy().to_string())
-            .arg("--smoke")
-            .arg("--database")
-            .arg(ProjectLayout::DATABASE)
-            .arg("--gateway")
-            .arg(project.gateway_bin().to_string_lossy().to_string()),
-        None => CommandSpec::new("bash")
-            .arg(harness.smoke_seam().to_string_lossy().to_string())
-            .arg(ProjectLayout::SMOKE_ACCOUNT)
-            .arg(ProjectLayout::SMOKE_CHARACTER),
-    };
-    base.env(
-        "WIRE_BIN",
-        harness.client_bin().to_string_lossy().to_string(),
-    )
-    .env("WIRE_HOST", bind.host())
-    // The harness resolves TWO roots and this is the one it cannot guess from its own
-    // location: it now lives under `.lyracore/`, not inside the checkout it is testing.
-    .env("LYRACORE_DIR", project.root.to_string_lossy().to_string())
-    .env("DB", ProjectLayout::DATABASE)
+/// The Headless Client takes the Account password through stdin. Suite scripts can restore
+/// fixture content, so local smoke uses the client directly with explicit Account credentials.
+fn smoke_command(
+    harness: &Harness,
+    bind: &ClientBind,
+    account_name: &str,
+    character: &str,
+) -> CommandSpec {
+    CommandSpec::new(harness.client_bin().to_string_lossy().to_string())
+        .arg("smoke")
+        .arg("--account")
+        .arg(account_name)
+        .arg("--character")
+        .arg(character)
+        .arg("--password-stdin")
+        .arg("--host")
+        .arg(bind.host())
 }
 
 fn classify(
@@ -1275,8 +1336,7 @@ mod tests {
             gateway.env_value("LYRACORE_WORLD_BIND"),
             Some("192.168.1.50:8085")
         );
-        // The realm list must send the client to an address it can reach — the seeded
-        // `game_realm` row says 127.0.0.1, which is the client's OWN machine over the LAN.
+        // The Realm advertises the address where its client listener runs.
         assert_eq!(
             gateway.env_value("LYRACORE_REALM_ADDRESS"),
             Some("192.168.1.50:8085")
@@ -1296,7 +1356,11 @@ mod tests {
             vec!["spacetime start --listen-addr 127.0.0.1:3000"]
         );
         assert!(
-            !stack.rendered().iter().any(|r| r.contains("192.168.1.50")),
+            !stack
+                .rendered()
+                .iter()
+                .filter(|r| !r.contains("provision_realm"))
+                .any(|r| r.contains("192.168.1.50")),
             "no LAN address may reach the database tier: {:?}",
             stack.rendered()
         );
@@ -1465,9 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn smoke_runs_the_seam_out_of_the_pinned_harness_checkout_not_the_server_repo() {
-        // #246 + the mirror: `adapters/` is not a directory the published repository carries, so
-        // resolving the seam relative to the checkout would make `dev smoke` unrunnable there.
+    fn smoke_runs_the_pinned_headless_client_with_explicit_credentials() {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project_with_harness(&tmp)).unwrap();
         let stack = harness_stack();
@@ -1480,13 +1542,24 @@ mod tests {
         )
         .unwrap();
 
-        dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
+        dev.smoke(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            "ALICE",
+            "Ginger",
+            || Ok(zeroize::Zeroizing::new(b"test-secret".to_vec())),
+        )
+        .unwrap();
 
         let smoke: Vec<CommandSpec> = stack
             .calls()
             .into_iter()
             .filter_map(|call| match call {
-                Call::Stream(spec) if spec.render().contains("adapters/lyracore") => Some(spec),
+                Call::SecretStdin { spec, secret } => {
+                    assert_eq!(secret, b"test-secret");
+                    Some(spec)
+                }
                 _ => None,
             })
             .collect();
@@ -1497,19 +1570,14 @@ mod tests {
             "the seam must come from the pinned cache: {rendered}"
         );
         assert!(
-            rendered.contains(ProjectLayout::HARNESS_SMOKE_SEAM),
+            rendered.contains(ProjectLayout::HARNESS_CLIENT_BIN),
             "{rendered}"
         );
         assert!(
             !rendered.starts_with(&tmp.path().join("adapters").display().to_string()),
             "nothing may be resolved out of the server repo's adapters/: {rendered}"
         );
-        assert_eq!(smoke[0].env_value("WIRE_HOST"), Some("127.0.0.1"));
-        assert_eq!(
-            smoke[0].env_value("LYRACORE_DIR"),
-            Some(dev.project.root.to_string_lossy().to_string()).as_deref(),
-            "the harness resolves two roots; this is the one it cannot guess"
-        );
+        assert!(rendered.contains("--host 127.0.0.1"), "{rendered}");
         // The client is built from the HARNESS's manifest, never this workspace's.
         let built = stack
             .rendered()
@@ -1523,15 +1591,11 @@ mod tests {
     }
 
     #[test]
-    fn a_release_that_carries_its_own_suite_entrypoint_is_preferred() {
+    fn smoke_never_runs_a_suite_that_can_restore_fixture_content() {
         let tmp = TempDir::new().unwrap();
         let project = project_with_harness(&tmp);
         let cached = project.harness_cache().join(HARNESS_SHA);
-        std::fs::write(
-            cached.join(ProjectLayout::HARNESS_SUITE_SCRIPT),
-            "#!/bin/sh\n",
-        )
-        .unwrap();
+        std::fs::write(cached.join("adapters/lyracore/run-suite.sh"), "#!/bin/sh\n").unwrap();
         let mut dev = DevManager::new(project).unwrap();
         let stack = harness_stack();
         dev.up(
@@ -1543,12 +1607,22 @@ mod tests {
         )
         .unwrap();
 
-        dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
+        dev.smoke(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            "ALICE",
+            "Ginger",
+            || Ok(zeroize::Zeroizing::new(b"test-secret".to_vec())),
+        )
+        .unwrap();
         let harness = resolved_harness(&dev.project, &stack);
-        let rendered = smoke_command(&dev.project, &harness, &dev.bind).render();
-        assert!(rendered.contains("run-suite.sh"), "{rendered}");
-        assert!(rendered.contains("--smoke"), "{rendered}");
-        assert!(rendered.contains("--database lyracore"), "{rendered}");
+        let rendered = smoke_command(&harness, &dev.bind, "ALICE", "Ginger").render();
+        assert!(!rendered.contains("run-suite.sh"), "{rendered}");
+        assert!(
+            rendered.contains("smoke --account ALICE --character Ginger --password-stdin"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1565,12 +1639,19 @@ mod tests {
         )
         .unwrap();
 
-        dev.smoke(&stack.runner(), &stack.inspector()).unwrap();
+        dev.smoke(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            "ALICE",
+            "Ginger",
+            || Ok(zeroize::Zeroizing::new(b"test-secret".to_vec())),
+        )
+        .unwrap();
         let harness = resolved_harness(&dev.project, &stack);
-        assert_eq!(
-            smoke_command(&dev.project, &harness, &dev.bind).env_value("WIRE_HOST"),
-            Some("192.168.1.50")
-        );
+        assert!(smoke_command(&harness, &dev.bind, "ALICE", "Ginger")
+            .render()
+            .contains("--host 192.168.1.50"));
     }
 
     #[test]
@@ -1579,7 +1660,16 @@ mod tests {
         let dev = DevManager::new(project_with_harness(&tmp)).unwrap();
         let stack = harness_stack();
 
-        let error = dev.smoke(&stack.runner(), &stack.inspector()).unwrap_err();
+        let error = dev
+            .smoke(
+                &stack.runner(),
+                &stack.inspector(),
+                &FakeHttp::new(),
+                "ALICE",
+                "Ginger",
+                || Ok(zeroize::Zeroizing::new(b"test-secret".to_vec())),
+            )
+            .unwrap_err();
         assert!(
             error.to_string().contains("lyracore dev up"),
             "must name the fix: {error}"
@@ -1604,7 +1694,16 @@ mod tests {
             Topology::Single,
         )
         .unwrap();
-        let error = dev.smoke(&stack.runner(), &stack.inspector()).unwrap_err();
+        let error = dev
+            .smoke(
+                &stack.runner(),
+                &stack.inspector(),
+                &FakeHttp::new(),
+                "ALICE",
+                "Ginger",
+                || Ok(zeroize::Zeroizing::new(b"test-secret".to_vec())),
+            )
+            .unwrap_err();
         assert!(
             error.to_string().contains(ProjectLayout::WIRE_HARNESS_PIN),
             "{error}"
@@ -1612,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_smoke_points_at_the_fixture_account() {
+    fn a_failing_smoke_names_the_selected_account() {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project_with_harness(&tmp)).unwrap();
         let stack = harness_stack();
@@ -1627,15 +1726,83 @@ mod tests {
 
         let failing = harness_stack()
             .with_process(4001, "x")
-            .fail_on(ProjectLayout::HARNESS_SMOKE_SEAM, "logon failed");
+            .fail_on("smoke --account", "logon failed");
         // Reuse the running stack's view of the world, but a runner that fails the harness.
         let error = dev
-            .smoke(&failing.runner(), &stack.inspector())
+            .smoke(
+                &failing.runner(),
+                &stack.inspector(),
+                &FakeHttp::new(),
+                "ALICE",
+                "Ginger",
+                || Ok(zeroize::Zeroizing::new(b"test-secret".to_vec())),
+            )
             .unwrap_err();
         assert!(
-            error.to_string().contains("account create TEST"),
-            "the most common smoke failure is an unprovisioned fixture account: {error}"
+            error.to_string().contains("account create ALICE"),
+            "the diagnostic must name the selected Account: {error}"
         );
+    }
+
+    #[test]
+    fn smoke_stops_before_password_or_client_build_when_content_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project_with_harness(&tmp)).unwrap();
+        let stack = harness_stack();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+            Topology::Single,
+        )
+        .unwrap();
+        let missing = harness_stack().fail_on(
+            "check_world_content",
+            "missing imported Hearthstone item 6948",
+        );
+        let error = dev
+            .smoke(
+                &missing.runner(),
+                &stack.inspector(),
+                &FakeHttp::new(),
+                "ALICE",
+                "Ginger",
+                || panic!("password must not be requested"),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("Hearthstone item 6948"));
+        assert!(!missing
+            .rendered()
+            .iter()
+            .any(|command| command.contains("cargo build")));
+    }
+
+    #[test]
+    fn up_provisions_the_advertisement_as_the_claimed_operator() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new().fail_on("login show", "no login");
+        let http = FakeHttp::new();
+        dev.up(
+            &stack.runner(),
+            &stack.inspector(),
+            &http,
+            lan(),
+            Topology::Sharded,
+        )
+        .unwrap();
+        let calls = calls_to(&http, "provision_realm");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].url.contains("/lyracore/call/"));
+        assert_eq!(calls[0].bearer.as_deref(), Some(MINTED_TOKEN));
+        assert_eq!(calls[0].body, r#"[1,"LyraCore","192.168.1.50:8085",0,1]"#);
+        assert_eq!(calls_to(&http, "debug_repair_after_publish").len(), 4);
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|command| command.contains("provision_account")
+                || command.contains("restore_taxi_fixture")));
     }
 
     // ---- database health ----

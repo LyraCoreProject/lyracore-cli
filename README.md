@@ -21,8 +21,11 @@ From the Core checkout root:
 ```bash
 ./lyracore doctor
 ./lyracore dev up
-./lyracore account create TEST
+./lyracore account create ALICE
+./lyracore import
+./lyracore dev check
 ./lyracore dev status
+lyracore dev check
 ```
 
 The global `lyracore` launcher supplied by Core's installer also works from a checkout subdirectory.
@@ -47,8 +50,9 @@ lyracore preflight
 lyracore publish [DATABASE ...] [--skip-preflight]
 lyracore dev up [--single] [--lan <IP>]
 lyracore dev status
+lyracore dev check
 lyracore dev logs [spacetime|gateway]
-lyracore dev smoke
+lyracore dev smoke ACCOUNT CHARACTER [--password-stdin]
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
 lyracore character gm NAME true|false
@@ -62,6 +66,7 @@ lyracore config
 lyracore config set client-data PATH
 lyracore import [--client-data PATH] [--accept] [--profile-shard PROFILE=SHARD ...]
 lyracore import world [--client-data PATH] [--accept] [--profile-shard PROFILE=SHARD ...]
+lyracore import check [--profile-shard PROFILE=SHARD ...]
 lyracore import vmaps [--client-data PATH] [--profile-shard PROFILE=SHARD ...]
 lyracore client sync
 lyracore client pack --out DIR [--zip]
@@ -108,8 +113,13 @@ explicit `--client-data PATH` first, then the saved path, then asks for one.
 
 With the realm running, `import` fetches the pinned cMaNGOS `classic-db` world data and combines
 it with your own 1.12.1 client's archives. It imports the supported Alliance early-game areas and
-Deadmines, including world content, DBCs, terrain, and navigation. It replaces the seeded content
-in the affected Import Families. You do not need a running MaNGOS installation.
+Deadmines, including world content, DBCs, terrain, and navigation. Playable worlds require
+imported content. A fresh publish contains configuration and runtime schedules only. It creates
+no Accounts, Characters, or game catalogue. You do not need a running MaNGOS installation.
+
+Server-issued Operator credentials reach importer subprocesses through a temporary SpacetimeDB
+CLI config with owner-only permissions. The CLI removes that config when the import ends. The
+global SpacetimeDB login stays intact.
 
 The command asks for consent on every run. For a scripted run:
 
@@ -215,8 +225,8 @@ created by this command before it can be replaced.
 ## Grant Character GM access
 
 ```bash
-lyracore character gm Tester true
-lyracore character gm Tester false
+lyracore character gm Ginger true
+lyracore character gm Ginger false
 ```
 
 The command searches the fixture's World Shards for the named Character and uses the coordinator
@@ -466,34 +476,29 @@ server to the internet" should not be one mistyped character away from "let my f
 A running gateway cannot be rebound: switching modes is refused with the `dev down` to run first,
 rather than reporting "already up" for a realm that is not listening where you asked.
 
-### `dev smoke`
+### `dev check` and `dev smoke`
 
-Runs the pinned wire harness's generic login smoke — logon, world handshake, character enumerate,
-enter world — against the running fixture.
-
-The harness is a separate, server-agnostic repository consumed as the RELEASE pinned in the
-checkout's `.wire-harness-rev` (`<tag> <full sha>`), and this CLI owns the consume path:
-
-* the **tag** is what is cloned — a release, never a branch, and there is deliberately no way to say
-  `main`;
-* the **sha** is what the checkout is then verified against, because a tag is a mutable ref and
-  "pinned to a tag someone moved" is not pinned. A mismatch is reported as a supply-chain event, not
-  a stale cache;
-* the clone lands in the git-ignored `.lyracore/wire-harness/<sha>/`. The
-  [wire-harness repository](https://github.com/LyraCoreProject/wire-harness) is public and fetched
-  over HTTPS, so no GitHub account or SSH key is needed;
-* `LYRACORE_WIRE_HARNESS_DIR=/path/to/wire-harness` overrides all of that with a local working tree.
-  It is validated, and announced on stderr every time — a stale local checkout silently substituted
-  for the pin is a measurement nobody can reproduce.
-
-The seam is resolved **inside that pinned checkout**, not from an `adapters/` directory in the
-server repo. The wire client is built from the harness's own manifest.
-
-It signs in as the fixture account, so provision that first:
+`lyracore dev check` asks the Module to check imported content on each World Shard and the
+Instance Pool. It checks completed imports and actual content dependencies. It reports all
+missing destinations and changes no content. `dev status` reports processes and published
+Shards; `preflight` checks the build offline.
 
 ```bash
-printf 'test123' | lyracore account create TEST --password-stdin
+lyracore account create ALICE
+lyracore import
+lyracore dev check
+lyracore dev smoke ALICE Ginger
 ```
+
+Smoke reads your Account password from a hidden terminal prompt, or from stdin with
+`--password-stdin`. It checks content before requesting the password. It builds the Headless
+Client from the release pinned in Core's `.wire-harness-rev`, verifies its commit, and runs
+login, Character enumeration and world entry. The client creates the named Human Warrior if
+it does not exist. That Character uses imported starting content.
+
+The release cache is `.lyracore/wire-harness/<sha>/`. Set `LYRACORE_WIRE_HARNESS_DIR` to use a
+local checkout; the CLI reports that override on every run. Smoke uses the local Realm's
+recorded client address, including LAN mode.
 
 ### Not the production topology
 
@@ -578,7 +583,7 @@ stdin and never becomes a command-line argument, so `ps` shows only the username
 zeroized buffer and is absent from rendered commands, logs, error messages, and `state.json`.
 
 ```bash
-printf 'hunter2' | lyracore account create TEST --password-stdin
+printf 'hunter2' | lyracore account create ALICE --password-stdin
 ```
 
 On a sharded realm the account is written **twice** — once on the world shard, whose account id owns

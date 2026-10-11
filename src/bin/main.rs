@@ -71,9 +71,20 @@ fn run(args: &[String]) -> Result<i32> {
             let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
             dev.status(&runner, &inspector).map(|_| EXIT_OK)
         }
-        Command::DevSmoke => {
+        Command::DevCheck => {
             let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
-            dev.smoke(&runner, &inspector).map(|_| EXIT_OK)
+            dev.check(&runner, &http).map(|_| EXIT_OK)
+        }
+        Command::DevSmoke {
+            account,
+            character,
+            source,
+        } => {
+            let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
+            dev.smoke(&runner, &inspector, &http, &account, &character, || {
+                cmd::account::read_password(source)
+            })
+            .map(|_| EXIT_OK)
         }
         Command::DevLogs(component) => {
             let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
@@ -83,9 +94,14 @@ fn run(args: &[String]) -> Result<i32> {
             let mut dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
             dev.down(&runner, &inspector, forget).map(|_| EXIT_OK)
         }
+        Command::ImportCheck { profile_shards } => {
+            cmd::import::run_check(&ProjectLayout::discover()?, &runner, &http, &profile_shards)
+                .map(|_| EXIT_OK)
+        }
         Command::ImportWorld(options) => cmd::import::run_world(
             &ProjectLayout::discover()?,
             &runner,
+            &http,
             &cmd::import::TtyPrompt::import_world(),
             &options,
         )

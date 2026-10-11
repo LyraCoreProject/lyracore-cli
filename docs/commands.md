@@ -51,8 +51,9 @@ lyracore preflight
 lyracore publish [DATABASE ...] [--skip-preflight]
 lyracore dev up [--lan <IP>]
 lyracore dev status
+lyracore dev check
 lyracore dev logs [spacetime|gateway]
-lyracore dev smoke
+lyracore dev smoke ACCOUNT CHARACTER [--password-stdin]
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
 lyracore account alpha-test-tools enrollment REALM_CORE [true|false]
@@ -87,11 +88,13 @@ lyracore update
 | `dev up` | start (or reuse) the loopback fixture — four databases: two world shards, the instance pool, realm-core (`--single` for one) |
 | `dev status` | process identity, endpoint, and whether the database is actually published |
 | `dev logs` | tail the components this CLI started |
-| `dev smoke` | the pinned wire harness's generic login smoke against the running fixture |
+| `dev smoke` | check content, then log in with your chosen Account and Character through the pinned Headless Client |
+| `dev check` | check imported content on each local World Shard and Instance Pool |
+| `import check` | check imported content using explicit World Import Profile assignments |
 | `dev down` | stop only the processes this CLI started, and only if the PID is still ours |
 | `account create` | provision an account's SRP6 credentials without a password in `argv` |
 | `account alpha-test-tools` | read or set automatic enrollment, or grant or revoke one Account |
-| `import` | replace the seed fixture with the real world — consent notice, then the ETL on every database the fixture populates |
+| `import` | import playable content into each selected World Shard and Instance Pool after consent |
 | `config` | show, or set, the client-data path `import` and `doctor` remember |
 | `client sync` | pack `patch-3.MPQ` and every enabled Package's addons, then install them into the configured client |
 | `client pack` | build the Client Artifact a player installs: package-authored content only, into a directory of your choosing |
@@ -144,6 +147,10 @@ directory, and build `lyracore-importer`. Each content destination then has thre
 run its importer modes, re-arm its schedules and gather pools, and run profile-aware Verification.
 That is six displayed stages under `--single` and twelve on the sharded fixture.
 
+Server-issued Operator credentials reach importer subprocesses through a temporary SpacetimeDB
+CLI config with owner-only permissions. The CLI removes that config when the import ends. The
+global SpacetimeDB login stays intact.
+
 The sharded destination plan is fixed:
 
 | Destination | Profile | Spatial result |
@@ -153,8 +160,7 @@ The sharded destination plan is fixed:
 | `lyracore-instances` | `instances` | whole map 36, with no open-world terrain or navigation pass |
 
 The single topology uses `alliance-single`, the union of those bounded continent slices and map 36.
-Every importer child names its destination and loopback SpacetimeDB endpoint. The curated
-`import-class-spells.sh` pass receives both through explicit environment variables. The full
+Every importer child names its destination and loopback SpacetimeDB endpoint. The full
 Spell.dbc catalogue already supplies caster spells, so Verification derives every referenced
 caster spell from `game_creature_cast` and `game_creature_spell` instead of maintaining an
 independent allowlist.
@@ -969,11 +975,27 @@ The credential reaches a child as an environment variable, never argv, and the n
 `Authorization` header, never a URL — so it is absent from rendered commands, logs, errors and
 `state.json`. Its only on-disk copy is the `0600` file above.
 
-The realm it brings up is **playable without a client-data import**: the module's `init` reducer
-seeds the realm row, the Human-Warrior start position, the graveyards, the `TEST` account and its
-character, and a small demo population. `./lyracore import` (which needs a world-database dump it
-pulls for you and client data you already own) is what turns that into the Alliance Human,
-Dwarf/Gnome and Night Elf early-game corridors, and it is not a prerequisite for logging in.
+A fresh Module creates configuration and runtime schedules. `dev up` claims the Operator on
+each Shard, repairs schedules, provisions the Realm advertisement on the default World Shard,
+and starts the Gateway. It creates no Accounts, Characters, or playable content.
+
+Provision your Account, import your world, and check content before play:
+
+```bash
+./lyracore account create ALICE
+./lyracore import
+./lyracore dev check
+```
+
+`dev check` asks each World Shard and Instance Pool to check its completed import and actual
+content dependencies. It reports missing content with the Module's diagnostic. Realm-core
+needs no spatial content. The command changes no content and is separate from offline
+`preflight` and the process status in `dev status`.
+
+Use `./lyracore import check --profile-shard PROFILE=SHARD ...` to check the same explicit
+assignments you supplied to `import world`. The import clears prior completion before each
+destination's first mode. It completes that destination only after all modes, schedule repair,
+profile floors, and dependency checks pass. A failed import stays unavailable for play.
 
 ### `--lan <IP>` — let another machine on your network in
 
@@ -983,47 +1005,35 @@ Dwarf/Gnome and Night Elf early-game corridors, and it is not a prerequisite for
 
 This binds the two **client-facing** listeners — logon 3724 and world 8085 — to that address, and
 makes the realm list advertise it (`LYRACORE_REALM_ADDRESS`, read by `gateway/src/config.rs`). Both
-halves matter: the seeded `game_realm` row says `127.0.0.1:8085`, so a client that logged in over
-the LAN would otherwise be told to open its world connection to *its own* loopback — a realm that
-authenticates and then goes nowhere.
+The CLI provisions `game_realm` with the address of the client listener.
 
 **SpacetimeDB does not move.** It stays on `127.0.0.1:3000` in every mode. The address must be
 private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`); a public address or `0.0.0.0` is a usage
 error, not a wildcard bind. A running gateway cannot be rebound — switching modes is refused, with
 the `dev down` to run first, rather than reported as "already up".
 
-This is a LAN convenience for a contributor fixture, not a deployment mode: no rate limiting, no
-TLS, 2004-era password hashing, and a `TEST` account whose password is in this document.
+LAN mode supports local development. It uses the Accounts and passwords you provision.
 
 ### `dev smoke`
 
 ```bash
-printf 'test123' | ./lyracore account create TEST --password-stdin   # once
-./lyracore dev smoke
+./lyracore dev check
+./lyracore dev smoke ALICE Ginger
 ```
 
-Runs the pinned wire harness's generic login smoke — logon → world handshake → character enumerate
-→ enter world — against the running fixture.
+Smoke checks the local World's content before it builds or runs the pinned Headless Client.
+It reads the Account password from a hidden terminal prompt. Use `--password-stdin` to supply
+one line through stdin. The password stays out of command arguments, logs and runtime state.
 
-**Where the harness comes from:** the CLI resolves it itself, from the release pinned in
-`.wire-harness-rev` — the same semantics the maintainers' internal `wire-harness.sh` script
-implements, and the same cache directory. It clones the pinned **tag** (a branch is refused as a
-pin) into the git-ignored `.lyracore/wire-harness/<sha>/`, then **verifies HEAD is the recorded
-sha**; a tag that has been re-pointed is reported as a supply-chain event, not a stale cache. It
-then builds `vanilla-wire` from the harness's own manifest and runs the harness's adapter seam out
-of that checkout.
+The CLI clones the release tag from `.wire-harness-rev` into `.lyracore/wire-harness/<sha>/`
+and verifies its commit. It builds `vanilla-wire` from that checkout, then runs login,
+Character enumeration and world entry with your chosen Account and Character. If the named
+Character is missing, the client creates a Human Warrior using imported starting content.
+It performs no fixture restoration or automatic Account provisioning.
 
-That is the one behavioural change here: `dev smoke` used to hand off to an internal
-`adapters/lyracore/run-suite.sh` wrapper, and now it does not touch it at all. That wrapper still
-exists, in the maintainers' own working tree, for running the **full** suite by hand; it is only
-`dev smoke` that no longer needs it.
-
-`LYRACORE_WIRE_HARNESS_DIR=/path/to/wire-harness` still overrides the pin with a local working tree.
-The CLI validates it and announces it on stderr every single time, because a stale local checkout
-silently substituted for the pin is a measurement nobody can reproduce.
-
-It refuses to run against a stack that is not up, and in `--lan` mode it connects to the LAN
-address rather than loopback.
+`LYRACORE_WIRE_HARNESS_DIR=/path/to/wire-harness` selects a local checkout. The CLI reports the
+override each time. Smoke requires running local processes and uses the recorded client
+address, including LAN mode.
 
 ### Sharded out of the box, on purpose
 
@@ -1048,7 +1058,7 @@ itself:
 
 | Database | Role |
 | --- | --- |
-| `lyracore` | the default world shard — Eastern Kingdoms, where `init` seeds the fixture content (Northshire Valley) and a new character spawns |
+| `lyracore` | default World Shard for imported Eastern Kingdoms maps and the Realm advertisement |
 | `lyracore-kalimdor` | world shard for map 1, reached via a `LYRACORE_SHARD_MAP` rule |
 | `lyracore-instances` | the instance pool — every dungeon run (map 36, the Deadmines), reached by a second rule of the same shape |
 | `lyracore-realm` | realm-core — accounts and sessions, the character→shard index, load samples |
@@ -1065,9 +1075,8 @@ Eastern Kingdoms stays whole on the default database.
 Three of those four names are production's own, and deliberately: what keeps a fixture off a
 production node is the node it is published to (`-s local`, loopback:3000), never the name.
 
-The fixture does not provide the wider world. **Elwynn beyond Northshire and all of the Kalimdor
-World Shard are empty** until you run `./lyracore import` with a cmangos dump and your own client
-MPQs. The import assigns `alliance-eastern` to `lyracore`, `alliance-kalimdor` to
+All World Shards and the Instance Pool require `./lyracore import` with public world data and
+your own client MPQs before play. The import assigns `alliance-eastern` to `lyracore`, `alliance-kalimdor` to
 `lyracore-kalimdor`, and the instance-only `instances` profile to `lyracore-instances`. The single
 topology receives their union in `lyracore`. Each destination is verified independently after its
 clear-and-reload stages, so rerun the command after fixing a failure.
@@ -1185,7 +1194,7 @@ stdin and never becomes a command-line argument, so `ps` shows only the username
 zeroized buffer, and is absent from rendered commands, logs, error messages, and `state.json`.
 
 ```bash
-printf 'hunter2' | ./lyracore account create TEST --password-stdin
+printf 'hunter2' | ./lyracore account create ALICE --password-stdin
 ```
 
 ## `service reconcile` — make a host match the tracked unit
