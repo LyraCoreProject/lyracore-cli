@@ -745,6 +745,8 @@ pub fn run_vmaps(
         "per-cell collision triangles into this checkout's local database(s). Nothing is fetched"
     );
     println!("from the network, and nothing read here leaves your machine.");
+    println!("This partial import clears content readiness on each changed Shard.");
+    println!("Run a full world import afterward to check dependencies and reopen world entry.");
     println!();
 
     let data = resolve_client_data(project, prompt, options.client_data.as_deref())?;
@@ -808,9 +810,9 @@ pub fn run_vmaps(
             destination.shard
         );
     }
-    println!(
-        "— flipping it is a runtime decision, not part of this import, so it is not done here."
-    );
+    println!("Enabling collision is an explicit runtime choice.");
+    println!("World entry remains closed until a full world import completes with the same profile assignments.");
+    println!("Run `lyracore import world`, then `lyracore import check`.");
     Ok(())
 }
 

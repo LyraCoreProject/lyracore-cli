@@ -1269,3 +1269,5 @@ not just a process restart.
 
 `doctor` exits nonzero only for launch-blocking failures. A busy port is a warning, not a failure —
 it is usually your own running stack.
+
+A separate `import vmaps` clears content readiness on each changed Shard. Complete a full world import with the same profile assignments, then run `import check` before playing.
