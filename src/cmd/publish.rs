@@ -160,6 +160,22 @@ fn describe_command(database: &str) -> CommandSpec {
         .arg(database)
 }
 
+fn database_is_absent(database: &str, error: &Error) -> bool {
+    let Error::SubprocessFailed {
+        code: 1, message, ..
+    } = error
+    else {
+        return false;
+    };
+    // SpacetimeDB 2.7.1 emits this diagnostic only for a name lookup HTTP 404.
+    let diagnostic = message
+        .trim()
+        .strip_prefix("WARNING: This command is UNSTABLE and subject to breaking changes.")
+        .unwrap_or(message.trim())
+        .trim();
+    diagnostic == format!("Error: failed to find database `{database}`.")
+}
+
 fn checkout_has_loot_receipt(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<bool> {
     let prepared = crate::cmd::bindings::ensure(project, runner)?;
     let (schema, errors) = crate::rls::generated_schema(&prepared.directory);
@@ -246,14 +262,16 @@ pub(crate) fn require_loot_roll_upgrade_ready(
     }
 
     for database in databases {
-        let schema = runner
-            .run_and_wait(&describe_command(database))
-            .map_err(|error| {
-                Error::Process(format!(
+        let schema = match runner.run_and_wait(&describe_command(database)) {
+            Ok(schema) => schema,
+            Err(error) if database_is_absent(database, &error) => continue,
+            Err(error) => {
+                return Err(Error::Process(format!(
                     "could not read the deployed schema for '{database}': {error}. Nothing was \
                      published."
-                ))
-            })?;
+                )));
+            }
+        };
         if deployed_has_loot_receipt(database, &schema)? {
             continue;
         }
@@ -561,6 +579,78 @@ mod tests {
                 .count(),
             wanted.len() * LOOT_DRAIN_QUERIES.len()
         );
+    }
+
+    #[test]
+    fn a_new_destination_publishes_without_legacy_drain_queries() {
+        let tmp = TempDir::new().unwrap();
+        let project = loot_receipt_upgrade(&tmp);
+        let stack = FakeStack::new().fail_on(
+            "spacetime describe",
+            "WARNING: This command is UNSTABLE and subject to breaking changes.\n\nError: failed to find database `fresh-realm`.\n",
+        );
+
+        run(&project, &stack.runner(), &names(&["fresh-realm"]), true).unwrap();
+
+        assert!(stack
+            .rendered()
+            .iter()
+            .any(|command| command.starts_with("spacetime publish")));
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|command| command.starts_with("spacetime sql")));
+    }
+
+    #[test]
+    fn an_unreadable_destination_blocks_a_batch_even_after_a_new_destination() {
+        let tmp = TempDir::new().unwrap();
+        let project = loot_receipt_upgrade(&tmp);
+        let stack = FakeStack::new()
+            .fail_on(
+                "local fresh-realm",
+                "Error: failed to find database `fresh-realm`.",
+            )
+            .fail_on("local existing-realm", "connection refused");
+
+        assert!(run(
+            &project,
+            &stack.runner(),
+            &names(&["fresh-realm", "existing-realm"]),
+            true
+        )
+        .is_err());
+        assert!(!stack
+            .rendered()
+            .iter()
+            .any(|command| command.starts_with("spacetime publish")));
+    }
+
+    #[test]
+    fn only_the_exact_destination_lookup_diagnostic_allows_a_fresh_publish() {
+        for message in [
+            "connection refused",
+            "HTTP status client error (404 Not Found)",
+            "Error: failed to find database `other-realm`.",
+            "Error: failed to find database `fresh-realm`.\nCaused by: unauthorized",
+            "Error: inventory unavailable",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let project = loot_receipt_upgrade(&tmp);
+            let stack = FakeStack::new().fail_on("spacetime describe", message);
+
+            assert!(
+                run(&project, &stack.runner(), &names(&["fresh-realm"]), true).is_err(),
+                "{message}"
+            );
+            assert!(
+                !stack
+                    .rendered()
+                    .iter()
+                    .any(|command| command.starts_with("spacetime publish")),
+                "{message}"
+            );
+        }
     }
 
     #[test]
