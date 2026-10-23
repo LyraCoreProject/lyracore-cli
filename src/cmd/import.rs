@@ -1081,6 +1081,8 @@ fn world_etl_commands(
             importer_command(project, database)
                 .arg("--dbc")
                 .arg(&data)
+                .arg("--taxi-mounts")
+                .arg(DUMP_PATH)
                 .arg("--apply"),
         ),
         (
@@ -3080,7 +3082,7 @@ pub(crate) mod tests {
             format!("{importer} --db {db} --server {server} --terrain {data} --world-profile alliance-single --apply"),
             format!("{importer} --db {db} --server {server} --nav {data} --world-profile alliance-single --apply"),
             format!("{importer} --db {db} --server {server} --vmap {data} --world-profile alliance-single --apply"),
-            format!("{importer} --db {db} --server {server} --dbc {data} --apply"),
+            format!("{importer} --db {db} --server {server} --dbc {data} --taxi-mounts {DUMP_PATH} --apply"),
             format!("{importer} --db {db} --server {server} --dbc {data} --talents --apply"),
             format!("{importer} --db {db} --server {server} --dbc {data} --spells --apply"),
         ];
