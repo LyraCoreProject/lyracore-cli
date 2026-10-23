@@ -184,10 +184,23 @@ fn read_store(path: &Path) -> Option<String> {
     (token.len() >= MIN_TOKEN_LEN).then_some(token)
 }
 
-/// Write the minted token so the NEXT run is the same identity.
-///
-/// 0600 from creation: this is the one place in the CLI where a credential touches the disk, and a
-/// checkout lives in a shared machine's home directory as often as not.
+pub(crate) fn retain_native_owner(
+    project: &crate::project::ProjectLayout,
+    credential: Credential,
+) -> Result<Credential> {
+    persist(&project.token_file(), credential.token())?;
+    let value = serde_json::to_string(credential.token())?;
+    persist(
+        &project.native_cli_config(),
+        &format!("spacetimedb_token = {value}"),
+    )?;
+    Ok(Credential {
+        source: Source::Persisted,
+        ..credential
+    })
+}
+
+// Create private credential files at mode 0600, including before their first write.
 fn persist(path: &Path, token: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -200,16 +213,14 @@ fn persist(path: &Path, token: &str) -> Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    use std::io::Write;
-    file.write_all(token.as_bytes())?;
-    file.write_all(b"\n")?;
-    // `mode()` applies only when the file is CREATED, so a 0644 one left by a hand-edit (or an
-    // older CLI) would keep its permissions through the rewrite. Set them explicitly too.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    use std::io::Write;
+    file.write_all(token.as_bytes())?;
+    file.write_all(b"\n")?;
     Ok(())
 }
 

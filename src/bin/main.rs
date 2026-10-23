@@ -134,7 +134,7 @@ fn run(command: Command) -> Result<i32> {
         .map(|_| EXIT_OK),
         Command::AccountCreate { user, source } => {
             let project = ProjectLayout::discover()?;
-            cmd::account::create(&project, &user, source, &runner).map(|_| EXIT_OK)
+            cmd::account::create(&project, &user, source, &runner, &http).map(|_| EXIT_OK)
         }
         Command::ConfigShow => cmd::config::show(&ProjectLayout::discover()?).map(|_| EXIT_OK),
         Command::ConfigSetClientData { path } => {

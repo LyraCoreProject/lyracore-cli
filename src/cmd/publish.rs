@@ -100,15 +100,11 @@ pub fn databases(args: &[String]) -> Result<Vec<String>> {
     Ok(args.to_vec())
 }
 
-/// What a bare `lyracore publish` means: every database in the topology `dev up` and `dev status`
-/// already treat as the truth, in the same order — a schema change must reach all of them, not just
-/// the one the fixture happened to seed first.
-///
-/// No active recorded fixture (a fresh clone, one that has never run `dev up`, or one after
-/// `dev down`) uses `Topology::Sharded`, not the last topology left in diagnostic state. A
-/// contributor who has not brought the stack up still gets a publish that matches what their next
-/// `dev up` will build.
+// See docs/commands.md for default publish targets during local runtime changes.
 fn recorded_databases(project: &ProjectLayout) -> Result<Vec<String>> {
+    if project.has_native_host() {
+        return Ok(vec![ProjectLayout::DATABASE.to_string()]);
+    }
     let state = RuntimeState::load(&project.state_file())?;
     // `dev down` deliberately keeps diagnostic state such as the last topology, but without a
     // recorded gateway there is no active fixture for that topology to describe. In that case the
@@ -136,10 +132,20 @@ fn database_list(databases: &[String]) -> String {
 /// The ONE correct publish invocation.
 pub fn publish_command(project: &ProjectLayout, database: &str) -> Result<CommandSpec> {
     validate_database(VERB, database)?;
-    Ok(preflight::module_command(project, "spacetime")
+    let mut command = preflight::module_command(project, "spacetime");
+    if project.has_native_host() && project.native_cli_config().is_file() {
+        command = command
+            .arg("--config-path")
+            .arg(project.native_cli_config().to_string_lossy());
+    }
+    Ok(command
         .arg("publish")
         .arg("-s")
-        .arg(ProjectLayout::STDB_SERVER)
+        .arg(if project.has_native_host() {
+            ProjectLayout::stdb_uri()
+        } else {
+            ProjectLayout::STDB_SERVER.into()
+        })
         .arg("-p")
         // Absolute, so `lyracore` publishes this checkout's module from any subdirectory of it.
         .arg(project.module_dir().to_string_lossy().to_string())

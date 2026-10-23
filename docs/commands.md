@@ -921,7 +921,35 @@ Runtime files live in the git-ignored `.lyracore/` — `state.json` for the proc
 `logs/{spacetime,gateway}.log`, and `coordinator-token` (mode `0600`) if this host had no
 `spacetime login` and the CLI minted a local identity for it.
 
-## What `dev up` actually does
+## Native Host startup
+
+A Core checkout with `native-host/prepare-host.py` selects the native runtime. `dev up` builds
+that pinned host, starts its HTTP endpoint on `127.0.0.1:3000`, and opens the logon and world
+listeners on ports 3724 and 8085. `--lan` changes only the two game listener addresses. The host
+owns all three listeners. No Gateway process starts.
+
+Startup runs preflight, publishes one Shard named `lyracore`, claims the Operator, installs its
+GUID range and provisions the Realm address. It checks for an actual WoW world authentication
+challenge before reporting success. Publishing and Operator calls use the same retained identity.
+The CLI uses a SpacetimeDB login when available, or mints a local identity. It writes the credential
+and publisher configuration to `.lyracore/native-owner-token` and `.lyracore/native-cli.toml`,
+both with mode `0600`. Native publishes target the explicit loopback URI.
+
+Native state lives in `.lyracore/native-data`; startup creates a new local Realm there. It does
+not merge data from the old Shards. Stop a recorded legacy runtime with `dev down` first. An
+unrelated process on any required port causes startup to stop before publishing. The CLI records
+the Native Host before publishing, so `dev down` can still stop it after a later step fails.
+
+`publish` without names, content imports and Character operations select the single Shard for
+native checkouts. `account create` computes the SRP salt and verifier locally and calls the Module
+over authenticated loopback HTTP. It does not build or invoke a Gateway binary. The password stays
+out of process arguments and HTTP requests.
+
+`dev status` reports the host and its listeners. `dev logs` shows the host log, and `dev down`
+stops the recorded host. Repeating `dev up` reuses a healthy native runtime. Changing its listener
+addresses requires `dev down` first. `--single` remains accepted and has no effect on native startup.
+
+## Startup for older Core checkouts
 
 1. Starts SpacetimeDB on `127.0.0.1:3000`, **or reuses one already listening there.** A node the CLI
    did not start is never recorded and never stopped by `dev down`.

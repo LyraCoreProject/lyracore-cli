@@ -41,6 +41,7 @@ use crate::cmd::dev::call_as_operator;
 use crate::http::HttpClient;
 use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::{ProjectLayout, Topology};
+#[cfg(test)]
 use crate::state::RuntimeState;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -314,10 +315,7 @@ pub fn run_world(
     if let Some(raw) = &options.client_data {
         validate_client_data(Path::new(raw))?;
     }
-    let destinations = import_destinations(
-        RuntimeState::load(&project.state_file())?.topology(),
-        &options.profile_shards,
-    )?;
+    let destinations = import_destinations(project.local_topology()?, &options.profile_shards)?;
 
     // ---- consent, first and always ------------------------------------------------------------
     consent(prompt, options.accept)?;
@@ -559,10 +557,7 @@ pub fn run_check(
     http: &dyn HttpClient,
     profile_shards: &[String],
 ) -> Result<()> {
-    let destinations = import_destinations(
-        RuntimeState::load(&project.state_file())?.topology(),
-        profile_shards,
-    )?;
+    let destinations = import_destinations(project.local_topology()?, profile_shards)?;
     let credential = crate::token::resolve_existing(runner, &project.token_file())?;
     let mut failures = Vec::new();
     for destination in destinations {
@@ -763,10 +758,7 @@ pub fn run_vmaps(
             )
         })?;
 
-    let destinations = import_destinations(
-        RuntimeState::load(&project.state_file())?.topology(),
-        &options.profile_shards,
-    )?;
+    let destinations = import_destinations(project.local_topology()?, &options.profile_shards)?;
     let owner_config = if project.token_file().is_file() {
         temporary_owner_config(&crate::token::resolve_existing(
             runner,

@@ -32,8 +32,9 @@ struct Inner {
     endpoints: HashSet<String>,
     /// Which spawned PID opened which endpoint, so terminating it closes the listener like a
     /// real one. (A pre-existing endpoint has no PID here and survives, also like a real one.)
-    listeners: HashMap<u32, String>,
+    listeners: HashMap<u32, Vec<String>>,
     next_pid: u32,
+    missing_world_challenge: bool,
     failures: HashMap<String, String>,
     /// Canned stdout, keyed by a substring of the rendered command. Overrides the defaults below.
     stdouts: HashMap<String, String>,
@@ -66,6 +67,11 @@ impl FakeStack {
             .unwrap()
             .generated_bindings
             .insert(name.into(), content.into());
+        self
+    }
+
+    pub fn without_world_challenge(self) -> Self {
+        self.0.lock().unwrap().missing_world_challenge = true;
         self
     }
 
@@ -216,7 +222,7 @@ impl FakeProcessRunner {
 /// otherwise every `--lan` test would pass against a fake that cannot represent the bug.
 fn endpoint_for(cmd: &CommandSpec) -> Option<String> {
     let render = cmd.render();
-    if render.contains("spacetime start") {
+    if render.contains("spacetime start") || render.contains("spacetimedb-standalone start") {
         return Some(format!("127.0.0.1:{}", ProjectLayout::STDB_PORT));
     }
     if render.contains("gateway") {
@@ -487,7 +493,17 @@ impl ProcessRunner for FakeProcessRunner {
             inner.processes.insert(pid, format!("fake-start {render}"));
             if let Some(endpoint) = endpoint {
                 inner.endpoints.insert(endpoint.clone());
-                inner.listeners.insert(pid, endpoint);
+                inner.listeners.insert(pid, vec![endpoint]);
+            }
+        }
+        for variable in ["LYRACORE_NATIVE_WORLD_ADDR", "LYRACORE_NATIVE_LOGON_ADDR"] {
+            if let Some(endpoint) = cmd.env_value(variable) {
+                inner.endpoints.insert(endpoint.into());
+                inner
+                    .listeners
+                    .entry(pid)
+                    .or_default()
+                    .push(endpoint.into());
             }
         }
         Ok(pid)
@@ -499,8 +515,10 @@ impl ProcessRunner for FakeProcessRunner {
         inner.processes.remove(&pid);
         inner.shim_reads.remove(&pid);
         inner.shim_pending_endpoint.remove(&pid);
-        if let Some(endpoint) = inner.listeners.remove(&pid) {
-            inner.endpoints.remove(&endpoint);
+        if let Some(endpoints) = inner.listeners.remove(&pid) {
+            for endpoint in endpoints {
+                inner.endpoints.remove(&endpoint);
+            }
         }
         Ok(())
     }
@@ -536,12 +554,17 @@ impl ProcessInspector for FakeProcessInspector {
                 return Some(before);
             }
             if let Some(endpoint) = inner.shim_pending_endpoint.remove(&pid) {
-                inner.listeners.insert(pid, endpoint.clone());
+                inner.listeners.insert(pid, vec![endpoint.clone()]);
                 inner.endpoints.insert(endpoint);
             }
             return Some(after);
         }
         inner.processes.get(&pid).cloned()
+    }
+
+    fn world_ready(&self, host: &str, port: u16) -> bool {
+        let missing = self.0.lock().unwrap().missing_world_challenge;
+        !missing && self.serving(host, port)
     }
 
     fn serving(&self, host: &str, port: u16) -> bool {
