@@ -89,6 +89,10 @@ fn run(command: Command) -> Result<i32> {
             dev.up(&runner, &inspector, &http, bind, topology)
                 .map(|_| EXIT_OK)
         }
+        Command::DevWatch => {
+            let mut dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
+            dev.watch(&runner, &inspector, &http).map(|_| EXIT_OK)
+        }
         Command::DevStatus => {
             let dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
             dev.status(&runner, &inspector).map(|_| EXIT_OK)

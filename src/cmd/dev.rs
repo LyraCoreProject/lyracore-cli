@@ -1,6 +1,7 @@
 //! See docs/commands.md for local Realm startup and process ownership.
 
 mod native;
+mod watch;
 
 use crate::cmd::{
     account,
@@ -141,7 +142,9 @@ impl DevManager {
         topology: Topology,
     ) -> Result<()> {
         if self.project.has_native_host() {
-            return self.up_native(runner, inspector, http, bind);
+            return self
+                .up_native(runner, inspector, http, bind, native::NativeMode::Normal)
+                .map(|_| ());
         }
         self.project.ensure_dirs()?;
         self.state.database = ProjectLayout::DATABASE.to_string();

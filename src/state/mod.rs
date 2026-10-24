@@ -21,6 +21,8 @@ pub struct RuntimeState {
     #[serde(default)]
     pub native_runtime: bool,
     #[serde(default)]
+    pub native_hot_reload: bool,
+    #[serde(default)]
     pub spacetime: Option<ProcessRecord>,
     #[serde(default)]
     pub gateway: Option<ProcessRecord>,
@@ -111,8 +113,6 @@ mod tests {
 
     #[test]
     fn state_written_before_lan_existed_reads_back_as_loopback() {
-        // A `state.json` from #251 has no `client_host` at all. It must load, not fail, and the
-        // stack it describes must be treated as the loopback one it is.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("state.json");
         fs::write(
@@ -124,7 +124,7 @@ mod tests {
         let state = RuntimeState::load(&path).unwrap();
         assert_eq!(state.record(Component::Gateway).unwrap().pid, 42);
         assert_eq!(state.bind(), ClientBind::Loopback);
-        // ...and it also predates #11's topology field, which reads back as the new default.
+        assert!(!state.native_hot_reload);
         assert_eq!(state.topology(), Topology::Sharded);
     }
 

@@ -1,13 +1,21 @@
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeMode {
+    Normal,
+    HotReload,
+}
+
 impl DevManager {
+    /// Returns a credential when watch must initialize the Realm after its first publish.
     pub(super) fn up_native(
         &mut self,
         runner: &dyn ProcessRunner,
         inspector: &dyn ProcessInspector,
         http: &dyn HttpClient,
         bind: ClientBind,
-    ) -> Result<()> {
+        mode: NativeMode,
+    ) -> Result<Option<Credential>> {
         self.project.ensure_dirs()?;
         for component in Component::ALL {
             if let Some(record) = self.state.record(component) {
@@ -34,6 +42,16 @@ impl DevManager {
         if matches!(
             current,
             ComponentStatus::Healthy | ComponentStatus::Starting
+        ) && mode == NativeMode::HotReload
+            && !self.state.native_hot_reload
+        {
+            return Err(Error::Process(
+                "the running Native Host uses a different development mode; run `lyracore dev down` first, then `lyracore dev watch` to enable hot reload".into(),
+            ));
+        }
+        if matches!(
+            current,
+            ComponentStatus::Healthy | ComponentStatus::Starting
         ) && self.bind != bind
         {
             return Err(Error::Process(
@@ -46,7 +64,7 @@ impl DevManager {
         {
             println!("Native Realm is already running.");
             self.print_native_status(runner, inspector);
-            return Ok(());
+            return Ok(None);
         }
         self.bind = bind;
         self.topology = Topology::Single;
@@ -54,6 +72,12 @@ impl DevManager {
         self.state.database = ProjectLayout::DATABASE.into();
         self.state.topology = Topology::Single.as_str().into();
         self.state.native_runtime = true;
+        if !matches!(
+            current,
+            ComponentStatus::Healthy | ComponentStatus::Starting
+        ) {
+            self.state.native_hot_reload = mode == NativeMode::HotReload;
+        }
         self.state.gateway = None;
 
         if !matches!(
@@ -83,11 +107,12 @@ impl DevManager {
                     .arg("--build")
                     .cwd(&self.project.root),
             )?;
-            let command = CommandSpec::new(
+            let mut command = CommandSpec::new(
                 checkout
                     .join("target/release/spacetimedb-standalone")
                     .to_string_lossy(),
             )
+            .own_process_group()
             .arg("start")
             .arg("--listen-addr")
             .arg(ProjectLayout::stdb_listen())
@@ -104,6 +129,11 @@ impl DevManager {
                 ProjectLayout::logon_bind(&self.bind),
             )
             .cwd(&self.project.root);
+            if mode == NativeMode::HotReload {
+                command = command.env("LYRACORE_NATIVE_DEV", "1");
+            } else {
+                command = command.env_remove("LYRACORE_NATIVE_DEV");
+            }
             let record = self.spawn_recorded(Component::Spacetime, &command, runner, inspector)?;
             self.state.spacetime = Some(record);
             self.state.save(&self.project.state_file())?;
@@ -118,8 +148,22 @@ impl DevManager {
         )?;
         // Native Core connections and operator calls must use the Module publisher's identity.
         let credential = crate::token::retain_native_owner(&self.project, credential)?;
+        if mode == NativeMode::HotReload {
+            return Ok(Some(credential));
+        }
         self.publish(runner)?;
-        self.claim_operator(runner, http, &credential)?;
+        self.initialize_native(runner, inspector, http, &credential)?;
+        Ok(None)
+    }
+
+    pub(super) fn initialize_native(
+        &self,
+        runner: &dyn ProcessRunner,
+        inspector: &dyn ProcessInspector,
+        http: &dyn HttpClient,
+        credential: &Credential,
+    ) -> Result<()> {
+        self.claim_operator(runner, http, credential)?;
         for (reducer, arguments) in [
             ("debug_repair_after_publish", vec![]),
             ("install_guid_range", vec![serde_json::json!(0)]),
@@ -128,13 +172,13 @@ impl DevManager {
                 &self.project,
                 runner,
                 http,
-                &credential,
+                credential,
                 ProjectLayout::DATABASE,
                 reducer,
                 &arguments,
             )?;
         }
-        self.provision_realm(runner, http, &credential)?;
+        self.provision_realm(runner, http, credential)?;
         if !inspector.world_ready(&self.bind.host(), ProjectLayout::WORLD_PORT) {
             return Err(Error::Process(format!(
                 "the Native Host did not return a world authentication challenge; check the Module's Operator identity and {}",
@@ -157,6 +201,9 @@ impl DevManager {
     ) {
         let host = self.status_for(Component::Spacetime, inspector);
         println!("Native Host: {host:?}");
+        if self.state.native_hot_reload {
+            println!("Development hot reload enabled.");
+        }
         for (name, port) in [
             ("logon", ProjectLayout::LOGON_PORT),
             ("world", ProjectLayout::WORLD_PORT),
@@ -230,6 +277,8 @@ mod tests {
             .collect();
         assert_eq!(spawned.len(), 1);
         assert!(spawned[0].program().ends_with("/spacetimedb-standalone"));
+        assert_eq!(spawned[0].env_value("LYRACORE_NATIVE_DEV"), None);
+        assert!(spawned[0].removes_env("LYRACORE_NATIVE_DEV"));
         assert_eq!(
             spawned[0].env_value("LYRACORE_NATIVE_DATABASE"),
             Some("lyracore")

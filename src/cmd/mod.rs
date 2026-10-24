@@ -39,6 +39,7 @@ pub enum Command {
         bind: ClientBind,
         topology: Topology,
     },
+    DevWatch,
     DevStatus,
     DevLogs {
         component: Option<Component>,
@@ -176,6 +177,8 @@ impl Command {
             }
 
             ["dev", "up", rest @ ..] => parse_dev_up(rest),
+            ["dev", "watch"] => Ok(Command::DevWatch),
+            ["dev", "watch", ..] => Err(Error::Usage("usage: lyracore dev watch".into())),
             ["dev", "status"] => Ok(Command::DevStatus),
             ["dev", "check"] => Ok(Command::DevCheck),
             ["dev", "smoke", account, character] if !account.trim().is_empty() && !character.trim().is_empty() && !account.starts_with('-') && !character.starts_with('-') => Ok(Command::DevSmoke {
@@ -202,10 +205,10 @@ impl Command {
                 Ok(Command::DevLogs { component, all })
             },
             ["dev"] => Err(Error::Usage(
-                "`dev` needs a subcommand: up, status, check, logs, smoke, down".to_string(),
+                "`dev` needs a subcommand: up, watch, status, check, logs, smoke, down".to_string(),
             )),
             ["dev", other, ..] => Err(Error::Usage(format!(
-                "unknown `dev` subcommand '{other}' — expected up, status, check, logs, smoke, or down"
+                "unknown `dev` subcommand '{other}'. Expected up, watch, status, check, logs, smoke, or down"
             ))),
 
             ["account", "create", user] => Ok(Command::AccountCreate {
@@ -937,6 +940,20 @@ mod tests {
     }
 
     #[test]
+    fn watch_accepts_no_publish_or_target_overrides() {
+        for flags in [
+            "--yes",
+            "--server http://127.0.0.1:3001",
+            "-c",
+            "lyracore",
+            "--lan 192.168.1.20",
+            "--single",
+        ] {
+            assert!(parse(&format!("dev watch {flags}")).is_err());
+        }
+    }
+
+    #[test]
     fn the_documented_surface_parses() {
         assert_eq!(parse("doctor").unwrap(), Command::Doctor);
         assert_eq!(
@@ -946,6 +963,7 @@ mod tests {
                 topology: Topology::Sharded,
             }
         );
+        assert_eq!(parse("dev watch").unwrap(), Command::DevWatch);
         assert_eq!(parse("dev status").unwrap(), Command::DevStatus);
         assert_eq!(parse("dev check").unwrap(), Command::DevCheck);
         assert_eq!(

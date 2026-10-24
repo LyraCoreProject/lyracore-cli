@@ -2,28 +2,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A command the CLI intends to run.
-///
-/// There is deliberately no way to put a secret in here. A password reaches a child only through
-/// [`ProcessRunner::run_with_secret_stdin`](super::ProcessRunner::run_with_secret_stdin), which
-/// takes it as a separate argument and writes it to the child's stdin — so "the rendered command
-/// contains no secret" is a property of the type, not of remembering to call a masking helper.
+/// Keep secrets out of arguments; use `ProcessRunner::run_with_secret_stdin`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     program: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
-    /// Variables explicitly unset for the child. The production gateway recipe is exported in
-    /// plenty of contributor shells; inheriting it would silently turn the single-database
-    /// fixture into a five-database gateway pointed at databases this CLI never published.
     env_remove: Vec<String>,
-    /// The directory the child runs in. `None` inherits ours.
-    ///
-    /// `lyracore` works from any subdirectory of a checkout, so "inherit" means "wherever the
-    /// contributor happened to be". A child that resolves a path relative to the checkout ROOT —
-    /// the import scripts run `./target/debug/lyracore-importer` — is then broken by nothing worse
-    /// than the caller's `cd`.
+    /// None inherits the caller's current directory.
     cwd: Option<PathBuf>,
+    own_process_group: bool,
 }
 
 impl CommandSpec {
@@ -34,6 +22,7 @@ impl CommandSpec {
             env: BTreeMap::new(),
             env_remove: Vec::new(),
             cwd: None,
+            own_process_group: false,
         }
     }
 
@@ -54,6 +43,12 @@ impl CommandSpec {
 
     pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cwd = Some(dir.into());
+        self
+    }
+
+    /// Isolate Unix terminal signals from a background child.
+    pub fn own_process_group(mut self) -> Self {
+        self.own_process_group = true;
         self
     }
 
@@ -79,6 +74,11 @@ impl CommandSpec {
 
     pub fn build(&self) -> Command {
         let mut cmd = Command::new(&self.program);
+        #[cfg(unix)]
+        if self.own_process_group {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         cmd.args(&self.args);
         for (key, value) in &self.env {
             cmd.env(key, value);

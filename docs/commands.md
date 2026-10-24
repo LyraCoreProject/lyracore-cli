@@ -46,6 +46,7 @@ lyracore bindings [--check]
 lyracore preflight
 lyracore publish [DATABASE ...] [--skip-preflight] [--server URL]
 lyracore dev up [--single] [--lan IP]
+lyracore dev watch
 lyracore dev status
 lyracore dev logs [spacetime|gateway] [--all]
 lyracore dev check
@@ -969,6 +970,62 @@ out of process arguments and HTTP requests.
 `dev status` reports the host and its listeners. `dev logs` shows the host log, and `dev down`
 stops the recorded host. Repeating `dev up` reuses a healthy native runtime. Changing its listener
 addresses requires `dev down` first. `--single` remains accepted and has no effect on native startup.
+
+## Developer Module hot reload
+
+```bash
+./lyracore dev watch
+```
+
+`dev watch` starts or reuses a loopback Native Host with `LYRACORE_NATIVE_DEV=1`. It requires
+`native-host/dev-reload.patch` in Core and the checkout's pinned `spacetime` CLI. An existing normal
+Host causes a refusal with `dev down` advice. Watch never restarts that Host. Normal `dev up`
+keeps its existing startup path and preserves the mode when it reuses a development Host.
+`.lyracore/state.json` records this mode as `native_hot_reload`; older state defaults to false.
+
+The first watch build uses the development artifact, including on a fresh local Realm. It does
+not run the release preflight or build the Host for each edit. It runs this build from the Core
+root with `CARGO_TARGET_DIR=.lyracore/dev-reload-target`:
+
+```text
+cargo build --locked -p lyracore-module --target wasm32-unknown-unknown --profile dev-reload --features=debug_reducers
+```
+
+Core owns the incremental `dev-reload` profile. Watch publishes the resulting
+`wasm32-unknown-unknown/dev-reload/lyracore_module.wasm` from that target directory using the
+private native publisher configuration:
+
+```text
+spacetime --config-path .lyracore/native-cli.toml publish --bin-path <artifact> --delete-data=never --yes=migrate,skip-login --no-config -s http://127.0.0.1:3000 lyracore
+```
+
+The Native Host requires exact equality of the complete normalized Module definition at both
+publish checks and transactional update. This includes more than table layouts. Schema changes,
+including a change to the `debug_reducers` feature set, require a separate explicit migration
+workflow. The first publish checks any Module already present in `native-data`. Watch forwards no
+extra publish flags and never selects a remote target or deletes content.
+
+Watch polls Rust source and Cargo manifests in the workspace and resolved local dependencies.
+It also watches enabled Package Rust source, `build_support` inputs, the Runtime Script
+`events.json`, Cargo configuration and Rust toolchain files. It ignores build output, hidden
+inventories and dependency caches. Package symlinks work; canonical paths prevent directory cycles
+and aliases into build output from entering the watched inputs.
+
+Watch debounces edits for 400 ms and runs one build and publish at a time. A source change observed
+during compilation discards that candidate and builds the latest source after it settles. A change
+during publish schedules another build. Identical WASM bytes skip subsequent publishes in the same
+watch run. A new watch run checks the existing Module again. Build, publish and total elapsed times
+appear for each attempt.
+
+A compile failure sends no publish and leaves the current Module running. Watch waits for another
+edit and tries again. A failed publish also leaves watch running, but an HTTP failure can have an
+unknown outcome. Inspect `dev logs` before assuming which Module is active. The Host's schema Gate
+and transaction checks remain authoritative. Watch does not run repair or provisioning reducers
+for each reload.
+
+One watcher can hold `.lyracore/dev-watch.lock` per checkout. Ctrl+C stops the watcher and its
+foreground build or publish. The Native Host runs in a separate process group and stays running.
+Use `dev down` to stop it.
 
 ## Startup for older Core checkouts
 
