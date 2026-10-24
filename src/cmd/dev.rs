@@ -2703,6 +2703,9 @@ mod tests {
         // The node mints happily; it is the CLAIM it refuses.
         struct ClaimRefused;
         impl crate::http::HttpClient for ClaimRefused {
+            fn publish_module(&self, _: &str, _: &str, _: &[u8]) -> Result<()> {
+                panic!("publication is not part of this fixture")
+            }
             fn post_json(&self, url: &str, _bearer: Option<&str>, _body: &str) -> Result<String> {
                 if url.ends_with("/v1/identity") {
                     return Ok(format!(

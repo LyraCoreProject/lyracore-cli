@@ -52,7 +52,7 @@ impl DevManager {
                 pending = true;
             }
             if pending && changed_at.elapsed() >= DEBOUNCE {
-                match reload.update(&self.project, runner, inspector) {
+                match reload.update(&self.project, runner, inspector, http) {
                     Ok(false) => {
                         changed_at = Instant::now();
                     }
@@ -117,8 +117,10 @@ fn wasm_path(project: &ProjectLayout) -> PathBuf {
 
 fn build_command(project: &ProjectLayout) -> CommandSpec {
     preflight::module_command(project, "cargo")
-        .arg("build")
+        .arg("rustc")
         .arg("--locked")
+        .arg("--lib")
+        .arg("--crate-type=cdylib")
         .arg("-p")
         .arg(ProjectLayout::MODULE_PACKAGE)
         .arg("--target")
@@ -129,10 +131,11 @@ fn build_command(project: &ProjectLayout) -> CommandSpec {
         .env("CARGO_TARGET_DIR", target_dir(project).to_string_lossy())
 }
 
-fn publish_command(
+fn publish_module(
     project: &ProjectLayout,
     inspector: &dyn ProcessInspector,
-) -> Result<CommandSpec> {
+    http: &dyn HttpClient,
+) -> Result<()> {
     publish::require_native_host(project, inspector, &ProjectLayout::stdb_uri())?;
     let state = RuntimeState::load(&project.state_file())?;
     if !state.native_hot_reload {
@@ -140,19 +143,14 @@ fn publish_command(
             "dev watch requires Development reload; run `lyracore dev down` first".into(),
         ));
     }
-    Ok(CommandSpec::new("spacetime")
-        .arg("--config-path")
-        .arg(project.native_cli_config().to_string_lossy())
-        .arg("publish")
-        .arg("--bin-path")
-        .arg(wasm_path(project).to_string_lossy())
-        .arg("--delete-data=never")
-        .arg("--yes=migrate,skip-login")
-        .arg("--no-config")
-        .arg("-s")
-        .arg(ProjectLayout::stdb_uri())
-        .arg(ProjectLayout::DATABASE)
-        .cwd(&project.root))
+    let credential = crate::token::native_owner(project)?;
+    let wasm = fs::read(wasm_path(project))?;
+    let url = format!(
+        "{}/v1/database/{}?host_type=Wasm&clear=false&policy=Compatible",
+        ProjectLayout::stdb_uri(),
+        ProjectLayout::DATABASE
+    );
+    http.publish_module(&url, credential.token(), &wasm)
 }
 
 impl Reload {
@@ -170,6 +168,7 @@ impl Reload {
         project: &ProjectLayout,
         runner: &dyn ProcessRunner,
         inspector: &dyn ProcessInspector,
+        http: &dyn HttpClient,
     ) -> Result<bool> {
         let total = Instant::now();
         self.refresh_roots(project, runner)?;
@@ -191,11 +190,10 @@ impl Reload {
             "{error}\nBuild failed; no Module was published. Build {:.2}s, publish 0.00s, total {:.2}s.",
             build_time.as_secs_f64(), total.elapsed().as_secs_f64()
         )))?;
-        let command = publish_command(project, inspector)?;
         println!("Publishing development Module to the local Native Host...");
         let publish = Instant::now();
-        runner.run_streaming(&command).map_err(|error| Error::Process(format!(
-            "{error}\nPublish failed; the command output above gives the reason. A lost HTTP connection can leave the outcome unknown. For Module definition changes, see docs/quickstart.md#development-reload in this Core checkout. Build {:.2}s, publish {:.2}s, total {:.2}s.",
+        publish_module(project, inspector, http).map_err(|error| Error::Process(format!(
+            "{error}\nPublish failed. The previous Module remains installed after a compatibility refusal. For Module definition changes, see docs/quickstart.md#development-reload in this Core checkout. Build {:.2}s, publish {:.2}s, total {:.2}s.",
             build_time.as_secs_f64(), publish.elapsed().as_secs_f64(), total.elapsed().as_secs_f64()
         )))?;
         println!(
@@ -463,6 +461,7 @@ mod tests {
         _tmp: TempDir,
         dev: DevManager,
         stack: FakeStack,
+        http: FakeHttp,
     }
 
     impl Fixture {
@@ -495,6 +494,7 @@ mod tests {
                 _tmp: tmp,
                 dev: DevManager::new(project).unwrap(),
                 stack,
+                http: FakeHttp::new(),
             }
         }
 
@@ -515,10 +515,10 @@ mod tests {
         }
 
         fn publish_count(&self) -> usize {
-            self.stack
-                .rendered()
+            self.http
+                .requests()
                 .iter()
-                .filter(|command| command.contains(" publish "))
+                .filter(|request| request.method == "PUT")
                 .count()
         }
 
@@ -558,7 +558,7 @@ mod tests {
         fn run_streaming(&self, command: &CommandSpec) -> Result<()> {
             self.stack.runner().run_streaming(command)?;
             if command.program() == "cargo"
-                && command.args().first().is_some_and(|arg| arg == "build")
+                && command.args().first().is_some_and(|arg| arg == "rustc")
             {
                 (self.build)()?;
             }
@@ -693,8 +693,10 @@ mod tests {
         assert_eq!(
             build.args(),
             [
-                "build",
+                "rustc",
                 "--locked",
+                "--lib",
+                "--crate-type=cdylib",
                 "-p",
                 "lyracore-module",
                 "--target",
@@ -710,31 +712,43 @@ mod tests {
             Some(target_dir(project).to_str().unwrap())
         );
         assert!(build.removes_env("RUSTFLAGS"));
-        let publish = publish_command(project, &fixture.stack.inspector()).unwrap();
-        assert_eq!(publish.program(), "spacetime");
+        fixture.artifact(b"module").unwrap();
+        publish_module(project, &fixture.stack.inspector(), &fixture.http).unwrap();
+        let requests = fixture.http.requests();
+        let publish = requests.last().unwrap();
+        assert_eq!(publish.method, "PUT");
+        assert_eq!(publish.url, "http://127.0.0.1:3000/v1/database/lyracore?host_type=Wasm&clear=false&policy=Compatible");
+        assert_eq!(publish.body, "module");
         assert_eq!(
-            publish.args(),
-            [
-                "--config-path",
-                project.native_cli_config().to_str().unwrap(),
-                "publish",
-                "--bin-path",
-                wasm_path(project).to_str().unwrap(),
-                "--delete-data=never",
-                "--yes=migrate,skip-login",
-                "--no-config",
-                "-s",
-                "http://127.0.0.1:3000",
-                "lyracore"
-            ]
+            publish.bearer.as_deref(),
+            Some(crate::proc::fake::FAKE_TOKEN)
         );
-        assert!(!publish
-            .args()
-            .iter()
-            .any(|arg| arg == "--yes" || arg == "-c" || arg == "local"));
         let record = fixture.dev.state.spacetime.clone().unwrap();
         fixture.stack.runner().terminate(record.pid).unwrap();
-        assert!(publish_command(project, &fixture.stack.inspector()).is_err());
+        assert!(publish_module(project, &fixture.stack.inspector(), &fixture.http).is_err());
+        assert_eq!(fixture.publish_count(), 1);
+    }
+
+    #[test]
+    fn missing_or_mismatched_publisher_files_stop_before_upload() {
+        let mut fixture = Fixture::new();
+        fixture.start();
+        fixture.artifact(b"module").unwrap();
+        let config = fixture.project().native_cli_config();
+        let original = fs::read(&config).unwrap();
+        fs::write(&config, "spacetimedb_token = \"other publisher\"").unwrap();
+        assert!(
+            publish_module(fixture.project(), &fixture.stack.inspector(), &fixture.http)
+                .unwrap_err()
+                .to_string()
+                .contains("disagree")
+        );
+        fs::write(&config, original).unwrap();
+        fs::remove_file(fixture.project().token_file()).unwrap();
+        assert!(
+            publish_module(fixture.project(), &fixture.stack.inspector(), &fixture.http).is_err()
+        );
+        assert_eq!(fixture.publish_count(), 0);
     }
 
     #[test]
@@ -744,16 +758,22 @@ mod tests {
         let mut reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
         let compiler = fixture.compiler(|| fixture.artifact(b"wasm A"));
         assert!(reload
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
+            .update(
+                fixture.project(),
+                &compiler,
+                &fixture.stack.inspector(),
+                &fixture.http
+            )
             .unwrap());
         fixture.artifact(b"manual wasm").unwrap();
-        fixture
-            .stack
-            .runner()
-            .run_streaming(&publish_command(fixture.project(), &fixture.stack.inspector()).unwrap())
-            .unwrap();
+        publish_module(fixture.project(), &fixture.stack.inspector(), &fixture.http).unwrap();
         assert!(reload
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
+            .update(
+                fixture.project(),
+                &compiler,
+                &fixture.stack.inspector(),
+                &fixture.http
+            )
             .unwrap());
         assert_eq!(fixture.publish_count(), 3);
         assert_eq!(fs::read(wasm_path(fixture.project())).unwrap(), b"wasm A");
@@ -773,22 +793,42 @@ mod tests {
             }
         });
         reload
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
+            .update(
+                fixture.project(),
+                &compiler,
+                &fixture.stack.inspector(),
+                &fixture.http,
+            )
             .unwrap();
         fail.set(true);
         let error = reload
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
+            .update(
+                fixture.project(),
+                &compiler,
+                &fixture.stack.inspector(),
+                &fixture.http,
+            )
             .unwrap_err();
         assert!(error.to_string().contains("no Module was published"));
         assert_eq!(fixture.publish_count(), 1);
         fail.set(false);
         reload
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
+            .update(
+                fixture.project(),
+                &compiler,
+                &fixture.stack.inspector(),
+                &fixture.http,
+            )
             .unwrap();
         assert_eq!(fixture.publish_count(), 2);
         let changed = fixture.compiler(|| fixture.artifact(b"fixed wasm"));
         reload
-            .update(fixture.project(), &changed, &fixture.stack.inspector())
+            .update(
+                fixture.project(),
+                &changed,
+                &fixture.stack.inspector(),
+                &fixture.http,
+            )
             .unwrap();
         assert_eq!(fixture.publish_count(), 3);
     }
@@ -805,12 +845,22 @@ mod tests {
             Ok(())
         });
         assert!(!reload
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
+            .update(
+                fixture.project(),
+                &compiler,
+                &fixture.stack.inspector(),
+                &fixture.http
+            )
             .unwrap());
         assert_eq!(fixture.publish_count(), 0);
         let latest = fixture.compiler(|| fixture.artifact(b"latest wasm"));
         assert!(reload
-            .update(fixture.project(), &latest, &fixture.stack.inspector())
+            .update(
+                fixture.project(),
+                &latest,
+                &fixture.stack.inspector(),
+                &fixture.http
+            )
             .unwrap());
         assert_eq!(fixture.publish_count(), 1);
         assert_eq!(
@@ -833,7 +883,12 @@ mod tests {
             fixture.artifact(b"temporary wasm")
         });
         assert!(!reload
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
+            .update(
+                fixture.project(),
+                &compiler,
+                &fixture.stack.inspector(),
+                &fixture.http
+            )
             .unwrap());
         assert_eq!(fixture.publish_count(), 0);
     }
@@ -846,25 +901,31 @@ mod tests {
             let mut reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
             let compiler = fixture.compiler(|| fixture.artifact(b"old wasm"));
             reload
-                .update(fixture.project(), &compiler, &fixture.stack.inspector())
-                .unwrap();
-            let failed = FakeStack::new()
-                .with_stdout(
-                    "cargo metadata",
-                    &module_metadata(fixture.project()).to_string(),
+                .update(
+                    fixture.project(),
+                    &compiler,
+                    &fixture.stack.inspector(),
+                    &fixture.http,
                 )
-                .fail_on(" publish ", reason);
-            let changed = Compiler {
-                stack: &failed,
-                build: || fixture.artifact(b"new wasm"),
-            };
+                .unwrap();
+            let failed = FakeHttp::failing(reason);
+            let changed = fixture.compiler(|| fixture.artifact(b"new wasm"));
             let error = reload
-                .update(fixture.project(), &changed, &fixture.stack.inspector())
+                .update(
+                    fixture.project(),
+                    &changed,
+                    &fixture.stack.inspector(),
+                    &failed,
+                )
                 .unwrap_err();
-            assert!(error.to_string().contains("lost HTTP connection"));
             assert!(error.to_string().contains(reason));
             reload
-                .update(fixture.project(), &compiler, &fixture.stack.inspector())
+                .update(
+                    fixture.project(),
+                    &compiler,
+                    &fixture.stack.inspector(),
+                    &fixture.http,
+                )
                 .unwrap();
             assert_eq!(fixture.publish_count(), 2);
         }

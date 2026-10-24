@@ -998,19 +998,30 @@ not run the release preflight or build the Host for each edit. It runs this buil
 root with `CARGO_TARGET_DIR=.lyracore/dev-reload-target`:
 
 ```text
-cargo build --locked -p lyracore-module --target wasm32-unknown-unknown --profile dev-reload --features=debug_reducers
+cargo rustc --locked --lib --crate-type=cdylib -p lyracore-module --target wasm32-unknown-unknown --profile dev-reload --features=debug_reducers
 ```
 
-Core owns the incremental `dev-reload` profile. Watch publishes the resulting
+Core owns the incremental `dev-reload` profile. Build scripts and procedural macros use
+optimization level 3. The watcher emits only the WASM library; Rust tests retain the normal
+library build through their own commands. Watch publishes the resulting
 `wasm32-unknown-unknown/dev-reload/lyracore_module.wasm` from that target directory using the
-private native publisher configuration:
+retained native publisher identity. Its token must match the private `native-cli.toml` written
+at startup. It sends one authenticated request with the WASM bytes:
 
 ```text
-spacetime --config-path .lyracore/native-cli.toml publish --bin-path <artifact> --delete-data=never --yes=migrate,skip-login --no-config -s http://127.0.0.1:3000 lyracore
+PUT http://127.0.0.1:3000/v1/database/lyracore?host_type=Wasm&clear=false&policy=Compatible
 ```
 
-The Native Host requires exact equality of the complete normalized Module definition at both
-publish checks and transactional update. This includes more than table layouts. Schema changes,
+This skips the CLI's separate pre-publish request. The Host checks the definition while applying
+the update. Inside the transaction it checks that the installed program hash has not changed.
+It never clears existing state. The HTTP
+client accepts literal loopback addresses only, disables proxies and redirects, and gives publish
+up to 180 seconds. A compatibility or authorization refusal reports the Host's reason. A 5xx,
+lost response or invalid confirmation reports an unknown outcome. Watch does not retry that
+request automatically.
+
+The Native Host requires exact equality of the complete normalized Module definition during
+update planning and transactional update. This includes more than table layouts. Schema changes,
 including a change to the `debug_reducers` feature set, require a separate explicit migration
 workflow. The first publish checks any Module already present in `native-data`. Watch forwards no
 extra publish flags and never selects a remote target or deletes content.
