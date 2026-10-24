@@ -239,14 +239,16 @@ impl Reload {
             if !selected.insert(id) {
                 continue;
             }
-            if let Some(dependencies) = nodes
-                .get(id)
-                .and_then(|node| node["dependencies"].as_array())
-            {
+            if let Some(dependencies) = nodes.get(id).and_then(|node| node["deps"].as_array()) {
                 pending.extend(
                     dependencies
                         .iter()
-                        .filter_map(|dependency| dependency.as_str()),
+                        .filter(|dependency| {
+                            dependency["dep_kinds"]
+                                .as_array()
+                                .is_some_and(|kinds| kinds.iter().any(|kind| kind["kind"] != "dev"))
+                        })
+                        .filter_map(|dependency| dependency["pkg"].as_str()),
                 );
             }
         }
@@ -453,7 +455,7 @@ mod tests {
         serde_json::json!({
             "packages": [{"id": "module", "name": ProjectLayout::MODULE_PACKAGE,
                 "manifest_path": project.module_manifest(), "source": null}],
-            "resolve": {"nodes": [{"id": "module", "dependencies": []}]}
+            "resolve": {"nodes": [{"id": "module", "deps": []}]}
         })
     }
 
@@ -881,7 +883,8 @@ mod tests {
         fs::write(external.path().join("lib.rs"), "fn external() {}").unwrap();
         let mut metadata = module_metadata(fixture.project());
         metadata["packages"].as_array_mut().unwrap().push(serde_json::json!({"id": "external", "manifest_path": external.path().join("Cargo.toml"), "source": null}));
-        metadata["resolve"]["nodes"][0]["dependencies"] = serde_json::json!(["external"]);
+        metadata["resolve"]["nodes"][0]["deps"] =
+            serde_json::json!([{"pkg": "external", "dep_kinds": [{"kind": null}]}]);
         let stack = fixture
             .stack
             .clone()
@@ -944,7 +947,8 @@ mod tests {
             serde_json::json!({"id": "external", "manifest_path": external.path().join("Cargo.toml"), "source": null}),
             serde_json::json!({"id": "importer", "manifest_path": importer.join("Cargo.toml"), "source": null}),
         ]);
-        metadata["resolve"]["nodes"][0]["dependencies"] = serde_json::json!(["external"]);
+        metadata["resolve"]["nodes"][0]["deps"] =
+            serde_json::json!([{"pkg": "external", "dep_kinds": [{"kind": null}]}]);
         let stack = fixture
             .stack
             .clone()
@@ -962,6 +966,62 @@ mod tests {
         fs::write(importer.join("lib.rs"), "fn unrelated_change() {}").unwrap();
         assert_eq!(
             observed,
+            snapshot(&fixture.project().root, &reload.roots).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_only_dependencies_are_not_watched() {
+        let fixture = Fixture::new();
+        let mut metadata = module_metadata(fixture.project());
+        let mut dependencies = Vec::new();
+        let mut ids = Vec::new();
+        for (id, kinds) in [
+            ("normal", serde_json::json!([{"kind": null}])),
+            ("build", serde_json::json!([{"kind": "build"}])),
+            (
+                "mixed",
+                serde_json::json!([{"kind": "dev"}, {"kind": null}]),
+            ),
+            ("tests", serde_json::json!([{"kind": "dev"}])),
+        ] {
+            let directory = fixture.project().root.join("crates").join(id);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("lib.rs"), "fn dependency() {}").unwrap();
+            metadata["packages"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id": id, "manifest_path": directory.join("Cargo.toml"), "source": null,
+                }));
+            dependencies.push(serde_json::json!({"pkg": id, "dep_kinds": kinds}));
+            ids.push(id);
+        }
+        metadata["resolve"]["nodes"][0]["dependencies"] = serde_json::json!(ids);
+        metadata["resolve"]["nodes"][0]["deps"] = serde_json::json!(dependencies);
+        let stack = fixture
+            .stack
+            .clone()
+            .with_stdout("cargo metadata", &metadata.to_string());
+        let reload = Reload::new(fixture.project(), &stack.runner()).unwrap();
+        let before = snapshot(&fixture.project().root, &reload.roots).unwrap();
+        for id in ["normal", "build", "mixed"] {
+            assert!(before.contains_key(
+                &fixture
+                    .project()
+                    .root
+                    .join("crates")
+                    .join(id)
+                    .join("lib.rs")
+            ));
+        }
+        fs::write(
+            fixture.project().root.join("crates/tests/lib.rs"),
+            "fn test_edit() {}",
+        )
+        .unwrap();
+        assert_eq!(
+            before,
             snapshot(&fixture.project().root, &reload.roots).unwrap()
         );
     }
