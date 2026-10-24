@@ -1,7 +1,4 @@
-//! Prepare and activate installed Packages on explicitly named Shards or the development topology.
-//! Sources build when artifacts are missing or stale. Rust Packages and pending Package Teardown
-//! require a Module publish and schedule repair. Artifact provenance skips completed families.
-//! Confirmation precedes all Realm writes. Failures stop the run and identify the remaining work.
+//! See docs/commands.md for Package preparation, confirmation and activation behavior.
 
 use std::path::Path;
 
@@ -12,7 +9,7 @@ use crate::cmd::packages::{check, inventory};
 use crate::cmd::packages::{recorded_databases, shard_list};
 use crate::cmd::publish::validate_database;
 use crate::cmd::{preflight, publish};
-use crate::proc::{CommandSpec, ProcessRunner};
+use crate::proc::{CommandSpec, ProcessInspector, ProcessRunner};
 use crate::project::ProjectLayout;
 use crate::{Error, Result};
 
@@ -22,8 +19,7 @@ const APPLY_REDUCER: &str = "apply_package_deltas";
 /// What `packages apply` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApplyOptions {
-    /// The Shards to apply onto. Empty means the recorded development topology — never a guessed
-    /// production list.
+    /// Empty selects the native Shard or the recorded legacy development topology.
     pub databases: Vec<String>,
     pub client_data: Option<String>,
     /// Prepare locally and check the plan without Realm writes.
@@ -314,6 +310,7 @@ fn resume_command(shards: &[String], options: &ApplyOptions) -> String {
 pub fn run(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
+    inspector: &dyn ProcessInspector,
     prompt: &dyn Prompt,
     options: &ApplyOptions,
 ) -> Result<()> {
@@ -330,6 +327,7 @@ pub fn run(
         ));
     }
     databases(&shards)?;
+    publish::require_native_host(project, inspector, &ProjectLayout::stdb_uri())?;
     check::prepare(project, runner, prompt, options.client_data.as_deref())?;
     // Disabled Rust may still be deployed if it was disabled without a running local stack.
     // Its removal needs a publish even when the target has no pending teardown record.
@@ -337,7 +335,6 @@ pub fn run(
         .iter()
         .any(|package| package.dir.join("src/mod.rs").is_file());
 
-    // ---- preflight: the artifacts, once, before any target is touched ----
     let root = project.packages_dir();
     let enabled = artifact::read_enabled(&root)?;
     let artifacts = &enabled.deltas;
@@ -475,7 +472,9 @@ pub fn run(
     if options.check {
         if !publish_shards.is_empty() {
             preflight::run(project, runner)?;
-            publish::require_loot_roll_upgrade_ready(project, runner, &publish_shards)?;
+            if !project.has_native_host() {
+                publish::require_loot_roll_upgrade_ready(project, runner, &publish_shards)?;
+            }
         }
         println!();
         println!("=== check: the plan, per Shard, writing nothing ===");
@@ -552,7 +551,9 @@ pub fn run(
     }
     if !publish_shards.is_empty() {
         preflight::run(project, runner)?;
-        publish::require_loot_roll_upgrade_ready(project, runner, &publish_shards)?;
+        if !project.has_native_host() {
+            publish::require_loot_roll_upgrade_ready(project, runner, &publish_shards)?;
+        }
     }
 
     let mut completed = Vec::new();
@@ -572,21 +573,23 @@ pub fn run(
         println!();
         println!("==> applying {}", target.database);
         if publish_shards.contains(&target.database) {
-            publish::publish_and_repair(project, runner, &target.database).map_err(|error| {
-                let remaining: Vec<_> = pending_targets[index + 1..]
-                    .iter()
-                    .map(|target| target.database.clone())
-                    .collect();
-                Error::Process(format!(
-                    "{error}\n  Published and repaired: {}\n  Completed artifacts:\n    \
+            publish::publish_and_repair(project, runner, inspector, &target.database).map_err(
+                |error| {
+                    let remaining: Vec<_> = pending_targets[index + 1..]
+                        .iter()
+                        .map(|target| target.database.clone())
+                        .collect();
+                    Error::Process(format!(
+                        "{error}\n  Published and repaired: {}\n  Completed artifacts:\n    \
                      spell: {}\n    script: {}\n  Not attempted: {}\n  Retry with:\n    {}",
-                    shard_list(&published),
-                    shard_list(&completed_in(&completed, SPELL_FAMILY)),
-                    shard_list(&completed_in(&completed, SCRIPT_FAMILY)),
-                    shard_list(&remaining),
-                    resume_command(&shards, options)
-                ))
-            })?;
+                        shard_list(&published),
+                        shard_list(&completed_in(&completed, SPELL_FAMILY)),
+                        shard_list(&completed_in(&completed, SCRIPT_FAMILY)),
+                        shard_list(&remaining),
+                        resume_command(&shards, options)
+                    ))
+                },
+            )?;
             published.push(target.database.clone());
         }
 
@@ -826,7 +829,7 @@ fn question(
 mod tests {
     use super::*;
     use crate::cmd::import::tests::ScriptedPrompt;
-    use crate::proc::fake::FakeStack;
+    use crate::proc::fake::{Call, FakeStack};
     use tempfile::TempDir;
 
     const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1062,7 +1065,98 @@ mod tests {
         assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
     }
 
-    // ---- the run ----
+    #[test]
+    fn native_packages_use_one_shard_and_its_publisher_for_every_operation() {
+        let checkout = Checkout::new();
+        checkout
+            .with_rust()
+            .with_script("greeter", 100300, "greeter.login");
+        checkout.with_package("bolt", 133, 1500);
+        let project = &checkout.project;
+        std::fs::create_dir_all(project.root.join("native-host")).unwrap();
+        std::fs::write(project.root.join("native-host/prepare-host.py"), "").unwrap();
+        std::fs::create_dir_all(&project.state_dir).unwrap();
+        std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'").unwrap();
+        crate::state::RuntimeState {
+            native_runtime: true,
+            spacetime: Some(crate::state::ProcessRecord {
+                pid: 42,
+                identity: "native host".into(),
+            }),
+            ..Default::default()
+        }
+        .save(&project.state_file())
+        .unwrap();
+        let stack = fresh_shard(
+            FakeStack::new()
+                .with_process(42, "native host")
+                .with_port(3000),
+            "lyracore",
+        );
+        run(
+            project,
+            &stack.runner(),
+            &stack.inspector(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options(&[]),
+        )
+        .unwrap();
+        let commands = stack.rendered();
+        let publisher = format!("--config-path {}", project.native_cli_config().display());
+        for command in commands.iter().filter(|command| {
+            [" call ", " sql ", " publish "]
+                .iter()
+                .any(|verb| command.contains(verb))
+        }) {
+            assert!(command.contains(&publisher), "{command}");
+            assert!(command.contains("http://127.0.0.1:3000"), "{command}");
+        }
+        assert!(commands
+            .iter()
+            .any(|command| command.contains("debug_repair_after_publish")));
+        assert_eq!(script_applies(&stack).len(), 1);
+        assert_eq!(applies(&stack).len(), 1);
+        assert!(stack.calls().iter().any(|call| matches!(call, Call::Stream(command)
+            if command.render().contains("lyracore-importer")
+                && command.render().contains("--apply")
+                && command.env_value("LYRACORE_SPACETIME_CONFIG_PATH") == project.native_cli_config().to_str())));
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("lyracore-kalimdor")));
+    }
+
+    #[test]
+    fn native_package_apply_requires_credentials_and_a_live_host_before_starting_processes() {
+        let checkout = Checkout::new();
+        let project = &checkout.project;
+        std::fs::create_dir_all(project.root.join("native-host")).unwrap();
+        std::fs::write(project.root.join("native-host/prepare-host.py"), "").unwrap();
+        std::fs::create_dir_all(&project.state_dir).unwrap();
+        let stack = FakeStack::new().with_port(3000);
+        for with_config in [false, true] {
+            if with_config {
+                std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'")
+                    .unwrap();
+            }
+            let error = run(
+                project,
+                &stack.runner(),
+                &stack.inspector(),
+                &ScriptedPrompt::new(&[]),
+                &checkout.options(&[]),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(if with_config {
+                    "recorded Native Host"
+                } else {
+                    "private publisher configuration"
+                }),
+                "{error}"
+            );
+            assert!(stack.rendered().is_empty());
+        }
+    }
 
     #[test]
     fn every_named_shard_is_applied_in_order() {
@@ -1076,6 +1170,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore", "lyracore-kalimdor", "lyracore-instances"]),
         )
@@ -1112,6 +1207,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore", "lyracore-kalimdor", "lyracore-instances"]),
         )
@@ -1160,6 +1256,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore", "lyracore-kalimdor"]),
         )
@@ -1188,6 +1285,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &options,
         )
@@ -1216,6 +1314,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore-kalimdor"]),
         )
@@ -1250,6 +1349,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore-kalimdor"]),
         )
@@ -1287,6 +1387,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &options,
         )
@@ -1317,6 +1418,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &options,
         )
@@ -1344,6 +1446,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &prompt,
             &ApplyOptions {
                 yes: false,
@@ -1377,6 +1480,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &ApplyOptions {
                 yes: false,
@@ -1398,6 +1502,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore"]),
         )
@@ -1425,6 +1530,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore", "lyracore-kalimdor"]),
         )
@@ -1447,6 +1553,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["no"]),
             &ApplyOptions {
                 yes: false,
@@ -1468,6 +1575,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore"]),
         )
@@ -1510,6 +1618,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore", "lyracore-kalimdor"]),
         )
@@ -1537,6 +1646,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore"]),
         )
@@ -1575,6 +1685,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore", "lyracore-kalimdor"]),
         )
@@ -1604,6 +1715,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &options,
         )
@@ -1628,6 +1740,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &prompt,
             &ApplyOptions {
                 yes: false,
@@ -1662,6 +1775,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &ApplyOptions {
                 yes: false,
@@ -1689,6 +1803,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore", "lyracore-kalimdor", "lyracore-instances"]),
         )
@@ -1730,6 +1845,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore"]),
         )
@@ -1753,6 +1869,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore"]),
         )
@@ -1788,6 +1905,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &options,
         )
@@ -1816,6 +1934,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["lyracore"]),
         )
@@ -1848,6 +1967,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &ApplyOptions {
                 yes: false,
@@ -1878,6 +1998,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options(&["lyracore"]),
         )
@@ -1909,6 +2030,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&["yes"]),
             &checkout.options(&["lyracore"]),
         )
@@ -2032,6 +2154,7 @@ mod tests {
                 checkout: &checkout,
                 stack: stack.clone(),
             },
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one"]),
         )
@@ -2075,6 +2198,7 @@ mod tests {
                 checkout: &checkout,
                 stack: stack.clone(),
             },
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one"]),
         )
@@ -2098,6 +2222,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one"]),
         )
@@ -2122,6 +2247,7 @@ mod tests {
                 checkout: &checkout,
                 stack: stack.clone(),
             },
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options(&["one"]),
         )
@@ -2141,6 +2267,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one"]),
         )
@@ -2162,6 +2289,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one", "two"]),
         )
@@ -2188,6 +2316,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one"]),
         )
@@ -2218,6 +2347,7 @@ mod tests {
         run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one"]),
         )
@@ -2240,6 +2370,7 @@ mod tests {
             let result = run(
                 &checkout.project,
                 &stack.runner(),
+                &stack.inspector(),
                 &ScriptedPrompt::new(&["no"]),
                 &options,
             );
@@ -2262,6 +2393,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one", "two", "three"]),
         )
@@ -2291,6 +2423,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one", "two"]),
         )
@@ -2316,6 +2449,7 @@ mod tests {
         let error = run(
             &checkout.project,
             &stack.runner(),
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options_without_client_data(&["one", "two"]),
         )
@@ -2353,6 +2487,7 @@ mod tests {
                 checkout: &checkout,
                 stack: stack.clone(),
             },
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options(&["one"]),
         )
@@ -2383,6 +2518,7 @@ mod tests {
                 checkout: &checkout,
                 stack: stack.clone(),
             },
+            &stack.inspector(),
             &ScriptedPrompt::new(&[]),
             &checkout.options(&["one"]),
         )

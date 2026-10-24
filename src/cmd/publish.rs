@@ -134,25 +134,7 @@ fn publish_command_to(
     validate_database(VERB, database)?;
     let mut command = preflight::module_command(project, "spacetime");
     if project.has_native_host() {
-        validate_native_server(server)?;
-        if !project.native_cli_config().is_file() {
-            return Err(Error::Usage("native publishing requires its private publisher configuration; run `lyracore dev up` to prepare it".into()));
-        }
-        let state = RuntimeState::load(&project.state_file())?;
-        let port = server
-            .strip_prefix("http://")
-            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-            .map(|address| address.port());
-        if port == Some(ProjectLayout::STDB_PORT)
-            && (state.gateway.is_some() || (!state.native_runtime && state.spacetime.is_some()))
-        {
-            return Err(Error::Usage("native publishing cannot target the recorded legacy runtime; stop it with `lyracore dev down` and start a native Realm first".into()));
-        }
-        if port == Some(ProjectLayout::STDB_PORT)
-            && (!state.native_runtime || state.spacetime.is_none())
-        {
-            return Err(Error::Usage("native publishing on port 3000 requires a recorded Native Host; run `lyracore dev up` first".into()));
-        }
+        require_native_configuration(project, server)?;
         command = command
             .arg("--config-path")
             .arg(project.native_cli_config().to_string_lossy());
@@ -169,6 +151,53 @@ fn publish_command_to(
         ))
         .arg("--yes")
         .arg(database))
+}
+
+fn require_native_configuration(project: &ProjectLayout, server: &str) -> Result<()> {
+    validate_native_server(server)?;
+    if !project.native_cli_config().is_file() {
+        return Err(Error::Usage("native publishing requires its private publisher configuration; run `lyracore dev up` to prepare it".into()));
+    }
+    let state = RuntimeState::load(&project.state_file())?;
+    let port = server
+        .strip_prefix("http://")
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .map(|address| address.port());
+    if port == Some(ProjectLayout::STDB_PORT)
+        && (state.gateway.is_some() || (!state.native_runtime && state.spacetime.is_some()))
+    {
+        return Err(Error::Usage("native publishing cannot target the recorded legacy runtime; stop it with `lyracore dev down` and start a native Realm first".into()));
+    }
+    if port == Some(ProjectLayout::STDB_PORT)
+        && (!state.native_runtime || state.spacetime.is_none())
+    {
+        return Err(Error::Usage("native publishing on port 3000 requires a recorded Native Host; run `lyracore dev up` first".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_native_host(
+    project: &ProjectLayout,
+    inspector: &dyn ProcessInspector,
+    target: &str,
+) -> Result<()> {
+    if project.has_native_host() {
+        require_native_configuration(project, target)?;
+        let address: std::net::SocketAddr = target
+            .strip_prefix("http://")
+            .and_then(|address| address.parse().ok())
+            .ok_or_else(|| Error::Usage("invalid native publish address".into()))?;
+        if address.port() == ProjectLayout::STDB_PORT {
+            let state = RuntimeState::load(&project.state_file())?;
+            let live = state.spacetime.as_ref().is_some_and(|record| {
+                inspector.identity(record.pid).as_deref() == Some(record.identity.as_str())
+            });
+            if !live || !inspector.serving(&address.ip().to_string(), address.port()) {
+                return Err(Error::Usage("native publishing on port 3000 requires the recorded Native Host to be running; run `lyracore dev up` first".into()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn describe_command(database: &str) -> CommandSpec {
@@ -334,24 +363,10 @@ pub fn run(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    if project.has_native_host() {
-        let target = server
-            .map(str::to_owned)
-            .unwrap_or_else(ProjectLayout::stdb_uri);
-        let address: std::net::SocketAddr = target
-            .strip_prefix("http://")
-            .and_then(|address| address.parse().ok())
-            .ok_or_else(|| Error::Usage("invalid native publish address".into()))?;
-        if address.port() == ProjectLayout::STDB_PORT {
-            let state = RuntimeState::load(&project.state_file())?;
-            let live = state.spacetime.as_ref().is_some_and(|record| {
-                inspector.identity(record.pid).as_deref() == Some(record.identity.as_str())
-            });
-            if !live || !inspector.serving(&address.ip().to_string(), address.port()) {
-                return Err(Error::Usage("native publishing on port 3000 requires the recorded Native Host to be running; run `lyracore dev up` first".into()));
-            }
-        }
-    }
+    let target = server
+        .map(str::to_owned)
+        .unwrap_or_else(ProjectLayout::stdb_uri);
+    require_native_host(project, inspector, &target)?;
 
     if skip_preflight {
         println!("· skipping preflight (--skip-preflight)");
@@ -388,13 +403,14 @@ pub fn run(
     Ok(())
 }
 
-/// Publish one preflighted Shard and repair its schedules before other activation steps.
-/// The caller must gate all targets with preflight and the Loot Roll upgrade check first.
+/// Call after preflight and applicable migration checks; publish and repair precede activation.
 pub(crate) fn publish_and_repair(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
+    inspector: &dyn ProcessInspector,
     database: &str,
 ) -> Result<()> {
+    require_native_host(project, inspector, &ProjectLayout::stdb_uri())?;
     runner
         .run_streaming(&publish_command(project, database)?)
         .map_err(|error| {
@@ -403,7 +419,7 @@ pub(crate) fn publish_and_repair(
     runner.run_and_wait(&import::call_command(project, database, "debug_repair_after_publish"))
         .map_err(|error| Error::Process(format!(
             "'{database}' was published, but schedule repair failed: {error}\n  \
-             Repair it with `spacetime call -s local {database} debug_repair_after_publish` before retrying."
+             Retry `lyracore packages apply {database}` with the same checkout and publisher identity."
         )))?;
     Ok(())
 }

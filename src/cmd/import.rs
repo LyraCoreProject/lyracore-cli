@@ -989,10 +989,18 @@ pub(crate) fn build_importer_command(project: &ProjectLayout) -> CommandSpec {
         .cwd(project.root.clone())
 }
 
-/// A base importer invocation: the pinned binary, destination Shard and loopback endpoint named
-/// explicitly. Neither may fall through to ambient CLI state.
+/// Name the destination Shard, local HTTP node and native publisher explicitly.
 pub(crate) fn importer_command(project: &ProjectLayout, database: &str) -> CommandSpec {
-    CommandSpec::new(project.importer_bin().to_string_lossy().to_string())
+    let command = CommandSpec::new(project.importer_bin().to_string_lossy().to_string());
+    let command = if project.has_native_host() {
+        command.env(
+            SPACETIME_CONFIG_VAR,
+            project.native_cli_config().to_string_lossy(),
+        )
+    } else {
+        command
+    };
+    command
         .arg("--db")
         .arg(database)
         .arg("--server")
@@ -1100,11 +1108,15 @@ fn world_etl_commands(
     commands
 }
 
-/// `spacetime call`, pinned to the loopback node — bare `spacetime call` inherits the CLI's
-/// AMBIENT default server, which on a fresh machine is maincloud, not the node `dev up` started
-/// (the #440 class of failure the bash flow's `SPACETIME_SERVER` chokepoint exists for).
+/// Native calls use the private publisher; every call names the local HTTP node.
 pub(crate) fn call_command(project: &ProjectLayout, database: &str, reducer: &str) -> CommandSpec {
-    CommandSpec::new("spacetime")
+    let mut command = CommandSpec::new("spacetime");
+    if project.has_native_host() {
+        command = command
+            .arg("--config-path")
+            .arg(project.native_cli_config().to_string_lossy());
+    }
+    command
         .arg("call")
         .arg("--server")
         .arg(ProjectLayout::stdb_uri())
@@ -1113,9 +1125,12 @@ pub(crate) fn call_command(project: &ProjectLayout, database: &str, reducer: &st
         .cwd(project.root.clone())
 }
 
-/// `spacetime sql`, pinned to the loopback node for the same #440 reason as [`call_command`].
+/// Native SQL uses the same publisher and HTTP node as [`call_command`].
 pub(crate) fn sql_command(project: &ProjectLayout, database: &str, query: &str) -> CommandSpec {
-    sql_command_with_config(project, database, query, None)
+    let config = project
+        .has_native_host()
+        .then(|| project.native_cli_config());
+    sql_command_with_config(project, database, query, config.as_deref())
 }
 
 fn sql_command_with_config(

@@ -623,6 +623,11 @@ git-ignored output and Build Identities detect changes to their author inputs. K
 
 ## `packages apply`
 
+Native checkouts default to the single `lyracore` Shard. Package reads, Module publication,
+schedule repair and artifact application use `.lyracore/native-cli.toml`. The local Native Host
+must be recorded and running before the command starts. This command targets the local node on
+port 3000; it does not inherit `publish --server` from another invocation.
+
 Prepare and activate the installed Packages on a running Realm:
 
 ```bash

@@ -194,6 +194,7 @@ fn run(command: Command) -> Result<i32> {
         Command::PackagesApply(options) => cmd::packages::apply::run(
             &ProjectLayout::discover()?,
             &runner,
+            &inspector,
             &cmd::import::TtyPrompt::packages_apply(),
             &options,
         )
