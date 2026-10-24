@@ -78,6 +78,7 @@ fn run(command: Command) -> Result<i32> {
         } => cmd::publish::run(
             &ProjectLayout::discover()?,
             &runner,
+            &inspector,
             &databases,
             skip_preflight,
             server.as_deref(),

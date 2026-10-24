@@ -878,15 +878,14 @@ sql, so it is safe against a live stack:
 ./lyracore publish lyracore lyracore-world-1 realm-core   # several shards, in order
 ```
 
-With no names, this publishes every database of the fixture topology `dev up` and `dev status`
-already read from `.lyracore/state.json` — one database for an active single fixture, all of them
-for an active sharded fixture, or the default sharded topology if nothing has been recorded yet (a
-fresh clone that has never run `dev up`). Naming databases explicitly still publishes exactly those,
-in the order given.
+In legacy checkouts, omitting names publishes every database in the recorded fixture topology.
+An active single fixture has one database. An active sharded fixture uses all of its databases.
+Without a recorded fixture, the command uses the default sharded topology. Explicit names select
+exactly those databases, in the order given.
 
-Renders exactly `spacetime publish -s local -p <checkout>/module
---build-options=--features=debug_reducers --yes <DATABASE>`, runs `preflight` first, and publishes
-several databases sequentially, stopping at the first failure.
+Legacy checkouts render `spacetime publish -s local -p <checkout>/module
+--build-options=--features=debug_reducers --yes <DATABASE>`. The command runs `preflight` first,
+then publishes databases in order and stops at the first failure.
 
 Database names cannot start with a flag. The CLI refuses destructive wipe flags and unknown
 options before starting a process. `--skip-preflight` skips offline checks. Legacy checkouts still
@@ -904,8 +903,9 @@ upgrade checks. To target a separate native node on the same machine, use:
 HTTP, a numeric loopback address and a nonzero port. It cannot include credentials or a path.
 Without this option, native publishing targets `http://127.0.0.1:3000`. All native publishes
 require the private publisher configuration before any command runs. Publishing to port 3000
-refuses recorded legacy runtime processes. Stop those processes with `dev down`, then use
-`dev up` to create the native Realm. An explicit target on another port can use an isolated
+requires a recorded Native Host with a matching live process identity and an answering endpoint.
+A stale `native_runtime` flag is insufficient. Stop recorded legacy processes with `dev down`,
+then use `dev up` to create the native Realm. An explicit target on another port can use an isolated
 native node while the legacy runtime remains recorded.
 
 [`docs/danger-zones.md`](https://github.com/LyraCoreProject/LyraCore/blob/main/docs/danger-zones.md)

@@ -2,7 +2,7 @@
 
 use crate::cmd::import;
 use crate::cmd::preflight;
-use crate::proc::{CommandSpec, ProcessRunner};
+use crate::proc::{CommandSpec, ProcessInspector, ProcessRunner};
 use crate::project::{Component, ProjectLayout, Topology};
 use crate::state::RuntimeState;
 use crate::{Error, Result};
@@ -147,6 +147,11 @@ fn publish_command_to(
             && (state.gateway.is_some() || (!state.native_runtime && state.spacetime.is_some()))
         {
             return Err(Error::Usage("native publishing cannot target the recorded legacy runtime; stop it with `lyracore dev down` and start a native Realm first".into()));
+        }
+        if port == Some(ProjectLayout::STDB_PORT)
+            && (!state.native_runtime || state.spacetime.is_none())
+        {
+            return Err(Error::Usage("native publishing on port 3000 requires a recorded Native Host; run `lyracore dev up` first".into()));
         }
         command = command
             .arg("--config-path")
@@ -299,6 +304,7 @@ pub(crate) fn require_loot_roll_upgrade_ready(
 pub fn run(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
+    inspector: &dyn ProcessInspector,
     databases: &[String],
     skip_preflight: bool,
     server: Option<&str>,
@@ -327,6 +333,25 @@ pub fn run(
             None => publish_command(project, database),
         })
         .collect::<Result<Vec<_>>>()?;
+
+    if project.has_native_host() {
+        let target = server
+            .map(str::to_owned)
+            .unwrap_or_else(ProjectLayout::stdb_uri);
+        let address: std::net::SocketAddr = target
+            .strip_prefix("http://")
+            .and_then(|address| address.parse().ok())
+            .ok_or_else(|| Error::Usage("invalid native publish address".into()))?;
+        if address.port() == ProjectLayout::STDB_PORT {
+            let state = RuntimeState::load(&project.state_file())?;
+            let live = state.spacetime.as_ref().is_some_and(|record| {
+                inspector.identity(record.pid).as_deref() == Some(record.identity.as_str())
+            });
+            if !live || !inspector.serving(&address.ip().to_string(), address.port()) {
+                return Err(Error::Usage("native publishing on port 3000 requires the recorded Native Host to be running; run `lyracore dev up` first".into()));
+            }
+        }
+    }
 
     if skip_preflight {
         println!("· skipping preflight (--skip-preflight)");
@@ -401,6 +426,7 @@ mod tests {
         run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &[],
             true,
             Some("http://127.0.0.1:13000"),
@@ -441,7 +467,15 @@ mod tests {
             Some("http://[::1]:3000"),
             Some("http://127.0.0.1:13000"),
         ] {
-            let error = run(&project, &stack.runner(), &[], false, target).unwrap_err();
+            let error = run(
+                &project,
+                &stack.runner(),
+                &stack.inspector(),
+                &[],
+                false,
+                target,
+            )
+            .unwrap_err();
             assert!(
                 error
                     .to_string()
@@ -456,7 +490,15 @@ mod tests {
             Some("http://127.0.0.1:3000"),
             Some("http://[::1]:3000"),
         ] {
-            let error = run(&project, &stack.runner(), &[], false, target).unwrap_err();
+            let error = run(
+                &project,
+                &stack.runner(),
+                &stack.inspector(),
+                &[],
+                false,
+                target,
+            )
+            .unwrap_err();
             assert!(
                 error.to_string().contains("recorded legacy runtime"),
                 "{error}"
@@ -467,20 +509,76 @@ mod tests {
         run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &[],
             true,
             Some("http://127.0.0.1:13000"),
         )
         .unwrap();
         state.native_runtime = true;
+        state.spacetime.as_mut().unwrap().identity = "native host".into();
+        let stack = stack.with_process(42, "native host").with_port(3000);
         state.save(&project.state_file()).unwrap();
-        run(&project, &stack.runner(), &[], true, None).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
         let commands = stack.rendered();
         assert_eq!(commands.len(), 2);
         assert!(commands[1].contains("publish -s http://127.0.0.1:3000"));
         assert!(commands
             .iter()
             .all(|command| command.contains("--config-path")));
+    }
+
+    #[test]
+    fn native_default_target_requires_its_live_record_even_when_another_node_answers() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        std::fs::create_dir_all(&project.state_dir).unwrap();
+        std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'").unwrap();
+        let stack = FakeStack::new()
+            .with_port(3000)
+            .with_process(99, "other native host");
+        for record in [
+            None,
+            Some(crate::state::ProcessRecord {
+                pid: 42,
+                identity: "exited native host".into(),
+            }),
+            Some(crate::state::ProcessRecord {
+                pid: 99,
+                identity: "reused pid".into(),
+            }),
+        ] {
+            RuntimeState {
+                native_runtime: true,
+                spacetime: record,
+                ..Default::default()
+            }
+            .save(&project.state_file())
+            .unwrap();
+            for server in [None, Some("http://127.0.0.1:3000")] {
+                let error = run(
+                    &project,
+                    &stack.runner(),
+                    &stack.inspector(),
+                    &[],
+                    false,
+                    server,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("requires"), "{error}");
+                assert!(stack.rendered().is_empty());
+            }
+        }
     }
 
     #[test]
@@ -491,6 +589,7 @@ mod tests {
         assert!(run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &[],
             true,
             Some("http://127.0.0.1:13000")
@@ -501,6 +600,7 @@ mod tests {
         assert!(run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &[],
             true,
             Some("http://127.0.0.1:13000")
@@ -706,7 +806,15 @@ mod tests {
         let stack = clean_old_schema_stack();
         let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
 
-        run(&project, &stack.runner(), &wanted, true, None).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &wanted,
+            true,
+            None,
+        )
+        .unwrap();
 
         let rendered = stack.rendered();
         let first_publish = rendered
@@ -738,6 +846,7 @@ mod tests {
         let error = run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &names(&["lyracore", "--delete-data"]),
             true,
             None,
@@ -762,6 +871,7 @@ mod tests {
             let error = run(
                 &project,
                 &stack.runner(),
+                &stack.inspector(),
                 &names(&["lyracore", "realm-core"]),
                 true,
                 None,
@@ -794,8 +904,15 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             let project = loot_receipt_upgrade(&tmp);
 
-            let error =
-                run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap_err();
+            let error = run(
+                &project,
+                &stack.runner(),
+                &stack.inspector(),
+                &names(&["lyracore"]),
+                true,
+                None,
+            )
+            .unwrap_err();
 
             assert!(
                 error.to_string().contains("Nothing was published"),
@@ -825,7 +942,15 @@ mod tests {
             .with_stdout("spacetime describe", &decoy)
             .with_stdout("FROM game_loot_roll WHERE", " n\n 1\n");
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("active or staging Loot Rolls"),
@@ -846,7 +971,15 @@ mod tests {
             &schema(&[LOOT_RECEIPT_TABLE, LOOT_RECEIPT_TABLE]),
         );
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("more than once"), "{error}");
         assert!(!stack
@@ -862,7 +995,15 @@ mod tests {
         let stack =
             FakeStack::new().with_stdout("spacetime describe", &schema(&[LOOT_RECEIPT_TABLE]));
 
-        run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap();
 
         assert!(!stack
             .rendered()
@@ -894,6 +1035,7 @@ mod tests {
         run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &names(&["lyracore", "realm-core"]),
             true,
             None,
@@ -933,7 +1075,15 @@ mod tests {
             .fail_on("cargo check", "preflight must be skipped")
             .with_stdout("FROM game_loot_roll WHERE", " n\n 1\n");
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("active or staging Loot Rolls"),
@@ -955,7 +1105,15 @@ mod tests {
         let project = healthy(&tmp);
         let stack = FakeStack::new().fail_on("spacetime describe", "must not inspect live state");
 
-        run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             stack
@@ -972,7 +1130,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = healthy(&tmp);
         let stack = FakeStack::new().fail_on("spacetime generate", "bad Module");
-        assert!(run(&project, &stack.runner(), &names(&["lyracore"]), true, None).is_err());
+        assert!(run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None
+        )
+        .is_err());
         assert!(!stack
             .rendered()
             .iter()
@@ -1001,7 +1167,15 @@ mod tests {
         record_active_topology(&project, Topology::Sharded);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true, None).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -1028,7 +1202,15 @@ mod tests {
         record_active_topology(&project, Topology::Single);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true, None).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -1050,7 +1232,15 @@ mod tests {
         let project = healthy(&tmp);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true, None).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -1077,7 +1267,15 @@ mod tests {
         state.save(&project.state_file()).unwrap();
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true, None).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -1097,6 +1295,7 @@ mod tests {
         run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &names(&["realm-core"]),
             true,
             None,
@@ -1117,7 +1316,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let stack = FakeStack::new();
         let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
-        run(&healthy(&tmp), &stack.runner(), &wanted, true, None).unwrap();
+        run(
+            &healthy(&tmp),
+            &stack.runner(),
+            &stack.inspector(),
+            &wanted,
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -1141,7 +1348,15 @@ mod tests {
         let stack = FakeStack::new().fail_on("lyracore-world-1", "migration rejected");
         let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
 
-        let error = run(&healthy(&tmp), &stack.runner(), &wanted, true, None).unwrap_err();
+        let error = run(
+            &healthy(&tmp),
+            &stack.runner(),
+            &stack.inspector(),
+            &wanted,
+            true,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE);
         let message = error.to_string();
         assert!(
@@ -1168,6 +1383,7 @@ mod tests {
         let error = run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &names(&["lyracore"]),
             false,
             None,
@@ -1209,6 +1425,7 @@ mod tests {
         let error = run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &names(&["lyracore"]),
             false,
             None,
@@ -1236,6 +1453,7 @@ mod tests {
         run(
             &healthy(&tmp),
             &stack.runner(),
+            &stack.inspector(),
             &names(&["lyracore"]),
             false,
             None,
@@ -1260,7 +1478,15 @@ mod tests {
         let project = healthy(&tmp);
         // A Module build preflight would refuse.
         let stack = FakeStack::new().fail_on("cargo check", "invalid native build");
-        run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap();
         assert!(
             stack
                 .rendered()
