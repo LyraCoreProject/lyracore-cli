@@ -416,11 +416,14 @@ pub(crate) fn publish_and_repair(
         .map_err(|error| {
             Error::Process(format!("Module publish failed at '{database}': {error}"))
         })?;
-    runner.run_and_wait(&import::call_command(project, database, "debug_repair_after_publish"))
-        .map_err(|error| Error::Process(format!(
+    let repair = import::call_command(project, database, "debug_repair_after_publish");
+    runner.run_and_wait(&repair).map_err(|error| {
+        Error::Process(format!(
             "'{database}' was published, but schedule repair failed: {error}\n  \
-             Retry `lyracore packages apply {database}` with the same checkout and publisher identity."
-        )))?;
+             Repair schedules with: {}",
+            repair.render()
+        ))
+    })?;
     Ok(())
 }
 

@@ -1123,6 +1123,20 @@ mod tests {
         assert!(!commands
             .iter()
             .any(|command| command.contains("lyracore-kalimdor")));
+
+        let stack = stack.fail_on("lyracore debug_repair_after_publish", "operator only");
+        let error = run(
+            project,
+            &stack.runner(),
+            &stack.inspector(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options(&[]),
+        )
+        .unwrap_err();
+        let repair = format!(
+            "spacetime {publisher} call --server http://127.0.0.1:3000 lyracore debug_repair_after_publish"
+        );
+        assert!(error.to_string().contains(&repair), "{error}");
     }
 
     #[test]

@@ -634,9 +634,10 @@ Prepare and activate the installed Packages on a running Realm:
 lyracore packages apply [DATABASE ...] [--check] [--yes] [--force-all] [--client-data PATH]
 ```
 
-With no Shard names, the command uses the recorded development topology. Named Shards are used
-exactly as given. It never infers a production Shard list. Run it from the checkout whose Module
-and Packages you intend to deploy, with an Operator identity on each target.
+With no Shard names, native checkouts use `lyracore`; legacy checkouts use the recorded development
+topology. Named Shards are used exactly as given. It never infers a production Shard list. Run it
+from the checkout whose Module and Packages you intend to deploy, with an Operator identity on
+each target.
 
 The command checks Build Identities and builds missing or stale artifacts from installed sources.
 A Datascript needs the pinned Bun version and your own client data. If its Base Snapshot is missing,
@@ -651,9 +652,9 @@ and asks once for the planned Realm changes. `--yes` answers that confirmation i
 Local generated files can change during a check.
 
 If the Package Inventory contains Rust, or a target records pending Package Teardown, `apply`
-publishes this checkout's Module. It keeps the normal preflight and Loot Roll upgrade checks and
-repairs schedules on each published Shard before continuing. Rust Packages cause a publish on
-every run, including disabled Packages whose code may still be deployed after an offline disable;
+publishes this checkout's Module. It runs preflight and repairs schedules on each published Shard
+before continuing. Legacy checkouts also run the Loot Roll upgrade check. Rust Packages cause a
+publish on every run, including disabled Packages whose code may still be deployed after an offline disable;
 artifact provenance does not track compiled Rust. Disable a Rust Package through
 `packages disable` before removing it so its tables and Characters receive Package Teardown.
 
