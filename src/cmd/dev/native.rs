@@ -121,9 +121,11 @@ fn native_jwt_keys(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Resul
 }
 
 fn jwt_openssl(runner: &dyn ProcessRunner, command: &CommandSpec) -> Result<String> {
-    runner.run_and_wait(command).map_err(|error| Error::Process(format!(
-        "could not prepare Native Host JWT keys: {error}. No existing keys were replaced; restore damaged key files from the matching pair"
-    )))
+    runner.run_and_wait(command).map_err(|error| {
+        Error::Process(format!(
+            "could not prepare Native Host JWT keys: {error}. No existing keys were replaced"
+        ))
+    })
 }
 
 fn persist_native_key(directory: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -523,6 +525,23 @@ mod tests {
             .calls()
             .iter()
             .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
+    }
+
+    #[test]
+    fn key_generation_failure_does_not_advise_restoring_nonexistent_keys() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack = FakeStack::new().fail_on("openssl genpkey", "EC generation unavailable");
+        let error = native_jwt_keys(&project, &stack.runner()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("EC generation unavailable"));
+        assert!(!message.contains("restore"));
+        assert_eq!(
+            fs::read_dir(project.state_dir.join("native-jwt"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
