@@ -311,7 +311,9 @@ pub const FAKE_SPACETIME_VERSION: &str = "2.7.1";
 pub const FAKE_BUN_VERSION: &str = "1.3.7";
 
 fn canned_stdout(render: &str) -> String {
-    if render.starts_with("openssl genpkey ") {
+    if render == "openssl version" {
+        "OpenSSL 3.0.0\n".into()
+    } else if render.starts_with("openssl genpkey ") {
         "fake native JWT private key\n".into()
     } else if render.starts_with("openssl pkey ") && render.ends_with(" -pubout") {
         "fake native JWT public key\n".into()

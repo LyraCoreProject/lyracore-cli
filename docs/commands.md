@@ -957,7 +957,7 @@ mints a local identity. It writes the credential
 and publisher configuration to `.lyracore/native-owner-token` and `.lyracore/native-cli.toml`,
 both with mode `0600`. Native publishes target the explicit loopback URI.
 
-Native startup requires OpenSSL with EC support. Before starting the Host, the CLI creates a
+Native startup requires OpenSSL 3 or newer on PATH. Before starting the Host, the CLI creates a
 persistent P-256 JWT key pair in `.lyracore/native-jwt`. The directory has mode `0700`, and both
 key files have mode `0600`. Restarts reuse the private key and compare its derived public key to
 the retained one. A missing public key is derived from the private key. A public key without its

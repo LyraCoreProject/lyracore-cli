@@ -11,6 +11,17 @@ pub(super) enum NativeMode {
 }
 
 fn native_jwt_keys(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<PathBuf> {
+    let version = jwt_openssl(runner, &CommandSpec::new("openssl").arg("version"))?;
+    let major = version
+        .strip_prefix("OpenSSL ")
+        .and_then(|value| value.split('.').next())
+        .and_then(|value| value.parse::<u32>().ok());
+    if major.is_none_or(|major| major < 3) {
+        return Err(Error::PrerequisiteMissing(format!(
+            "Native Host JWT keys require OpenSSL 3 or newer on PATH; found {}. See docs/quickstart.md#1-prerequisites in this Core checkout",
+            version.trim()
+        )));
+    }
     let directory = project.state_dir.join("native-jwt");
     let mut create = fs::DirBuilder::new();
     create.recursive(true);
@@ -64,7 +75,9 @@ fn native_jwt_keys(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Resul
                 .arg("-algorithm")
                 .arg("EC")
                 .arg("-pkeyopt")
-                .arg("ec_paramgen_curve:P-256"),
+                .arg("ec_paramgen_curve:P-256")
+                .arg("-pkeyopt")
+                .arg("ec_param_enc:named_curve"),
         )?);
         persist_native_key(&directory, &private, private_pem.as_bytes())?;
     }
@@ -105,7 +118,7 @@ fn native_jwt_keys(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Resul
 
 fn jwt_openssl(runner: &dyn ProcessRunner, command: &CommandSpec) -> Result<String> {
     runner.run_and_wait(command).map_err(|error| Error::PrerequisiteMissing(format!(
-        "could not prepare Native Host JWT keys: {error}. OpenSSL with EC support is required; existing key files were kept"
+        "could not prepare Native Host JWT keys: {error}. OpenSSL 3 or newer on PATH is required; see docs/quickstart.md#1-prerequisites in this Core checkout. Existing key files were kept"
     )))
 }
 
@@ -377,6 +390,19 @@ mod tests {
         let directory = native_jwt_keys(&project, &crate::proc::RealProcessRunner).unwrap();
         assert!(directory.join("id_ecdsa").is_file());
         assert!(directory.join("id_ecdsa.pub").is_file());
+        let parameters = crate::proc::RealProcessRunner
+            .run_and_wait(
+                &CommandSpec::new("openssl")
+                    .arg("ec")
+                    .arg("-pubin")
+                    .arg("-in")
+                    .arg(directory.join("id_ecdsa.pub").to_string_lossy())
+                    .arg("-param_out"),
+            )
+            .unwrap();
+        assert!(parameters.contains(
+            "-----BEGIN EC PARAMETERS-----\nBggqhkjOPQMBBw==\n-----END EC PARAMETERS-----"
+        ));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -483,13 +509,36 @@ mod tests {
                 NativeMode::HotReload,
             )
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("OpenSSL with EC support is required"));
+        assert!(error.to_string().contains("OpenSSL 3 or newer"));
         assert!(!stack
             .calls()
             .iter()
             .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
+    }
+
+    #[test]
+    fn unsupported_openssl_fails_before_creating_keys_or_starting_the_host() {
+        for version in ["LibreSSL 3.3.6", "OpenSSL 1.1.1w", "unknown crypto tool"] {
+            let tmp = TempDir::new().unwrap();
+            let mut dev = DevManager::new(project(&tmp)).unwrap();
+            let stack = FakeStack::new().with_stdout("openssl version", version);
+            let error = dev
+                .up_native(
+                    &stack.runner(),
+                    &stack.inspector(),
+                    &FakeHttp::new(),
+                    ClientBind::Loopback,
+                    NativeMode::HotReload,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("OpenSSL 3 or newer"));
+            assert!(error.to_string().contains(version));
+            assert!(!dev.project.state_dir.join("native-jwt").exists());
+            assert!(!stack
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
+        }
     }
 
     #[test]
