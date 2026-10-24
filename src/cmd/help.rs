@@ -37,9 +37,9 @@ commands! {
     "doctor", "doctor", "Check prerequisites for dev up.";
     "bindings", "bindings [--check]", "Prepare Gateway Rust bindings outside the source tree. --check reports freshness as JSON without generating files.";
     "preflight", "preflight", "Validate the deploy build, schema, filters and artifact identities offline.";
-    "publish", "publish [DATABASE ...] [--skip-preflight]", "Publish the module to named databases or the development topology. No data-wiping flags. --skip-preflight skips preflight; binding preparation and upgrade checks still run.";
-    "dev up", "dev up [--single] [--lan IP]", "Start or reuse four local databases. --single uses one; --lan serves game clients on a private address while SpacetimeDB stays on loopback.";
-    "dev status", "dev status", "Report processes, published databases and gateway connections.";
+    "publish", "publish [DATABASE ...] [--skip-preflight] [--server URL]", "Publish the Module. Native checkouts accept an explicit loopback HTTP URL with --server and use their private publisher credential. --skip-preflight skips the offline checks. Legacy checkouts retain their upgrade Gates. Data-wiping flags are refused.";
+    "dev up", "dev up [--single] [--lan IP]", "Start the local Realm. Native Host checkouts use one Shard; older checkouts support --single. --lan serves game clients on a private address.";
+    "dev status", "dev status", "Report local processes, listeners and published Shards.";
     "dev logs", "dev logs [spacetime|gateway] [--all]", "Show the last 100 lines (up to 64 KiB) per log. --all streams the complete files.";
     "dev check", "dev check", "Alias for import check using the recorded development topology.";
     "dev smoke", "dev smoke ACCOUNT CHARACTER [--password-stdin]", "Check content, then exercise login/world entry through the pinned Headless Client. Passwords use a hidden prompt or one stdin line.";

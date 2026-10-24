@@ -17,7 +17,6 @@ use crate::cmd::dev::{operator_call_failure, reducer_url};
 use crate::http::HttpClient;
 use crate::proc::ProcessRunner;
 use crate::project::ProjectLayout;
-use crate::state::RuntimeState;
 use crate::{Error, Result};
 
 pub fn gm(
@@ -29,9 +28,7 @@ pub fn gm(
 ) -> Result<()> {
     let level = if enabled { 3 } else { 0 };
     let credential = crate::token::resolve_existing(runner, &project.token_file())?;
-    let shards = RuntimeState::load(&project.state_file())?
-        .topology()
-        .world_shards();
+    let shards = project.local_topology()?.world_shards();
     // Serialized rather than concatenated: hand-escaping a character name would be one more place
     // to forget an edge case.
     let arguments = serde_json::to_string(&(name, level))?;
@@ -63,6 +60,7 @@ mod tests {
     use crate::http::fake::FakeHttp;
     use crate::proc::fake::FakeStack;
     use crate::project::Topology;
+    #[cfg(test)]
     use crate::state::RuntimeState;
     use tempfile::TempDir;
 

@@ -4,6 +4,7 @@
 //! process. We pair the PID with the kernel's start time plus the command name, both read through
 //! POSIX `ps` — no `/proc` (absent on macOS), no `grep -P`, no GNU-only flags.
 
+use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::Command;
 use std::time::Duration;
@@ -29,6 +30,8 @@ pub trait ProcessInspector {
     /// Is something accepting connections on `host:port`? The host matters since `--lan`: a
     /// gateway bound to a LAN address does not answer on loopback.
     fn serving(&self, host: &str, port: u16) -> bool;
+
+    fn world_ready(&self, host: &str, port: u16) -> bool;
 }
 
 pub struct RealProcessInspector;
@@ -49,6 +52,30 @@ impl ProcessInspector for RealProcessInspector {
             .collect::<Vec<_>>()
             .join(" ");
         (!identity.is_empty()).then_some(identity)
+    }
+
+    fn world_ready(&self, host: &str, port: u16) -> bool {
+        let Ok(addresses) = (host, port).to_socket_addrs() else {
+            return false;
+        };
+        for address in addresses {
+            let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+            else {
+                continue;
+            };
+            if stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .is_err()
+            {
+                continue;
+            }
+            let mut packet = [0u8; 8];
+            // Build 5875 sends an unencrypted SMSG_AUTH_CHALLENGE with a four-byte seed.
+            if stream.read_exact(&mut packet).is_ok() && packet[..4] == [0, 6, 0xec, 1] {
+                return true;
+            }
+        }
+        false
     }
 
     fn serving(&self, host: &str, port: u16) -> bool {
@@ -112,5 +139,32 @@ mod tests {
         // as "not serving" rather than hanging or panicking.
         assert!(!inspector.serving("192.0.2.1", port));
         assert!(!inspector.serving("not a host", port));
+    }
+}
+
+#[cfg(test)]
+mod world_readiness_tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    #[test]
+    fn readiness_requires_the_complete_world_authentication_challenge() {
+        for (packet, expected) in [
+            (vec![0, 6, 0xec, 1, 1, 2, 3, 4], true),
+            (vec![0, 6, 0xed, 1, 1, 2, 3, 4], false),
+            (vec![0, 6, 0xec, 1], false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let writer = std::thread::spawn(move || {
+                listener.accept().unwrap().0.write_all(&packet).unwrap();
+            });
+            assert_eq!(
+                RealProcessInspector.world_ready("127.0.0.1", port),
+                expected
+            );
+            writer.join().unwrap();
+        }
     }
 }

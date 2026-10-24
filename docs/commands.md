@@ -44,7 +44,7 @@ lyracore help [--all | COMMAND ...]
 lyracore doctor
 lyracore bindings [--check]
 lyracore preflight
-lyracore publish [DATABASE ...] [--skip-preflight]
+lyracore publish [DATABASE ...] [--skip-preflight] [--server URL]
 lyracore dev up [--single] [--lan IP]
 lyracore dev status
 lyracore dev logs [spacetime|gateway] [--all]
@@ -878,24 +878,38 @@ sql, so it is safe against a live stack:
 ./lyracore publish lyracore lyracore-world-1 realm-core   # several shards, in order
 ```
 
-With no names, this publishes every database of the fixture topology `dev up` and `dev status`
-already read from `.lyracore/state.json` — one database for an active single fixture, all of them
-for an active sharded fixture, or the default sharded topology if nothing has been recorded yet (a
-fresh clone that has never run `dev up`). Naming databases explicitly still publishes exactly those,
-in the order given.
+In legacy checkouts, omitting names publishes every database in the recorded fixture topology.
+An active single fixture has one database. An active sharded fixture uses all of its databases.
+Without a recorded fixture, the command uses the default sharded topology. Explicit names select
+exactly those databases, in the order given.
 
-Renders exactly `spacetime publish -s local -p <checkout>/module
---build-options=--features=debug_reducers --yes <DATABASE>`, runs `preflight` first, and publishes
-several databases sequentially, stopping at the first failure.
+Legacy checkouts render `spacetime publish -s local -p <checkout>/module
+--build-options=--features=debug_reducers --yes <DATABASE>`. The command runs `preflight` first,
+then publishes databases in order and stops at the first failure.
 
-Its arguments are database **NAMES**. **Every flag-shaped argument is refused** with exit 2, before
-any process starts — `-c`, `--delete-data`, `--clear-database` and `--clear` with a message naming
-it as the destructive wipe, anything else with the general refusal. Nothing is forwarded to
-`spacetime publish` that this CLI did not put there itself. The only recognised option is
-`--skip-preflight`. Binding preparation and Loot Roll upgrade checks still run.
+Database names cannot start with a flag. The CLI refuses destructive wipe flags and unknown
+options before starting a process. `--skip-preflight` skips offline checks. Legacy checkouts still
+prepare bindings and check Loot Roll upgrade readiness.
 
-This is the same contract the maintainers' internal deploy script carries — each of those cases is a
-unit test in the CLI too. [`docs/danger-zones.md`](https://github.com/LyraCoreProject/LyraCore/blob/main/docs/danger-zones.md) §1 remains authoritative.
+Native checkouts publish one Shard named `lyracore` by default, using
+`.lyracore/native-cli.toml` for the publisher identity. They do not run the legacy multi-Shard
+upgrade checks. To target a separate native node on the same machine, use:
+
+```bash
+./lyracore publish --server http://127.0.0.1:13000
+```
+
+`--server` requires a native checkout and its private publisher configuration. The URL must use
+HTTP, a numeric loopback address and a nonzero port. It cannot include credentials or a path.
+Without this option, native publishing targets `http://127.0.0.1:3000`. All native publishes
+require the private publisher configuration before any command runs. Publishing to port 3000
+requires a recorded Native Host with a matching live process identity and an answering endpoint.
+A stale `native_runtime` flag is insufficient. Stop recorded legacy processes with `dev down`,
+then use `dev up` to create the native Realm. An explicit target on another port can use an isolated
+native node while the legacy runtime remains recorded.
+
+[`docs/danger-zones.md`](https://github.com/LyraCoreProject/LyraCore/blob/main/docs/danger-zones.md)
+remains authoritative for deployment and data migrations.
 
 ## `production status` — read-only evidence for a named topology
 
@@ -921,7 +935,36 @@ Runtime files live in the git-ignored `.lyracore/` — `state.json` for the proc
 `logs/{spacetime,gateway}.log`, and `coordinator-token` (mode `0600`) if this host had no
 `spacetime login` and the CLI minted a local identity for it.
 
-## What `dev up` actually does
+## Native Host startup
+
+A Core checkout with `native-host/prepare-host.py` selects the native runtime. `dev up` builds
+that pinned host, starts its HTTP endpoint on `127.0.0.1:3000`, and opens the logon and world
+listeners on ports 3724 and 8085. `--lan` changes only the two game listener addresses. The host
+owns all three listeners. No Gateway process starts.
+
+Startup runs preflight, publishes one Shard named `lyracore`, claims the Operator, installs its
+GUID range and provisions the Realm address. It checks for an actual WoW world authentication
+challenge before reporting success. Publishing and Operator calls use the same retained identity.
+The CLI reuses the retained native credential first, then a SpacetimeDB login if available, or
+mints a local identity. It writes the credential
+and publisher configuration to `.lyracore/native-owner-token` and `.lyracore/native-cli.toml`,
+both with mode `0600`. Native publishes target the explicit loopback URI.
+
+Native state lives in `.lyracore/native-data`; startup creates a new local Realm there. It does
+not merge data from the old Shards. Stop a recorded legacy runtime with `dev down` first. An
+unrelated process on any required port causes startup to stop before publishing. The CLI records
+the Native Host before publishing, so `dev down` can still stop it after a later step fails.
+
+`publish` without names, content imports and Character operations select the single Shard for
+native checkouts. `account create` computes the SRP salt and verifier locally and calls the Module
+over authenticated loopback HTTP. It does not build or invoke a Gateway binary. The password stays
+out of process arguments and HTTP requests.
+
+`dev status` reports the host and its listeners. `dev logs` shows the host log, and `dev down`
+stops the recorded host. Repeating `dev up` reuses a healthy native runtime. Changing its listener
+addresses requires `dev down` first. `--single` remains accepted and has no effect on native startup.
+
+## Startup for older Core checkouts
 
 1. Starts SpacetimeDB on `127.0.0.1:3000`, **or reuses one already listening there.** A node the CLI
    did not start is never recorded and never stopped by `dev down`.
