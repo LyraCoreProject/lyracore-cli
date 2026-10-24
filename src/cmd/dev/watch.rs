@@ -11,14 +11,8 @@ const DEBOUNCE: Duration = Duration::from_millis(400);
 
 type Snapshot = BTreeMap<PathBuf, blake3::Hash>;
 
-struct PublishedModule {
-    host: ProcessRecord,
-    hash: String,
-}
-
 struct Reload {
     roots: Vec<PathBuf>,
-    published: Option<PublishedModule>,
 }
 
 impl DevManager {
@@ -38,13 +32,20 @@ impl DevManager {
             ClientBind::Loopback,
             NativeMode::HotReload,
         )?;
-        let mut reload = Reload::new(&self.project);
-        let mut observed = snapshot(&reload.roots)?;
+        let mut reload = Reload::new(&self.project, runner)?;
+        let mut observed = snapshot(&self.project.root, &reload.roots)?;
         let mut pending = true;
         let mut changed_at = Instant::now() - DEBOUNCE;
         println!("Watching Module source. Ctrl+C stops watch and leaves the Native Host running.");
         loop {
-            let current = snapshot(&reload.roots)?;
+            let current = match snapshot(&self.project.root, &reload.roots) {
+                Ok(current) => current,
+                Err(error) => {
+                    eprintln!("Cannot read watched source: {error}. Retrying.");
+                    sleep(POLL);
+                    continue;
+                }
+            };
             if current != observed {
                 observed = current;
                 changed_at = Instant::now();
@@ -136,7 +137,7 @@ fn publish_command(
     let state = RuntimeState::load(&project.state_file())?;
     if !state.native_hot_reload {
         return Err(Error::Usage(
-            "dev watch requires a development Native Host; run `lyracore dev down` first".into(),
+            "dev watch requires Development reload; run `lyracore dev down` first".into(),
         ));
     }
     Ok(CommandSpec::new("spacetime")
@@ -155,11 +156,12 @@ fn publish_command(
 }
 
 impl Reload {
-    fn new(project: &ProjectLayout) -> Self {
-        Self {
+    fn new(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<Self> {
+        let mut reload = Self {
             roots: source_roots(project),
-            published: None,
-        }
+        };
+        reload.refresh_roots(project, runner)?;
+        Ok(reload)
     }
 
     /// False means sources changed during compilation; retry after they settle.
@@ -171,10 +173,10 @@ impl Reload {
     ) -> Result<bool> {
         let total = Instant::now();
         self.refresh_roots(project, runner)?;
-        let before = snapshot(&self.roots)?;
+        let before = snapshot(&project.root, &self.roots)?;
         println!("Building development Module...");
         let build = Instant::now();
-        let (built, stale) = monitored_build(&self.roots, before, || {
+        let (built, stale) = monitored_build(&project.root, &self.roots, before, || {
             runner.run_streaming(&build_command(project))
         })?;
         let build_time = build.elapsed();
@@ -189,34 +191,13 @@ impl Reload {
             "{error}\nBuild failed; no Module was published. Build {:.2}s, publish 0.00s, total {:.2}s.",
             build_time.as_secs_f64(), total.elapsed().as_secs_f64()
         )))?;
-        let hash = blake3::hash(&fs::read(wasm_path(project))?)
-            .to_hex()
-            .to_string();
         let command = publish_command(project, inspector)?;
-        let host = RuntimeState::load(&project.state_file())?
-            .spacetime
-            .ok_or_else(|| Error::State("Native Host record disappeared".into()))?;
-        if self
-            .published
-            .as_ref()
-            .is_some_and(|published| published.host == host && published.hash == hash)
-        {
-            println!(
-                "WASM unchanged; skipped publish. Build {:.2}s, publish 0.00s, total {:.2}s.",
-                build_time.as_secs_f64(),
-                total.elapsed().as_secs_f64()
-            );
-            return Ok(true);
-        }
-        self.published = None;
         println!("Publishing development Module to the local Native Host...");
         let publish = Instant::now();
         runner.run_streaming(&command).map_err(|error| Error::Process(format!(
-            "{error}\nPublish failed; the HTTP outcome may be unknown. Inspect the Native Host log before assuming the previous Module is active. Build {:.2}s, publish {:.2}s, total {:.2}s.",
+            "{error}\nPublish failed; the command output above gives the reason. A lost HTTP connection can leave the outcome unknown. For Module definition changes, see docs/quickstart.md#development-reload in this Core checkout. Build {:.2}s, publish {:.2}s, total {:.2}s.",
             build_time.as_secs_f64(), publish.elapsed().as_secs_f64(), total.elapsed().as_secs_f64()
         )))?;
-        let published = PublishedModule { host, hash };
-        self.published = Some(published);
         println!(
             "Module updated. Build {:.2}s, publish {:.2}s, total {:.2}s.",
             build_time.as_secs_f64(),
@@ -240,14 +221,46 @@ impl Reload {
             .as_array()
             .ok_or_else(|| Error::Process("cargo metadata returned no packages".into()))?;
         let mut roots: BTreeSet<_> = source_roots(project).into_iter().collect();
-        for package in packages
+        let module = packages
             .iter()
-            .filter(|package| package["source"].is_null())
-        {
-            if let Some(manifest) = package["manifest_path"].as_str() {
-                if let Some(directory) = Path::new(manifest).parent() {
-                    roots.insert(directory.to_path_buf());
-                }
+            .find(|package| package["name"] == ProjectLayout::MODULE_PACKAGE)
+            .and_then(|package| package["id"].as_str())
+            .ok_or_else(|| Error::Process("cargo metadata returned no lyracore-module".into()))?;
+        let nodes = metadata["resolve"]["nodes"]
+            .as_array()
+            .ok_or_else(|| Error::Process("cargo metadata returned no dependency graph".into()))?;
+        let nodes: BTreeMap<_, _> = nodes
+            .iter()
+            .filter_map(|node| node["id"].as_str().map(|id| (id, node)))
+            .collect();
+        let mut selected = BTreeSet::new();
+        let mut pending = vec![module];
+        while let Some(id) = pending.pop() {
+            if !selected.insert(id) {
+                continue;
+            }
+            if let Some(dependencies) = nodes
+                .get(id)
+                .and_then(|node| node["dependencies"].as_array())
+            {
+                pending.extend(
+                    dependencies
+                        .iter()
+                        .filter_map(|dependency| dependency.as_str()),
+                );
+            }
+        }
+        for package in packages.iter().filter(|package| {
+            package["source"].is_null()
+                && package["id"]
+                    .as_str()
+                    .is_some_and(|id| selected.contains(id))
+        }) {
+            if let Some(directory) = package["manifest_path"]
+                .as_str()
+                .and_then(|path| Path::new(path).parent())
+            {
+                roots.insert(directory.to_path_buf());
             }
         }
         self.roots = roots.into_iter().collect();
@@ -256,6 +269,7 @@ impl Reload {
 }
 
 fn monitored_build(
+    project_root: &Path,
     roots: &[PathBuf],
     before: Snapshot,
     build: impl FnOnce() -> Result<()>,
@@ -266,7 +280,7 @@ fn monitored_build(
             let mut stale = false;
             loop {
                 let finished = receive.recv_timeout(POLL) != Err(mpsc::RecvTimeoutError::Timeout);
-                stale |= snapshot(roots)? != before;
+                stale |= snapshot(project_root, roots)? != before;
                 if finished {
                     return Ok(stale);
                 }
@@ -284,7 +298,6 @@ fn monitored_build(
 fn source_roots(project: &ProjectLayout) -> Vec<PathBuf> {
     [
         "module",
-        "crates",
         "packages",
         "build_support",
         "Cargo.toml",
@@ -300,57 +313,94 @@ fn source_roots(project: &ProjectLayout) -> Vec<PathBuf> {
     .collect()
 }
 
-fn snapshot(roots: &[PathBuf]) -> Result<Snapshot> {
-    fn ignored(path: &Path) -> bool {
+fn snapshot(project_root: &Path, roots: &[PathBuf]) -> Result<Snapshot> {
+    fn excluded(path: &Path) -> bool {
         path.components().any(|component| {
             let name = component.as_os_str().to_string_lossy();
-            name.starts_with('.')
+            name == ".git"
+                || name == ".lyracore"
                 || name == "target"
                 || name.starts_with("target-")
                 || name == "node_modules"
         })
     }
-    fn visit(path: &Path, visited: &mut BTreeSet<PathBuf>, files: &mut Snapshot) -> Result<()> {
+    fn absent(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    }
+    fn visit(
+        path: &Path,
+        project_root: &Path,
+        source_root: &Path,
+        visited: &mut BTreeSet<PathBuf>,
+        files: &mut Snapshot,
+    ) -> Result<()> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if absent(&error) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         if metadata.file_type().is_symlink() {
+            let target = match fs::read_link(path) {
+                Ok(target) => target,
+                Err(error)
+                    if absent(&error) || error.kind() == std::io::ErrorKind::InvalidInput =>
+                {
+                    return Ok(())
+                }
+                Err(error) => return Err(error.into()),
+            };
             files.insert(
                 path.to_path_buf(),
-                blake3::hash(fs::read_link(path)?.as_os_str().as_encoded_bytes()),
+                blake3::hash(target.as_os_str().as_encoded_bytes()),
             );
         }
         let canonical = match path.canonicalize() {
             Ok(canonical) => canonical,
             Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
+                if absent(&error)
                     || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
             {
                 return Ok(())
             }
             Err(error) => return Err(error.into()),
         };
-        if canonical.components().any(|part| {
-            let name = part.as_os_str().to_string_lossy();
-            name == ".git"
-                || name == ".lyracore"
-                || name == "target"
-                || name.starts_with("target-")
-                || name == "node_modules"
-        }) || !visited.insert(canonical)
+        if [project_root, source_root]
+            .iter()
+            .any(|root| canonical.strip_prefix(root).is_ok_and(excluded))
+            || !visited.insert(canonical.clone())
         {
             return Ok(());
         }
+        let source_root =
+            if canonical.starts_with(source_root) || canonical.starts_with(project_root) {
+                source_root
+            } else if path.is_dir() {
+                canonical.as_path()
+            } else {
+                canonical.parent().unwrap_or(&canonical)
+            };
         if path.is_dir() {
-            let mut entries = fs::read_dir(path)?
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<std::io::Result<Vec<_>>>()?;
-            entries.sort();
+            let entries = match fs::read_dir(path) {
+                Ok(entries) => entries,
+                Err(error) if absent(&error) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+            let mut paths = Vec::new();
             for entry in entries {
-                if !ignored(Path::new(entry.file_name().unwrap_or_default())) {
-                    visit(&entry, visited, files)?;
+                match entry {
+                    Ok(entry) => paths.push(entry.path()),
+                    Err(error) if absent(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            paths.sort();
+            for entry in paths {
+                let name = entry.file_name().unwrap_or_default().to_string_lossy();
+                if !name.starts_with('.') && !excluded(Path::new(name.as_ref())) {
+                    visit(&entry, project_root, source_root, visited, files)?;
                 }
             }
         } else if path.is_file() {
@@ -362,12 +412,11 @@ fn snapshot(roots: &[PathBuf]) -> Result<Snapshot> {
                     "rust-toolchain.toml",
                     "rust-toolchain",
                     "events.json",
+                    "config",
+                    "config.toml",
                 ]
                 .iter()
                 .any(|wanted| name == *wanted)
-                || ["config", "config.toml"]
-                    .iter()
-                    .any(|wanted| name == *wanted)
                 || path
                     .components()
                     .any(|part| part.as_os_str() == "build_support")
@@ -376,17 +425,18 @@ fn snapshot(roots: &[PathBuf]) -> Result<Snapshot> {
                     Ok(bytes) => {
                         files.insert(path.to_path_buf(), blake3::hash(&bytes));
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) if absent(&error) => {}
                     Err(error) => return Err(error.into()),
                 }
             }
         }
         Ok(())
     }
+    let project_root = project_root.canonicalize()?;
     let mut files = BTreeMap::new();
     let mut visited = BTreeSet::new();
     for root in roots {
-        visit(root, &mut visited, &mut files)?;
+        visit(root, &project_root, &project_root, &mut visited, &mut files)?;
     }
     Ok(files)
 }
@@ -399,6 +449,14 @@ mod tests {
     use std::cell::Cell;
     use tempfile::TempDir;
 
+    fn module_metadata(project: &ProjectLayout) -> serde_json::Value {
+        serde_json::json!({
+            "packages": [{"id": "module", "name": ProjectLayout::MODULE_PACKAGE,
+                "manifest_path": project.module_manifest(), "source": null}],
+            "resolve": {"nodes": [{"id": "module", "dependencies": []}]}
+        })
+    }
+
     struct Fixture {
         _tmp: TempDir,
         dev: DevManager,
@@ -407,7 +465,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
+            Self::from_directory(TempDir::new().unwrap())
+        }
+
+        fn from_directory(tmp: TempDir) -> Self {
             let root = tmp.path();
             fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
             fs::write(
@@ -426,7 +487,8 @@ mod tests {
             fs::write(root.join("native-host/prepare-host.py"), "").unwrap();
             fs::write(root.join("native-host/dev-reload.patch"), "patch").unwrap();
             let project = ProjectLayout::from_root(root).unwrap();
-            let stack = FakeStack::new().with_stdout("cargo metadata", r#"{"packages":[]}"#);
+            let stack = FakeStack::new()
+                .with_stdout("cargo metadata", &module_metadata(&project).to_string());
             Self {
                 _tmp: tmp,
                 dev: DevManager::new(project).unwrap(),
@@ -674,29 +736,32 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_wasm_skips_publish_but_new_watcher_checks_the_existing_module() {
+    fn every_successful_build_publishes_even_after_a_manual_publish() {
         let mut fixture = Fixture::new();
         fixture.start();
-        let mut reload = Reload::new(fixture.project());
+        let mut reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
         let compiler = fixture.compiler(|| fixture.artifact(b"wasm A"));
         assert!(reload
             .update(fixture.project(), &compiler, &fixture.stack.inspector())
             .unwrap());
+        fixture.artifact(b"manual wasm").unwrap();
+        fixture
+            .stack
+            .runner()
+            .run_streaming(&publish_command(fixture.project(), &fixture.stack.inspector()).unwrap())
+            .unwrap();
         assert!(reload
             .update(fixture.project(), &compiler, &fixture.stack.inspector())
             .unwrap());
-        assert_eq!(fixture.publish_count(), 1);
-        assert!(Reload::new(fixture.project())
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
-            .unwrap());
-        assert_eq!(fixture.publish_count(), 2);
+        assert_eq!(fixture.publish_count(), 3);
+        assert_eq!(fs::read(wasm_path(fixture.project())).unwrap(), b"wasm A");
     }
 
     #[test]
     fn compilation_failure_retains_the_previous_module_and_next_edit_can_publish() {
         let mut fixture = Fixture::new();
         fixture.start();
-        let mut reload = Reload::new(fixture.project());
+        let mut reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
         let fail = Cell::new(false);
         let compiler = fixture.compiler(|| {
             if fail.get() {
@@ -714,27 +779,23 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("no Module was published"));
         assert_eq!(fixture.publish_count(), 1);
-        assert_eq!(
-            reload.published.as_ref().unwrap().hash,
-            blake3::hash(b"working wasm").to_hex().to_string()
-        );
         fail.set(false);
         reload
             .update(fixture.project(), &compiler, &fixture.stack.inspector())
             .unwrap();
-        assert_eq!(fixture.publish_count(), 1);
+        assert_eq!(fixture.publish_count(), 2);
         let changed = fixture.compiler(|| fixture.artifact(b"fixed wasm"));
         reload
             .update(fixture.project(), &changed, &fixture.stack.inspector())
             .unwrap();
-        assert_eq!(fixture.publish_count(), 2);
+        assert_eq!(fixture.publish_count(), 3);
     }
 
     #[test]
     fn a_source_change_during_build_discards_the_artifact_and_rebuilds_latest() {
         let mut fixture = Fixture::new();
         fixture.start();
-        let mut reload = Reload::new(fixture.project());
+        let mut reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
         let source = fixture.project().module_sources().join("lib.rs");
         let compiler = fixture.compiler(|| {
             fixture.artifact(b"stale wasm")?;
@@ -751,8 +812,8 @@ mod tests {
             .unwrap());
         assert_eq!(fixture.publish_count(), 1);
         assert_eq!(
-            reload.published.as_ref().unwrap().hash,
-            blake3::hash(b"latest wasm").to_hex().to_string()
+            fs::read(wasm_path(fixture.project())).unwrap(),
+            b"latest wasm"
         );
     }
 
@@ -760,7 +821,7 @@ mod tests {
     fn source_saved_then_restored_during_compilation_still_discards_the_candidate() {
         let mut fixture = Fixture::new();
         fixture.start();
-        let mut reload = Reload::new(fixture.project());
+        let mut reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
         let source = fixture.project().module_sources().join("lib.rs");
         let original = fs::read(&source).unwrap();
         let compiler = fixture.compiler(|| {
@@ -776,30 +837,35 @@ mod tests {
     }
 
     #[test]
-    fn publish_failure_forgets_the_confirmed_hash_because_http_outcome_can_be_unknown() {
-        let mut fixture = Fixture::new();
-        fixture.start();
-        let mut reload = Reload::new(fixture.project());
-        let compiler = fixture.compiler(|| fixture.artifact(b"old wasm"));
-        reload
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
-            .unwrap();
-        let failed = FakeStack::new()
-            .with_stdout("cargo metadata", r#"{"packages":[]}"#)
-            .fail_on(" publish ", "connection reset");
-        let changed = Compiler {
-            stack: &failed,
-            build: || fixture.artifact(b"new wasm"),
-        };
-        let error = reload
-            .update(fixture.project(), &changed, &fixture.stack.inspector())
-            .unwrap_err();
-        assert!(error.to_string().contains("outcome may be unknown"));
-        assert!(reload.published.is_none());
-        reload
-            .update(fixture.project(), &compiler, &fixture.stack.inspector())
-            .unwrap();
-        assert_eq!(fixture.publish_count(), 2);
+    fn publish_failure_reports_the_reason_and_the_next_build_can_publish() {
+        for reason in ["connection reset", "Module definitions differ"] {
+            let mut fixture = Fixture::new();
+            fixture.start();
+            let mut reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
+            let compiler = fixture.compiler(|| fixture.artifact(b"old wasm"));
+            reload
+                .update(fixture.project(), &compiler, &fixture.stack.inspector())
+                .unwrap();
+            let failed = FakeStack::new()
+                .with_stdout(
+                    "cargo metadata",
+                    &module_metadata(fixture.project()).to_string(),
+                )
+                .fail_on(" publish ", reason);
+            let changed = Compiler {
+                stack: &failed,
+                build: || fixture.artifact(b"new wasm"),
+            };
+            let error = reload
+                .update(fixture.project(), &changed, &fixture.stack.inspector())
+                .unwrap_err();
+            assert!(error.to_string().contains("lost HTTP connection"));
+            assert!(error.to_string().contains(reason));
+            reload
+                .update(fixture.project(), &compiler, &fixture.stack.inspector())
+                .unwrap();
+            assert_eq!(fixture.publish_count(), 2);
+        }
     }
 
     #[test]
@@ -813,16 +879,18 @@ mod tests {
         let external = TempDir::new().unwrap();
         fs::write(external.path().join("Cargo.toml"), "[package]").unwrap();
         fs::write(external.path().join("lib.rs"), "fn external() {}").unwrap();
-        let metadata = serde_json::json!({"packages": [{"manifest_path": external.path().join("Cargo.toml"), "source": null}]});
+        let mut metadata = module_metadata(fixture.project());
+        metadata["packages"].as_array_mut().unwrap().push(serde_json::json!({"id": "external", "manifest_path": external.path().join("Cargo.toml"), "source": null}));
+        metadata["resolve"]["nodes"][0]["dependencies"] = serde_json::json!(["external"]);
         let stack = fixture
             .stack
             .clone()
             .with_stdout("cargo metadata", &metadata.to_string());
-        let mut reload = Reload::new(fixture.project());
+        let mut reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
         reload
             .refresh_roots(fixture.project(), &stack.runner())
             .unwrap();
-        let before = snapshot(&reload.roots).unwrap();
+        let before = snapshot(&fixture.project().root, &reload.roots).unwrap();
         for path in [
             root.join("module/build_support/input.txt"),
             root.join("datascripts/runtime-scripts/events.json"),
@@ -833,9 +901,151 @@ mod tests {
         }
         fs::create_dir_all(root.join("module/target/out")).unwrap();
         fs::write(root.join("module/target/out/generated.rs"), "generated").unwrap();
-        assert_eq!(before, snapshot(&reload.roots).unwrap());
+        assert_eq!(
+            before,
+            snapshot(&fixture.project().root, &reload.roots).unwrap()
+        );
         fs::write(external.path().join("lib.rs"), "fn changed() {}").unwrap();
-        assert_ne!(before, snapshot(&reload.roots).unwrap());
+        assert_ne!(
+            before,
+            snapshot(&fixture.project().root, &reload.roots).unwrap()
+        );
+    }
+
+    #[test]
+    fn checkout_under_a_target_named_parent_still_observes_source_edits() {
+        let parent = TempDir::new().unwrap();
+        let target_parent = parent.path().join("target-x");
+        fs::create_dir(&target_parent).unwrap();
+        let fixture = Fixture::from_directory(TempDir::new_in(&target_parent).unwrap());
+        let reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
+        let before = snapshot(&fixture.project().root, &reload.roots).unwrap();
+        let source = fixture.project().module_sources().join("lib.rs");
+        assert!(before.contains_key(&source));
+        fs::write(source, "fn changed() {}\n").unwrap();
+        assert_ne!(
+            before,
+            snapshot(&fixture.project().root, &reload.roots).unwrap()
+        );
+    }
+
+    #[test]
+    fn initial_snapshot_contains_module_dependencies_and_ignores_unrelated_importer_edits() {
+        let fixture = Fixture::new();
+        let external = TempDir::new().unwrap();
+        fs::write(external.path().join("Cargo.toml"), "[package]").unwrap();
+        fs::write(external.path().join("lib.rs"), "fn dependency() {}").unwrap();
+        let importer = fixture.project().root.join("importer");
+        fs::create_dir_all(&importer).unwrap();
+        fs::write(importer.join("Cargo.toml"), "[package]").unwrap();
+        fs::write(importer.join("lib.rs"), "fn importer() {}").unwrap();
+        let mut metadata = module_metadata(fixture.project());
+        metadata["packages"].as_array_mut().unwrap().extend([
+            serde_json::json!({"id": "external", "manifest_path": external.path().join("Cargo.toml"), "source": null}),
+            serde_json::json!({"id": "importer", "manifest_path": importer.join("Cargo.toml"), "source": null}),
+        ]);
+        metadata["resolve"]["nodes"][0]["dependencies"] = serde_json::json!(["external"]);
+        let stack = fixture
+            .stack
+            .clone()
+            .with_stdout("cargo metadata", &metadata.to_string());
+        let mut reload = Reload::new(fixture.project(), &stack.runner()).unwrap();
+        let observed = snapshot(&fixture.project().root, &reload.roots).unwrap();
+        assert!(observed.contains_key(&external.path().join("lib.rs")));
+        reload
+            .refresh_roots(fixture.project(), &stack.runner())
+            .unwrap();
+        assert_eq!(
+            observed,
+            snapshot(&fixture.project().root, &reload.roots).unwrap()
+        );
+        fs::write(importer.join("lib.rs"), "fn unrelated_change() {}").unwrap();
+        assert_eq!(
+            observed,
+            snapshot(&fixture.project().root, &reload.roots).unwrap()
+        );
+    }
+
+    #[test]
+    fn deleting_directories_during_scans_does_not_stop_watching() {
+        let fixture = Fixture::new();
+        let reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
+        let temporary = fixture.project().module_sources().join("temporary");
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for _ in 0..100 {
+                    fs::create_dir_all(&temporary).unwrap();
+                    fs::write(temporary.join("generated.rs"), "fn temporary() {}").unwrap();
+                    fs::remove_dir_all(&temporary).unwrap();
+                }
+            });
+            while !writer.is_finished() {
+                snapshot(&fixture.project().root, &reload.roots).unwrap();
+            }
+            writer.join().unwrap();
+        });
+        assert!(!snapshot(&fixture.project().root, &reload.roots)
+            .unwrap()
+            .contains_key(&temporary.join("generated.rs")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_symlinks_during_scans_does_not_stop_watching() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
+        let link = fixture.project().module_sources().join("temporary.rs");
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for _ in 0..100 {
+                    symlink("lib.rs", &link).unwrap();
+                    fs::remove_file(&link).unwrap();
+                }
+            });
+            while !writer.is_finished() {
+                snapshot(&fixture.project().root, &reload.roots).unwrap();
+            }
+            writer.join().unwrap();
+        });
+        assert!(!snapshot(&fixture.project().root, &reload.roots)
+            .unwrap()
+            .contains_key(&link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliases_into_checkout_state_and_build_output_are_ignored() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let root = &fixture.project().root;
+        for output in [root.join(".lyracore/cache"), root.join("target/out")] {
+            fs::create_dir_all(&output).unwrap();
+            fs::write(output.join("generated.rs"), "fn generated() {}").unwrap();
+        }
+        symlink(
+            root.join(".lyracore/cache"),
+            root.join("module/src/state-alias"),
+        )
+        .unwrap();
+        symlink(
+            root.join("target/out"),
+            root.join("module/src/output-alias"),
+        )
+        .unwrap();
+        let reload = Reload::new(fixture.project(), &fixture.stack.runner()).unwrap();
+        let before = snapshot(root, &reload.roots).unwrap();
+        fs::write(
+            root.join(".lyracore/cache/generated.rs"),
+            "fn changed_state() {}",
+        )
+        .unwrap();
+        fs::write(
+            root.join("target/out/generated.rs"),
+            "fn changed_output() {}",
+        )
+        .unwrap();
+        assert_eq!(before, snapshot(root, &reload.roots).unwrap());
     }
 
     #[cfg(unix)]
@@ -855,7 +1065,7 @@ mod tests {
         symlink(external.path(), external.path().join("src/cycle")).unwrap();
         symlink("loop", external.path().join("src/loop")).unwrap();
         let roots = source_roots(fixture.project());
-        let before = snapshot(&roots).unwrap();
+        let before = snapshot(&fixture.project().root, &roots).unwrap();
         assert!(before.contains_key(&fixture.project().packages_dir().join("linked/src/mod.rs")));
         fs::create_dir_all(external.path().join("target")).unwrap();
         fs::write(external.path().join("target/generated.rs"), "A").unwrap();
@@ -864,10 +1074,16 @@ mod tests {
             external.path().join("output-alias"),
         )
         .unwrap();
-        let with_alias = snapshot(&roots).unwrap();
+        let with_alias = snapshot(&fixture.project().root, &roots).unwrap();
         fs::write(external.path().join("target/generated.rs"), "B").unwrap();
-        assert_eq!(with_alias, snapshot(&roots).unwrap());
+        assert_eq!(
+            with_alias,
+            snapshot(&fixture.project().root, &roots).unwrap()
+        );
         fs::write(external.path().join("src/mod.rs"), "fn changed() {}").unwrap();
-        assert_ne!(with_alias, snapshot(&roots).unwrap());
+        assert_ne!(
+            with_alias,
+            snapshot(&fixture.project().root, &roots).unwrap()
+        );
     }
 }

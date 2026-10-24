@@ -159,7 +159,7 @@ impl DevManager {
             && !self.state.native_hot_reload
         {
             return Err(Error::Process(
-                "the running Native Host uses a different development mode; run `lyracore dev down` first, then `lyracore dev watch` to enable hot reload".into(),
+                "the running Native Host uses a different development mode; run `lyracore dev down` first, then `lyracore dev watch` to enable Development reload".into(),
             ));
         }
         if matches!(
@@ -318,7 +318,7 @@ impl DevManager {
         let host = self.status_for(Component::Spacetime, inspector);
         println!("Native Host: {host:?}");
         if self.state.native_hot_reload {
-            println!("Development hot reload enabled.");
+            println!("Development reload enabled.");
         }
         for (name, port) in [
             ("logon", ProjectLayout::LOGON_PORT),

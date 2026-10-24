@@ -978,8 +978,10 @@ out of process arguments and HTTP requests.
 `dev status` reports the host and its listeners. `dev logs` shows the host log, and `dev down`
 stops the recorded host. Repeating `dev up` reuses a healthy native runtime. Changing its listener
 addresses requires `dev down` first. `--single` remains accepted and has no effect on native startup.
+The Native Host runs in a separate process group. Ctrl+C during startup leaves it running; use
+`dev down` to stop it.
 
-## Developer Module hot reload
+## Development reload
 
 ```bash
 ./lyracore dev watch
@@ -988,7 +990,7 @@ addresses requires `dev down` first. `--single` remains accepted and has no effe
 `dev watch` starts or reuses a loopback Native Host with `LYRACORE_NATIVE_DEV=1`. It requires
 `native-host/dev-reload.patch` in Core and the checkout's pinned `spacetime` CLI. An existing normal
 Host causes a refusal with `dev down` advice. Watch never restarts that Host. Normal `dev up`
-keeps its existing startup path and preserves the mode when it reuses a development Host.
+keeps its existing startup path and preserves Development reload when it reuses a running Host.
 `.lyracore/state.json` records this mode as `native_hot_reload`; older state defaults to false.
 
 The first watch build uses the development artifact, including on a fresh local Realm. It does
@@ -1013,7 +1015,7 @@ including a change to the `debug_reducers` feature set, require a separate expli
 workflow. The first publish checks any Module already present in `native-data`. Watch forwards no
 extra publish flags and never selects a remote target or deletes content.
 
-Watch polls Rust source and Cargo manifests in the workspace and resolved local dependencies.
+Watch polls Rust source and Cargo manifests in the Module and its resolved local dependencies.
 It also watches enabled Package Rust source, `build_support` inputs, the Runtime Script
 `events.json`, Cargo configuration and Rust toolchain files. It ignores build output, hidden
 inventories and dependency caches. Package symlinks work; canonical paths prevent directory cycles
@@ -1021,15 +1023,30 @@ and aliases into build output from entering the watched inputs.
 
 Watch debounces edits for 400 ms and runs one build and publish at a time. A source change observed
 during compilation discards that candidate and builds the latest source after it settles. A change
-during publish schedules another build. Identical WASM bytes skip subsequent publishes in the same
-watch run. A new watch run checks the existing Module again. Build, publish and total elapsed times
-appear for each attempt.
+during publish schedules another build. Every successful build publishes its artifact. The Host
+handles identical WASM as a no-op, so a manual publish cannot make watch skip a later build's artifact.
+Build, publish and total elapsed times appear for each attempt.
 
 A compile failure sends no publish and leaves the current Module running. Watch waits for another
-edit and tries again. A failed publish also leaves watch running, but an HTTP failure can have an
-unknown outcome. Inspect `dev logs` before assuming which Module is active. The Host's schema Gate
-and transaction checks remain authoritative. Watch does not run repair or provisioning reducers
-for each reload.
+edit and tries again. A failed publish also leaves watch running. The command's output gives the
+actual reason, including definite compatibility refusals. If the HTTP connection is lost, the
+outcome can be unknown; inspect `dev logs` before assuming which Module is active. The Host's
+compatibility check and transaction checks remain authoritative. Watch does not run repair or
+provisioning reducers for each reload.
+
+For a local Module definition change, stop watch with Ctrl+C, then run:
+
+```bash
+./lyracore dev down
+./lyracore dev up
+./lyracore dev down
+./lyracore dev watch
+```
+
+Normal `dev up` attempts the standard SpacetimeDB migration without Development reload. If that
+publish is refused, perform the required manual migration before returning to watch. Package changes
+that publish a new Module definition require the same procedure. Package changes that keep the
+definition can use the normal apply workflow.
 
 One watcher can hold `.lyracore/dev-watch.lock` per checkout. Ctrl+C stops the watcher and its
 foreground build or publish. The Native Host runs in a separate process group and stays running.

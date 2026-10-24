@@ -40,7 +40,7 @@ commands! {
     "preflight", "preflight", "Validate the deploy build, schema, filters and artifact identities offline.";
     "publish", "publish [DATABASE ...] [--skip-preflight] [--server URL]", "Publish the Module. Native checkouts accept an explicit loopback HTTP URL with --server and use their private publisher credential. --skip-preflight skips the offline checks. Legacy checkouts retain their upgrade Gates. Data-wiping flags are refused.";
     "dev up", "dev up [--single] [--lan IP]", "Start the local Realm. Native Host checkouts use one Shard; older checkouts support --single. --lan serves game clients on a private address.";
-    "dev watch", "dev watch", "Start or reuse a local development Native Host and watch Module source. Requires native-host/dev-reload.patch. Schema changes are refused. Ctrl+C leaves the Host running; dev down stops it.";
+    "dev watch", "dev watch", "Start or reuse a local Native Host with Development reload and watch Module source. Requires native-host/dev-reload.patch. Module definition changes are refused. Ctrl+C leaves the Host running; dev down stops it.";
     "dev status", "dev status", "Report local processes, listeners and published Shards.";
     "dev logs", "dev logs [spacetime|gateway] [--all]", "Show the last 100 lines (up to 64 KiB) per log. --all streams the complete files.";
     "dev check", "dev check", "Alias for import check using the recorded development topology.";
