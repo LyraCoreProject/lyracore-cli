@@ -1,9 +1,122 @@
 use super::*;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativeMode {
     Normal,
     HotReload,
+}
+
+fn native_jwt_keys(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<PathBuf> {
+    let directory = project.state_dir.join("native-jwt");
+    let mut create = fs::DirBuilder::new();
+    create.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        create.mode(0o700);
+    }
+    create.create(&directory)?;
+    if fs::symlink_metadata(&directory)?.file_type().is_symlink() {
+        return Err(Error::State(
+            "native-jwt must be a private directory, not a symlink".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let private = directory.join("id_ecdsa");
+    let public = directory.join("id_ecdsa.pub");
+    let mut exists = [false; 2];
+    for (index, path) in [&private, &public].into_iter().enumerate() {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(Error::State(format!(
+                        "{} must be a regular JWT key file; no keys were replaced",
+                        path.display()
+                    )));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                }
+                exists[index] = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !exists[0] {
+        if exists[1] {
+            return Err(Error::State("Native Host JWT private key is missing while its public key exists; restore the private key instead of replacing the identity".into()));
+        }
+        let private_pem = Zeroizing::new(jwt_openssl(
+            runner,
+            &CommandSpec::new("openssl")
+                .arg("genpkey")
+                .arg("-algorithm")
+                .arg("EC")
+                .arg("-pkeyopt")
+                .arg("ec_paramgen_curve:P-256"),
+        )?);
+        persist_native_key(&directory, &private, private_pem.as_bytes())?;
+    }
+    jwt_openssl(
+        runner,
+        &CommandSpec::new("openssl")
+            .arg("pkey")
+            .arg("-in")
+            .arg(private.to_string_lossy())
+            .arg("-check")
+            .arg("-noout"),
+    )?;
+    let derived = jwt_openssl(
+        runner,
+        &CommandSpec::new("openssl")
+            .arg("pkey")
+            .arg("-in")
+            .arg(private.to_string_lossy())
+            .arg("-pubout"),
+    )?;
+    if !exists[1] {
+        persist_native_key(&directory, &public, derived.as_bytes())?;
+    }
+    let retained = jwt_openssl(
+        runner,
+        &CommandSpec::new("openssl")
+            .arg("pkey")
+            .arg("-pubin")
+            .arg("-in")
+            .arg(public.to_string_lossy())
+            .arg("-pubout"),
+    )?;
+    if retained != derived {
+        return Err(Error::State("Native Host JWT public and private keys do not match; restore the matching pair. No keys were replaced".into()));
+    }
+    Ok(directory)
+}
+
+fn jwt_openssl(runner: &dyn ProcessRunner, command: &CommandSpec) -> Result<String> {
+    runner.run_and_wait(command).map_err(|error| Error::PrerequisiteMissing(format!(
+        "could not prepare Native Host JWT keys: {error}. OpenSSL with EC support is required; existing key files were kept"
+    )))
+}
+
+fn persist_native_key(directory: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(bytes)?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error.into()),
+    }
 }
 
 impl DevManager {
@@ -92,6 +205,7 @@ impl DevManager {
                     )));
                 }
             }
+            let jwt_keys = native_jwt_keys(&self.project, runner)?;
             let checkout = self.project.state_dir.join("native-host/SpacetimeDB");
             println!("Building the Native Host...");
             runner.run_streaming(
@@ -118,6 +232,8 @@ impl DevManager {
             .arg(ProjectLayout::stdb_listen())
             .arg("--data-dir")
             .arg(self.project.state_dir.join("native-data").to_string_lossy())
+            .arg("--jwt-key-dir")
+            .arg(jwt_keys.to_string_lossy())
             .arg("--non-interactive")
             .env("LYRACORE_NATIVE_DATABASE", ProjectLayout::DATABASE)
             .env(
@@ -252,6 +368,163 @@ mod tests {
         std::fs::create_dir_all(root.join("native-host")).unwrap();
         std::fs::write(root.join("native-host/prepare-host.py"), "").unwrap();
         ProjectLayout::from_root(root).unwrap()
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_generates_a_private_pair() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let directory = native_jwt_keys(&project, &crate::proc::RealProcessRunner).unwrap();
+        assert!(directory.join("id_ecdsa").is_file());
+        assert!(directory.join("id_ecdsa.pub").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            for name in ["id_ecdsa", "id_ecdsa.pub"] {
+                assert_eq!(
+                    fs::metadata(directory.join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_reuses_both_keys_on_restart() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let private = Zeroizing::new(fs::read(directory.join("id_ecdsa")).unwrap());
+        let public = fs::read(directory.join("id_ecdsa.pub")).unwrap();
+        native_jwt_keys(&project, &runner).unwrap();
+        assert!(fs::read(directory.join("id_ecdsa")).unwrap() == *private);
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == public);
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_derives_a_missing_public_key_without_rotating_private_key() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let private = Zeroizing::new(fs::read(directory.join("id_ecdsa")).unwrap());
+        let public = fs::read(directory.join("id_ecdsa.pub")).unwrap();
+        fs::remove_file(directory.join("id_ecdsa.pub")).unwrap();
+        native_jwt_keys(&project, &runner).unwrap();
+        assert!(fs::read(directory.join("id_ecdsa")).unwrap() == *private);
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == public);
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_refuses_a_mismatched_pair_without_replacing_either_key() {
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let other_project = self::project(&other);
+        let other_directory = native_jwt_keys(&other_project, &runner).unwrap();
+        let private = Zeroizing::new(fs::read(directory.join("id_ecdsa")).unwrap());
+        let other_public = fs::read(other_directory.join("id_ecdsa.pub")).unwrap();
+        fs::write(directory.join("id_ecdsa.pub"), &other_public).unwrap();
+        let error = native_jwt_keys(&project, &runner).unwrap_err();
+        assert!(error.to_string().contains("do not match"));
+        assert!(fs::read(directory.join("id_ecdsa")).unwrap() == *private);
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == other_public);
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_refuses_corrupt_private_key_without_replacing_it() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let public = fs::read(directory.join("id_ecdsa.pub")).unwrap();
+        fs::write(directory.join("id_ecdsa"), b"invalid private PEM").unwrap();
+        assert!(native_jwt_keys(&project, &runner).is_err());
+        assert!(fs::read(directory.join("id_ecdsa")).unwrap() == b"invalid private PEM");
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == public);
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_refuses_a_public_key_without_its_private_key() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let public = fs::read(directory.join("id_ecdsa.pub")).unwrap();
+        fs::remove_file(directory.join("id_ecdsa")).unwrap();
+        let error = native_jwt_keys(&project, &runner).unwrap_err();
+        assert!(error.to_string().contains("restore the private key"));
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == public);
+        assert!(!directory.join("id_ecdsa").exists());
+    }
+
+    #[test]
+    fn openssl_failure_stops_native_start_before_build_or_spawn() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new().fail_on("openssl", "not found");
+        let error = dev
+            .up_native(
+                &stack.runner(),
+                &stack.inspector(),
+                &FakeHttp::new(),
+                ClientBind::Loopback,
+                NativeMode::HotReload,
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("OpenSSL with EC support is required"));
+        assert!(!stack
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
+    }
+
+    #[test]
+    fn native_start_preserves_configured_certificate_authority() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let config = project.state_dir.join("native-data/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let configured = "[certificate-authority]\njwt-priv-key-path = '/existing/private'\njwt-pub-key-path = '/existing/public'\n";
+        fs::write(&config, configured).unwrap();
+        let mut dev = DevManager::new(project).unwrap();
+        let stack = FakeStack::new();
+        dev.up_native(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+            NativeMode::HotReload,
+        )
+        .unwrap();
+        let calls = stack.calls();
+        let host = calls
+            .iter()
+            .find_map(|call| match call {
+                Call::Spawn { spec, .. } => Some(spec),
+                _ => None,
+            })
+            .unwrap();
+        assert!(host.args().windows(2).any(|args| args[0] == "--jwt-key-dir"
+            && args[1] == dev.project.state_dir.join("native-jwt").to_string_lossy()));
+        assert!(!host
+            .args()
+            .iter()
+            .any(|arg| arg == "--jwt-pub-key-path" || arg == "--jwt-priv-key-path"));
+        assert_eq!(fs::read_to_string(config).unwrap(), configured);
     }
 
     #[test]
