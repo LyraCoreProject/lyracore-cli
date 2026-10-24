@@ -74,11 +74,13 @@ fn run(command: Command) -> Result<i32> {
         Command::Publish {
             databases,
             skip_preflight,
+            server,
         } => cmd::publish::run(
             &ProjectLayout::discover()?,
             &runner,
             &databases,
             skip_preflight,
+            server.as_deref(),
         )
         .map(|_| EXIT_OK),
         Command::DevUp { bind, topology } => {

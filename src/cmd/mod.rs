@@ -30,10 +30,10 @@ pub enum Command {
         check: bool,
     },
     Publish {
-        /// The database names typed on the command line. Empty means none were — `publish::run`
-        /// resolves that against the recorded topology once it has discovered the project.
+        /// Empty names select the checkout's recorded topology.
         databases: Vec<String>,
         skip_preflight: bool,
+        server: Option<String>,
     },
     DevUp {
         bind: ClientBind,
@@ -150,20 +150,28 @@ impl Command {
                 "`preflight` takes no arguments (got '{other}')"
             ))),
 
-            // Everything that is not the one recognised option is a database NAME — and
-            // `publish::databases` is what refuses anything flag-shaped, including `-c`. An empty
-            // result is not yet a default: `publish::run` resolves it against the recorded
-            // topology once it has discovered the project (parsing happens before that).
             ["publish", rest @ ..] => {
-                let skip_preflight = rest.contains(&"--skip-preflight");
-                let names: Vec<String> = rest
-                    .iter()
-                    .filter(|arg| **arg != "--skip-preflight")
-                    .map(|arg| (*arg).to_string())
-                    .collect();
+                let mut skip_preflight = false;
+                let mut server = None;
+                let mut names = Vec::new();
+                let mut args = rest.iter();
+                while let Some(arg) = args.next() {
+                    match *arg {
+                        "--skip-preflight" => skip_preflight = true,
+                        "--server" if server.is_none() => {
+                            let value = args.next().ok_or_else(|| Error::Usage(
+                                "publish --server requires a loopback HTTP URL".into()
+                            ))?;
+                            publish::validate_native_server(value)?;
+                            server = Some((*value).to_string());
+                        }
+                        _ => names.push((*arg).to_string()),
+                    }
+                }
                 publish::databases(&names).map(|databases| Command::Publish {
                     databases,
                     skip_preflight,
+                    server,
                 })
             }
 
@@ -1071,6 +1079,7 @@ mod tests {
             Command::Publish {
                 databases: vec![],
                 skip_preflight: false,
+                server: None,
             }
         );
         assert_eq!(
@@ -1078,17 +1087,19 @@ mod tests {
             Command::Publish {
                 databases: vec!["lyracore".to_string(), "lyracore-world-1".to_string()],
                 skip_preflight: false,
+                server: None,
             }
         );
     }
 
     #[test]
-    fn skip_preflight_is_the_only_flag_publish_accepts() {
+    fn publish_accepts_skip_preflight_with_or_without_names() {
         assert_eq!(
             parse("publish --skip-preflight").unwrap(),
             Command::Publish {
                 databases: vec![],
                 skip_preflight: true,
+                server: None,
             }
         );
         assert_eq!(
@@ -1096,6 +1107,7 @@ mod tests {
             Command::Publish {
                 databases: vec!["realm-core".to_string()],
                 skip_preflight: true,
+                server: None,
             }
         );
     }
@@ -1116,6 +1128,26 @@ mod tests {
                 "`{line}` should be refused"
             );
             assert!(error.to_string().contains("Refusing"), "`{line}`: {error}");
+        }
+    }
+
+    #[test]
+    fn publish_parses_an_explicit_native_target() {
+        assert_eq!(
+            parse("publish --server http://127.0.0.1:13000 lyracore --skip-preflight").unwrap(),
+            Command::Publish {
+                databases: vec!["lyracore".into()],
+                skip_preflight: true,
+                server: Some("http://127.0.0.1:13000".into())
+            }
+        );
+        for command in [
+            "publish --server",
+            "publish --server local",
+            "publish --server http://127.0.0.1:13000 --server http://127.0.0.1:14000",
+            "publish --server http://127.0.0.1:13000 -c",
+        ] {
+            assert!(parse(command).is_err(), "{command}");
         }
     }
 

@@ -100,6 +100,19 @@ pub fn databases(args: &[String]) -> Result<Vec<String>> {
     Ok(args.to_vec())
 }
 
+pub fn validate_native_server(server: &str) -> Result<()> {
+    let valid = server
+        .strip_prefix("http://")
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| address.ip().is_loopback() && address.port() != 0);
+    if !valid {
+        return Err(Error::Usage(
+            "native publishing requires an explicit loopback HTTP address and nonzero port".into(),
+        ));
+    }
+    Ok(())
+}
+
 // See docs/commands.md for default publish targets during local runtime changes.
 fn recorded_databases(project: &ProjectLayout) -> Result<Vec<String>> {
     if project.has_native_host() {
@@ -129,8 +142,20 @@ fn database_list(databases: &[String]) -> String {
     }
 }
 
-/// The ONE correct publish invocation.
 pub fn publish_command(project: &ProjectLayout, database: &str) -> Result<CommandSpec> {
+    let server = if project.has_native_host() {
+        ProjectLayout::stdb_uri()
+    } else {
+        ProjectLayout::STDB_SERVER.into()
+    };
+    publish_command_to(project, database, &server)
+}
+
+fn publish_command_to(
+    project: &ProjectLayout,
+    database: &str,
+    server: &str,
+) -> Result<CommandSpec> {
     validate_database(VERB, database)?;
     let mut command = preflight::module_command(project, "spacetime");
     if project.has_native_host() && project.native_cli_config().is_file() {
@@ -141,13 +166,8 @@ pub fn publish_command(project: &ProjectLayout, database: &str) -> Result<Comman
     Ok(command
         .arg("publish")
         .arg("-s")
-        .arg(if project.has_native_host() {
-            ProjectLayout::stdb_uri()
-        } else {
-            ProjectLayout::STDB_SERVER.into()
-        })
+        .arg(server)
         .arg("-p")
-        // Absolute, so `lyracore` publishes this checkout's module from any subdirectory of it.
         .arg(project.module_dir().to_string_lossy().to_string())
         .arg(format!(
             "--build-options={}",
@@ -286,16 +306,20 @@ pub(crate) fn require_loot_roll_upgrade_ready(
     Ok(())
 }
 
-/// Publish to each database in turn, stopping at the first failure.
-///
-/// Fail-fast is deliberate: a half-published realm is the state the gateway reports as an unrelated
-/// mid-session hang, so continuing past a failure would bury the one line that explains it.
+/// Stops at the first failed publish and reports completed and unattempted targets.
 pub fn run(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
     databases: &[String],
     skip_preflight: bool,
+    server: Option<&str>,
 ) -> Result<()> {
+    if let Some(server) = server {
+        validate_native_server(server)?;
+        if !project.has_native_host() || !project.native_cli_config().is_file() {
+            return Err(Error::Usage("publish --server requires a native checkout and its private publisher configuration".into()));
+        }
+    }
     let databases = if databases.is_empty() {
         recorded_databases(project)?
     } else {
@@ -306,19 +330,23 @@ pub fn run(
     }
 
     if skip_preflight {
-        println!(
-            "· skipping preflight (--skip-preflight): binding preparation and Loot Roll upgrade checks still run."
-        );
+        println!("· skipping preflight (--skip-preflight)");
     } else {
         preflight::run(project, runner)?;
     }
 
-    require_loot_roll_upgrade_ready(project, runner, &databases)?;
+    if !project.has_native_host() {
+        require_loot_roll_upgrade_ready(project, runner, &databases)?;
+    }
 
     for (index, database) in databases.iter().enumerate() {
         println!();
         println!("==> publishing to {database}");
-        if let Err(error) = runner.run_streaming(&publish_command(project, database)?) {
+        let command = match server {
+            Some(server) => publish_command_to(project, database, server)?,
+            None => publish_command(project, database)?,
+        };
+        if let Err(error) = runner.run_streaming(&command) {
             return Err(Error::Process(format!(
                 "{error}\n  publish stopped at: {database}\n  completed: {}\n  not attempted: {}",
                 database_list(&databases[..index]),
@@ -329,7 +357,7 @@ pub fn run(
 
     println!();
     println!("published to: {}", databases.join(" "));
-    if databases == [ProjectLayout::DATABASE] {
+    if !project.has_native_host() && databases == [ProjectLayout::DATABASE] {
         println!(
             "NOTE: only {}. A SCHEMA change must be published to every shard of a sharded realm, \
              or the gateway",
@@ -365,6 +393,79 @@ mod tests {
     use super::*;
     use crate::proc::fake::FakeStack;
     use tempfile::TempDir;
+
+    #[test]
+    fn native_publish_uses_the_selected_node_and_private_publisher() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        std::fs::create_dir_all(&project.state_dir).unwrap();
+        std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'").unwrap();
+        let stack = FakeStack::new();
+        run(
+            &project,
+            &stack.runner(),
+            &[],
+            true,
+            Some("http://127.0.0.1:13000"),
+        )
+        .unwrap();
+        let commands = stack.rendered();
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(
+            commands[0].contains("publish -s http://127.0.0.1:13000"),
+            "{commands:?}"
+        );
+        assert!(commands[0].contains(&format!(
+            "--config-path {}",
+            project.native_cli_config().display()
+        )));
+        assert!(commands[0].ends_with("--yes lyracore"));
+    }
+
+    #[test]
+    fn native_target_requires_a_native_checkout_and_private_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        let stack = FakeStack::new();
+        assert!(run(
+            &project,
+            &stack.runner(),
+            &[],
+            true,
+            Some("http://127.0.0.1:13000")
+        )
+        .is_err());
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        assert!(run(
+            &project,
+            &stack.runner(),
+            &[],
+            true,
+            Some("http://127.0.0.1:13000")
+        )
+        .is_err());
+        assert!(stack.rendered().is_empty());
+    }
+
+    #[test]
+    fn native_target_refuses_non_loopback_and_ambiguous_addresses() {
+        for target in [
+            "local",
+            "http://localhost:13000",
+            "https://127.0.0.1:13000",
+            "http://127.0.0.1:0",
+            "http://159.69.88.70:13000",
+            "http://user:secret@127.0.0.1:13000",
+            "http://127.0.0.1:13000/path",
+        ] {
+            assert!(validate_native_server(target).is_err(), "{target}");
+        }
+        assert!(validate_native_server("http://127.0.0.1:13000").is_ok());
+        assert!(validate_native_server("http://[::1]:13000").is_ok());
+    }
 
     fn project(tmp: &TempDir) -> ProjectLayout {
         std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
@@ -546,7 +647,7 @@ mod tests {
         let stack = clean_old_schema_stack();
         let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
 
-        run(&project, &stack.runner(), &wanted, true).unwrap();
+        run(&project, &stack.runner(), &wanted, true, None).unwrap();
 
         let rendered = stack.rendered();
         let first_publish = rendered
@@ -580,6 +681,7 @@ mod tests {
             &stack.runner(),
             &names(&["lyracore", "--delete-data"]),
             true,
+            None,
         )
         .unwrap_err();
 
@@ -603,6 +705,7 @@ mod tests {
                 &stack.runner(),
                 &names(&["lyracore", "realm-core"]),
                 true,
+                None,
             )
             .unwrap_err();
 
@@ -632,7 +735,8 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             let project = loot_receipt_upgrade(&tmp);
 
-            let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+            let error =
+                run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap_err();
 
             assert!(
                 error.to_string().contains("Nothing was published"),
@@ -662,7 +766,7 @@ mod tests {
             .with_stdout("spacetime describe", &decoy)
             .with_stdout("FROM game_loot_roll WHERE", " n\n 1\n");
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap_err();
 
         assert!(
             error.to_string().contains("active or staging Loot Rolls"),
@@ -683,7 +787,7 @@ mod tests {
             &schema(&[LOOT_RECEIPT_TABLE, LOOT_RECEIPT_TABLE]),
         );
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap_err();
 
         assert!(error.to_string().contains("more than once"), "{error}");
         assert!(!stack
@@ -699,7 +803,7 @@ mod tests {
         let stack =
             FakeStack::new().with_stdout("spacetime describe", &schema(&[LOOT_RECEIPT_TABLE]));
 
-        run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap();
+        run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap();
 
         assert!(!stack
             .rendered()
@@ -733,6 +837,7 @@ mod tests {
             &stack.runner(),
             &names(&["lyracore", "realm-core"]),
             true,
+            None,
         )
         .unwrap();
 
@@ -769,7 +874,7 @@ mod tests {
             .fail_on("cargo check", "preflight must be skipped")
             .with_stdout("FROM game_loot_roll WHERE", " n\n 1\n");
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap_err();
 
         assert!(
             error.to_string().contains("active or staging Loot Rolls"),
@@ -791,7 +896,7 @@ mod tests {
         let project = healthy(&tmp);
         let stack = FakeStack::new().fail_on("spacetime describe", "must not inspect live state");
 
-        run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap();
+        run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap();
 
         assert_eq!(
             stack
@@ -808,7 +913,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = healthy(&tmp);
         let stack = FakeStack::new().fail_on("spacetime generate", "bad Module");
-        assert!(run(&project, &stack.runner(), &names(&["lyracore"]), true).is_err());
+        assert!(run(&project, &stack.runner(), &names(&["lyracore"]), true, None).is_err());
         assert!(!stack
             .rendered()
             .iter()
@@ -837,7 +942,7 @@ mod tests {
         record_active_topology(&project, Topology::Sharded);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true).unwrap();
+        run(&project, &stack.runner(), &[], true, None).unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -864,7 +969,7 @@ mod tests {
         record_active_topology(&project, Topology::Single);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true).unwrap();
+        run(&project, &stack.runner(), &[], true, None).unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -886,7 +991,7 @@ mod tests {
         let project = healthy(&tmp);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true).unwrap();
+        run(&project, &stack.runner(), &[], true, None).unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -913,7 +1018,7 @@ mod tests {
         state.save(&project.state_file()).unwrap();
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true).unwrap();
+        run(&project, &stack.runner(), &[], true, None).unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -930,7 +1035,14 @@ mod tests {
         record_active_topology(&project, Topology::Sharded);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &names(&["realm-core"]), true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &names(&["realm-core"]),
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -946,7 +1058,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let stack = FakeStack::new();
         let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
-        run(&healthy(&tmp), &stack.runner(), &wanted, true).unwrap();
+        run(&healthy(&tmp), &stack.runner(), &wanted, true, None).unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -970,7 +1082,7 @@ mod tests {
         let stack = FakeStack::new().fail_on("lyracore-world-1", "migration rejected");
         let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
 
-        let error = run(&healthy(&tmp), &stack.runner(), &wanted, true).unwrap_err();
+        let error = run(&healthy(&tmp), &stack.runner(), &wanted, true, None).unwrap_err();
         assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE);
         let message = error.to_string();
         assert!(
@@ -994,7 +1106,14 @@ mod tests {
 
         let stack = FakeStack::new();
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), false).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &names(&["lyracore"]),
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("Nothing was published"),
             "{error}"
@@ -1028,7 +1147,14 @@ mod tests {
         .unwrap();
         let stack = FakeStack::new();
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), false).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &names(&["lyracore"]),
+            false,
+            None,
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("Nothing was published"),
@@ -1053,6 +1179,7 @@ mod tests {
             &stack.runner(),
             &names(&["lyracore"]),
             false,
+            None,
         )
         .unwrap();
 
@@ -1074,7 +1201,7 @@ mod tests {
         let project = healthy(&tmp);
         // A Module build preflight would refuse.
         let stack = FakeStack::new().fail_on("cargo check", "invalid native build");
-        run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap();
+        run(&project, &stack.runner(), &names(&["lyracore"]), true, None).unwrap();
         assert!(
             stack
                 .rendered()

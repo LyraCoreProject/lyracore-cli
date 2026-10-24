@@ -44,7 +44,7 @@ lyracore help [--all | COMMAND ...]
 lyracore doctor
 lyracore bindings [--check]
 lyracore preflight
-lyracore publish [DATABASE ...] [--skip-preflight]
+lyracore publish [DATABASE ...] [--skip-preflight] [--server URL]
 lyracore dev up [--single] [--lan IP]
 lyracore dev status
 lyracore dev logs [spacetime|gateway] [--all]
@@ -888,14 +888,24 @@ Renders exactly `spacetime publish -s local -p <checkout>/module
 --build-options=--features=debug_reducers --yes <DATABASE>`, runs `preflight` first, and publishes
 several databases sequentially, stopping at the first failure.
 
-Its arguments are database **NAMES**. **Every flag-shaped argument is refused** with exit 2, before
-any process starts — `-c`, `--delete-data`, `--clear-database` and `--clear` with a message naming
-it as the destructive wipe, anything else with the general refusal. Nothing is forwarded to
-`spacetime publish` that this CLI did not put there itself. The only recognised option is
-`--skip-preflight`. Binding preparation and Loot Roll upgrade checks still run.
+Database names cannot start with a flag. The CLI refuses destructive wipe flags and unknown
+options before starting a process. `--skip-preflight` skips offline checks. Legacy checkouts still
+prepare bindings and check Loot Roll upgrade readiness.
 
-This is the same contract the maintainers' internal deploy script carries — each of those cases is a
-unit test in the CLI too. [`docs/danger-zones.md`](https://github.com/LyraCoreProject/LyraCore/blob/main/docs/danger-zones.md) §1 remains authoritative.
+Native checkouts publish one Shard named `lyracore` by default, using
+`.lyracore/native-cli.toml` for the publisher identity. They do not run the legacy multi-Shard
+upgrade checks. To target a separate native node on the same machine, use:
+
+```bash
+./lyracore publish --server http://127.0.0.1:13000
+```
+
+`--server` requires a native checkout and its private publisher configuration. The URL must use
+HTTP, a numeric loopback address and a nonzero port. It cannot include credentials or a path.
+Without this option, native publishing targets `http://127.0.0.1:3000`.
+
+[`docs/danger-zones.md`](https://github.com/LyraCoreProject/LyraCore/blob/main/docs/danger-zones.md)
+remains authoritative for deployment and data migrations.
 
 ## `production status` — read-only evidence for a named topology
 
