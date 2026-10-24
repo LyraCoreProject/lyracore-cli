@@ -1134,7 +1134,8 @@ mod tests {
         )
         .unwrap_err();
         let repair = format!(
-            "spacetime {publisher} call --server http://127.0.0.1:3000 lyracore debug_repair_after_publish"
+            "'spacetime' '--config-path' '{}' 'call' '--server' 'http://127.0.0.1:3000' 'lyracore' 'debug_repair_after_publish'",
+            project.native_cli_config().display()
         );
         assert!(error.to_string().contains(&repair), "{error}");
     }

@@ -418,10 +418,14 @@ pub(crate) fn publish_and_repair(
         })?;
     let repair = import::call_command(project, database, "debug_repair_after_publish");
     runner.run_and_wait(&repair).map_err(|error| {
+        let command = std::iter::once(repair.program())
+            .chain(repair.args().iter().map(String::as_str))
+            .map(|arg| super::packages::shell_quote(std::path::Path::new(arg)))
+            .collect::<Vec<_>>()
+            .join(" ");
         Error::Process(format!(
             "'{database}' was published, but schedule repair failed: {error}\n  \
-             Repair schedules with: {}",
-            repair.render()
+             Repair schedules with: {command}"
         ))
     })?;
     Ok(())
@@ -432,6 +436,58 @@ mod tests {
     use super::*;
     use crate::proc::fake::FakeStack;
     use tempfile::TempDir;
+
+    #[test]
+    fn native_repair_advice_preserves_shell_metacharacters_as_one_argument() {
+        let tmp = tempfile::Builder::new()
+            .prefix("native user's $(printf bad) ")
+            .tempdir()
+            .unwrap();
+        let project = healthy(&tmp);
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        std::fs::create_dir_all(&project.state_dir).unwrap();
+        std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'").unwrap();
+        RuntimeState {
+            native_runtime: true,
+            spacetime: Some(crate::state::ProcessRecord {
+                pid: 42,
+                identity: "native host".into(),
+            }),
+            ..Default::default()
+        }
+        .save(&project.state_file())
+        .unwrap();
+        let stack = FakeStack::new()
+            .with_process(42, "native host")
+            .with_port(3000)
+            .fail_on("debug_repair_after_publish", "operator only");
+        let error = publish_and_repair(&project, &stack.runner(), &stack.inspector(), "lyracore")
+            .unwrap_err()
+            .to_string();
+        let command = error.split_once("Repair schedules with: ").unwrap().1;
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -- {command}; printf '%s\\0' \"$@\""))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let arguments = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            vec![
+                b"spacetime".as_slice(),
+                b"--config-path",
+                project.native_cli_config().to_str().unwrap().as_bytes(),
+                b"call",
+                b"--server",
+                b"http://127.0.0.1:3000",
+                b"lyracore",
+                b"debug_repair_after_publish",
+                b"",
+            ]
+        );
+    }
 
     #[test]
     fn native_publish_uses_the_selected_node_and_private_publisher() {
