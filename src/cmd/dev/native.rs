@@ -11,7 +11,11 @@ pub(super) enum NativeMode {
 }
 
 fn native_jwt_keys(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<PathBuf> {
-    let version = jwt_openssl(runner, &CommandSpec::new("openssl").arg("version"))?;
+    let version = runner
+        .run_and_wait(&CommandSpec::new("openssl").arg("version"))
+        .map_err(|error| Error::PrerequisiteMissing(format!(
+            "could not check OpenSSL: {error}. OpenSSL 3 or newer on PATH is required; see docs/quickstart.md#1-prerequisites in this Core checkout"
+        )))?;
     let major = version
         .strip_prefix("OpenSSL ")
         .and_then(|value| value.split('.').next())
@@ -117,8 +121,8 @@ fn native_jwt_keys(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Resul
 }
 
 fn jwt_openssl(runner: &dyn ProcessRunner, command: &CommandSpec) -> Result<String> {
-    runner.run_and_wait(command).map_err(|error| Error::PrerequisiteMissing(format!(
-        "could not prepare Native Host JWT keys: {error}. OpenSSL 3 or newer on PATH is required; see docs/quickstart.md#1-prerequisites in this Core checkout. Existing key files were kept"
+    runner.run_and_wait(command).map_err(|error| Error::Process(format!(
+        "could not prepare Native Host JWT keys: {error}. No existing keys were replaced; restore damaged key files from the matching pair"
     )))
 }
 
@@ -476,7 +480,12 @@ mod tests {
         let directory = native_jwt_keys(&project, &runner).unwrap();
         let public = fs::read(directory.join("id_ecdsa.pub")).unwrap();
         fs::write(directory.join("id_ecdsa"), b"invalid private PEM").unwrap();
-        assert!(native_jwt_keys(&project, &runner).is_err());
+        let error = native_jwt_keys(&project, &runner).unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, Error::Process(_)));
+        assert!(message.contains(directory.join("id_ecdsa").to_string_lossy().as_ref()));
+        assert!(message.contains("No existing keys were replaced"));
+        assert!(!message.contains("OpenSSL 3 or newer"));
         assert!(fs::read(directory.join("id_ecdsa")).unwrap() == b"invalid private PEM");
         assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == public);
     }
