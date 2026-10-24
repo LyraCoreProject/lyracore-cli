@@ -30,7 +30,7 @@ pub enum Command {
         check: bool,
     },
     Publish {
-        /// Empty names select the checkout's recorded topology.
+        /// Empty names select the runtime defaults; see docs/commands.md.
         databases: Vec<String>,
         skip_preflight: bool,
         server: Option<String>,

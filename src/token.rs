@@ -1,38 +1,4 @@
-//! The coordinator's auth token — the one credential the fixture cannot run without.
-//!
-//! `game_account` and `game_session` are PRIVATE module tables. The gateway's coordinator
-//! connection subscribes to both, and `provision_account` is `require_operator`-gated, so an
-//! anonymous connection cannot read an account, cannot answer an SRP6 challenge, and cannot
-//! provision anything. What makes the connection privileged is `LYRACORE_COORDINATOR_TOKEN`
-//! carrying the identity that claimed the operator.
-//!
-//! Without it the gateway does not fail fast: it starts, warns, and then dies ~15s later on
-//! "coordinator subscriptions not applied within 15s", which reads like a node problem rather
-//! than a credential problem.
-//!
-//! ## Where the credential comes from (#297)
-//!
-//! In order, and the order is the whole design:
-//!
-//! 1. **`.lyracore/coordinator-token`** — a server-issued token this CLI minted on an earlier run.
-//!    It wins, because it is the identity that already called `claim_operator`: `claim_operator`
-//!    is idempotent for the SAME identity and refuses a different one, so preferring anything else
-//!    once this file exists would lock the checkout out of its own database.
-//! 2. **`spacetime login show --token`** — the dev-machine case. If the contributor already uses
-//!    SpacetimeDB, their existing identity is reused and nothing new is minted or stored.
-//! 3. **`POST /v1/identity` on the local node** — a SERVER-ISSUED identity, minted from the node
-//!    `dev up` just started and persisted at 0600 for step 1.
-//!
-//! Step 3 is what makes the quickstart anonymous. `spacetime login` (2.5.0) offers only the
-//! spacetimedb.com browser flow, so requiring it would put a third-party account signup in front of
-//! `git clone && ./lyracore dev up` — and a server-issued token is exactly as privileged here: the
-//! node issues it, the module trusts whoever claimed the operator, and this CLI claims the operator
-//! with the very token it just minted.
-//!
-//! The login token is asked of the `spacetime` CLI rather than parsed out of `cli.toml`, because
-//! the config file's location is the CLI's business and differs per platform — the production
-//! recipe in `docs/danger-zones.md` §3 greps `~/.config/spacetime/cli.toml` with `grep -oP`, which
-//! is both Linux-only twice over (the path and the PCRE flag) and exactly what this CLI must not do.
+//! See docs/commands.md for retained native and legacy Operator credentials.
 
 use crate::http::{self, HttpClient};
 use crate::proc::{CommandSpec, ProcessRunner};
@@ -49,12 +15,10 @@ const MIN_TOKEN_LEN: usize = 16;
 /// The node endpoint that mints a server-issued identity.
 const IDENTITY_PATH: &str = "/v1/identity";
 
-/// Where a credential came from. Besides diagnostics it decides one thing: whether
-/// `claim_operator` can be called through the `spacetime` CLI (which acts as the LOGIN identity)
-/// or must be called with this token directly.
+/// Selects the global CLI login or authenticated HTTP for privileged calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// Minted by an earlier run and read back from `.lyracore/coordinator-token`.
+    /// Read from the retained credential file for this runtime.
     Persisted,
     /// The `spacetime` CLI's own login.
     SpacetimeLogin,
@@ -62,7 +26,7 @@ pub enum Source {
     ServerIssued,
 }
 
-/// A coordinator credential. Its `Debug` is redacted, so it cannot reach a log line by accident.
+/// An Operator credential with redacted `Debug` output.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     token: String,
@@ -74,8 +38,7 @@ impl Credential {
         &self.token
     }
 
-    /// True when the `spacetime` CLI is NOT this identity, so anything privileged must be done
-    /// with the token rather than by shelling out to `spacetime call`.
+    /// True when privileged calls must use this credential instead of the global CLI login.
     pub fn is_server_issued(&self) -> bool {
         matches!(self.source, Source::Persisted | Source::ServerIssued)
     }
@@ -97,9 +60,7 @@ pub fn token_command() -> CommandSpec {
         .arg("--token")
 }
 
-/// `dev up`: the full ladder, minting from `node_uri` as the last resort.
-///
-/// `store` is `.lyracore/coordinator-token`, inside the git-ignored state directory.
+/// Prefers `store`, then the global CLI login, then mints from `node_uri`.
 pub fn resolve_or_mint(
     runner: &dyn ProcessRunner,
     http: &dyn HttpClient,

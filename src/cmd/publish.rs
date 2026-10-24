@@ -1,27 +1,4 @@
-//! `lyracore publish [DATABASE …]` — deploy the SpacetimeDB module to the LOCAL node, the ONE
-//! correct way.
-//!
-//! This absorbs the server repo's `scripts/publish-module.sh`. Two flags are baked in and one is
-//! unreachable:
-//!
-//! * `--build-options=--features=debug_reducers` — the debug module (`game_debug_readout` and
-//!   friends) is behind that Cargo feature. A plain build omits it, so publish reports a FALSE
-//!   "Removed table" breaking change and aborts. With the feature the build matches the deployed
-//!   (debug) schema, so there is no false alarm.
-//! * `--yes` — SpacetimeDB prompts "All clients will be disconnected" for ANY schema change, even
-//!   an additive END-appended `#[default]` column. It confirms ONLY that disconnect warning; it
-//!   does NOT bypass the data-destructive path. Without it, a non-interactive stdin makes even a
-//!   safe additive migration abort on EOF.
-//! * `-c` / `--delete-data` — the destructive wipe (docs/danger-zones.md §1). It is not baked in,
-//!   and it cannot be passed through: this command's arguments are database NAMES, and anything
-//!   flag-shaped is REFUSED before a single `spacetime` process is started.
-//!
-//! WHY IT TAKES DATABASE NAMES: a schema change needs EVERY shard republished. The original
-//! hardcoded one database, so every other shard was published by hand-typing the raw command — and
-//! the documented form of that dropped `--yes`. That is how two shards were once left behind
-//! missing a table while the others were current, which the gateway reported only as "realm-core
-//! unreachable — LOGONS WILL BE REFUSED". Passing them all in one command is what makes "all of
-//! them" checkable instead of remembered.
+//! See docs/commands.md for publish targets, credentials and migration checks.
 
 use crate::cmd::import;
 use crate::cmd::preflight;
@@ -90,9 +67,7 @@ pub fn validate_database(verb: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate the database names given on the command line. Empty means "none named" — `run` then
-/// resolves that against the persisted topology once it has a [`ProjectLayout`] to read; parsing
-/// happens before the project is discovered, so it cannot make that call itself.
+/// Empty names select the runtime defaults in `run`; see docs/commands.md.
 pub fn databases(args: &[String]) -> Result<Vec<String>> {
     for name in args {
         validate_database(VERB, name)?;
@@ -158,7 +133,21 @@ fn publish_command_to(
 ) -> Result<CommandSpec> {
     validate_database(VERB, database)?;
     let mut command = preflight::module_command(project, "spacetime");
-    if project.has_native_host() && project.native_cli_config().is_file() {
+    if project.has_native_host() {
+        validate_native_server(server)?;
+        if !project.native_cli_config().is_file() {
+            return Err(Error::Usage("native publishing requires its private publisher configuration; run `lyracore dev up` to prepare it".into()));
+        }
+        let state = RuntimeState::load(&project.state_file())?;
+        let port = server
+            .strip_prefix("http://")
+            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+            .map(|address| address.port());
+        if port == Some(ProjectLayout::STDB_PORT)
+            && (state.gateway.is_some() || (!state.native_runtime && state.spacetime.is_some()))
+        {
+            return Err(Error::Usage("native publishing cannot target the recorded legacy runtime; stop it with `lyracore dev down` and start a native Realm first".into()));
+        }
         command = command
             .arg("--config-path")
             .arg(project.native_cli_config().to_string_lossy());
@@ -316,8 +305,10 @@ pub fn run(
 ) -> Result<()> {
     if let Some(server) = server {
         validate_native_server(server)?;
-        if !project.has_native_host() || !project.native_cli_config().is_file() {
-            return Err(Error::Usage("publish --server requires a native checkout and its private publisher configuration".into()));
+        if !project.has_native_host() {
+            return Err(Error::Usage(
+                "publish --server requires a native checkout".into(),
+            ));
         }
     }
     let databases = if databases.is_empty() {
@@ -329,6 +320,14 @@ pub fn run(
         validate_database(VERB, database)?;
     }
 
+    let commands = databases
+        .iter()
+        .map(|database| match server {
+            Some(server) => publish_command_to(project, database, server),
+            None => publish_command(project, database),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     if skip_preflight {
         println!("· skipping preflight (--skip-preflight)");
     } else {
@@ -339,14 +338,10 @@ pub fn run(
         require_loot_roll_upgrade_ready(project, runner, &databases)?;
     }
 
-    for (index, database) in databases.iter().enumerate() {
+    for (index, (database, command)) in databases.iter().zip(&commands).enumerate() {
         println!();
         println!("==> publishing to {database}");
-        let command = match server {
-            Some(server) => publish_command_to(project, database, server)?,
-            None => publish_command(project, database)?,
-        };
-        if let Err(error) = runner.run_streaming(&command) {
+        if let Err(error) = runner.run_streaming(command) {
             return Err(Error::Process(format!(
                 "{error}\n  publish stopped at: {database}\n  completed: {}\n  not attempted: {}",
                 database_list(&databases[..index]),
@@ -422,6 +417,70 @@ mod tests {
             project.native_cli_config().display()
         )));
         assert!(commands[0].ends_with("--yes lyracore"));
+    }
+
+    #[test]
+    fn native_default_and_explicit_publish_refuse_missing_credentials_and_legacy_state() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        let stack = FakeStack::new();
+        let mut state = RuntimeState {
+            spacetime: Some(crate::state::ProcessRecord {
+                pid: 42,
+                identity: "legacy".into(),
+            }),
+            topology: "sharded".into(),
+            ..Default::default()
+        };
+        state.save(&project.state_file()).unwrap();
+        for target in [
+            None,
+            Some("http://127.0.0.1:3000"),
+            Some("http://[::1]:3000"),
+            Some("http://127.0.0.1:13000"),
+        ] {
+            let error = run(&project, &stack.runner(), &[], false, target).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("private publisher configuration"),
+                "{error}"
+            );
+        }
+        assert!(publish_command(&project, "lyracore").is_err());
+        std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'").unwrap();
+        for target in [
+            None,
+            Some("http://127.0.0.1:3000"),
+            Some("http://[::1]:3000"),
+        ] {
+            let error = run(&project, &stack.runner(), &[], false, target).unwrap_err();
+            assert!(
+                error.to_string().contains("recorded legacy runtime"),
+                "{error}"
+            );
+        }
+        assert!(publish_command(&project, "lyracore").is_err());
+        assert!(stack.rendered().is_empty());
+        run(
+            &project,
+            &stack.runner(),
+            &[],
+            true,
+            Some("http://127.0.0.1:13000"),
+        )
+        .unwrap();
+        state.native_runtime = true;
+        state.save(&project.state_file()).unwrap();
+        run(&project, &stack.runner(), &[], true, None).unwrap();
+        let commands = stack.rendered();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[1].contains("publish -s http://127.0.0.1:3000"));
+        assert!(commands
+            .iter()
+            .all(|command| command.contains("--config-path")));
     }
 
     #[test]

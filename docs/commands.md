@@ -902,7 +902,11 @@ upgrade checks. To target a separate native node on the same machine, use:
 
 `--server` requires a native checkout and its private publisher configuration. The URL must use
 HTTP, a numeric loopback address and a nonzero port. It cannot include credentials or a path.
-Without this option, native publishing targets `http://127.0.0.1:3000`.
+Without this option, native publishing targets `http://127.0.0.1:3000`. All native publishes
+require the private publisher configuration before any command runs. Publishing to port 3000
+refuses recorded legacy runtime processes. Stop those processes with `dev down`, then use
+`dev up` to create the native Realm. An explicit target on another port can use an isolated
+native node while the legacy runtime remains recorded.
 
 [`docs/danger-zones.md`](https://github.com/LyraCoreProject/LyraCore/blob/main/docs/danger-zones.md)
 remains authoritative for deployment and data migrations.
@@ -941,7 +945,8 @@ owns all three listeners. No Gateway process starts.
 Startup runs preflight, publishes one Shard named `lyracore`, claims the Operator, installs its
 GUID range and provisions the Realm address. It checks for an actual WoW world authentication
 challenge before reporting success. Publishing and Operator calls use the same retained identity.
-The CLI uses a SpacetimeDB login when available, or mints a local identity. It writes the credential
+The CLI reuses the retained native credential first, then a SpacetimeDB login if available, or
+mints a local identity. It writes the credential
 and publisher configuration to `.lyracore/native-owner-token` and `.lyracore/native-cli.toml`,
 both with mode `0600`. Native publishes target the explicit loopback URI.
 
