@@ -965,6 +965,10 @@ private key, corrupt key material or a mismatched pair stops startup without rep
 keys. The Host receives this directory through `--jwt-key-dir`; a certificate authority already
 set in `native-data/config.toml` retains precedence.
 
+`doctor` checks the same OpenSSL requirement for native checkouts. A missing command, LibreSSL,
+or an unsupported version is a blocking failure with a link to the installation instructions.
+The check reads the version only; it does not create or change signing keys.
+
 Native state lives in `.lyracore/native-data`; startup creates a new local Realm there. It does
 not merge data from the old Shards. Stop a recorded legacy runtime with `dev down` first. An
 unrelated process on any required port causes startup to stop before publishing. The CLI records
@@ -1287,9 +1291,10 @@ Three things that fail independently:
   (`docs/danger-zones.md` §3).
 
 `doctor` covers the prerequisites for getting there: the project layout, `rustc` against the
-version this checkout declares, Cargo, SpacetimeDB 2.7.1, the WASM target, and the three ports. It
-asks for a **minimum** version; `preflight` asks for an **exact** match against the pins, because
-one is "can you build this at all" and the other is "is it safe to deploy this".
+version this checkout declares, Cargo, SpacetimeDB 2.7.1, the WASM target, the three ports, and
+OpenSSL 3 or newer for a native checkout. It asks for a **minimum** version; `preflight` asks for
+an **exact** match against the pins, because one is "can you build this at all" and the other is
+"is it safe to deploy this".
 
 `doctor` also reports the **client data** path from `config.json` (§"`config`" above): unset, or set
 to something that no longer validates, is a `⚠` naming the problem and the `config set client-data`

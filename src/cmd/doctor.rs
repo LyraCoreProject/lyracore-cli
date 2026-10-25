@@ -5,6 +5,7 @@
 
 use crate::cmd::import;
 use crate::config::Config;
+use crate::proc::{require_openssl, ProcessRunner, RealProcessRunner};
 use crate::project::ProjectLayout;
 use crate::Result;
 use std::path::Path;
@@ -110,7 +111,7 @@ fn version_output(program: &str, args: &[&str]) -> Option<String> {
 }
 
 pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
-    vec![
+    let mut checks = vec![
         check_layout(layout),
         check_rust(layout.as_ref().ok()),
         check_tool(
@@ -124,7 +125,24 @@ pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
         check_wasm_opt(),
         check_ports(),
         check_client_data(layout.as_ref().ok()),
-    ]
+    ];
+    if let Some(check) = check_native_openssl(layout.as_ref().ok(), &RealProcessRunner) {
+        checks.push(check);
+    }
+    checks
+}
+
+fn check_native_openssl(
+    project: Option<&ProjectLayout>,
+    runner: &dyn ProcessRunner,
+) -> Option<Check> {
+    if !project.is_some_and(ProjectLayout::has_native_host) {
+        return None;
+    }
+    Some(match require_openssl(runner) {
+        Ok(banner) => Check::pass("OpenSSL", banner),
+        Err(error) => Check::fail("OpenSSL", error.to_string()),
+    })
 }
 
 /// Read the checkout's declared minimum Rust version out of its workspace manifest.
@@ -454,6 +472,58 @@ mod tests {
             Some(Version(1, 80, 1))
         );
         assert_eq!(parse_version("no version here"), None);
+    }
+
+    #[test]
+    fn native_openssl_requirement_matches_startup_without_writing_keys() {
+        use crate::proc::fake::FakeStack;
+        let tmp = TempDir::new().unwrap();
+        let project = workspace(&tmp);
+        std::fs::create_dir(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        for banner in [
+            "OpenSSL 3.0.0 7 Sep 2021",
+            "OpenSSL 3.6.5",
+            "OpenSSL 4.0.0",
+            "OpenSSL 3.6.0-dev",
+            "OpenSSL 3.1.5+quic",
+        ] {
+            let stack = FakeStack::new().with_stdout("openssl version", banner);
+            assert!(matches!(
+                check_native_openssl(Some(&project), &stack.runner()),
+                Some(Check::Pass { .. })
+            ));
+        }
+        for banner in [
+            "LibreSSL 3.3.6",
+            "OpenSSL 1.1.1w",
+            "OpenSSL 3.bad",
+            "unknown",
+        ] {
+            let stack = FakeStack::new().with_stdout("openssl version", banner);
+            let Some(Check::Fail { guidance, .. }) =
+                check_native_openssl(Some(&project), &stack.runner())
+            else {
+                panic!("{banner} must block native startup");
+            };
+            assert!(guidance.contains(banner));
+            assert!(guidance.contains("docs/quickstart.md#1-prerequisites"));
+        }
+        let stack = FakeStack::new().fail_on("openssl version", "not found");
+        assert!(check_native_openssl(Some(&project), &stack.runner())
+            .unwrap()
+            .is_blocking());
+        assert!(!project.state_dir.join("native-jwt").exists());
+    }
+
+    #[test]
+    fn legacy_doctor_does_not_require_the_native_signing_tool() {
+        let tmp = TempDir::new().unwrap();
+        let project = workspace(&tmp);
+        let stack = crate::proc::fake::FakeStack::new().fail_on("openssl", "not found");
+        assert!(check_native_openssl(Some(&project), &stack.runner()).is_none());
+        assert!(check_native_openssl(None, &stack.runner()).is_none());
+        assert!(stack.calls().is_empty());
     }
 
     #[test]
