@@ -161,6 +161,26 @@ pub(crate) fn retain_native_owner(
     })
 }
 
+pub(crate) fn native_owner(project: &crate::project::ProjectLayout) -> Result<Credential> {
+    let token = read_store(&project.token_file()).ok_or_else(|| {
+        Error::Usage(
+            "Development reload requires its retained publisher; run `lyracore dev up` first"
+                .into(),
+        )
+    })?;
+    let expected = format!("spacetimedb_token = {}", serde_json::to_string(&token)?);
+    let config = std::fs::read_to_string(project.native_cli_config()).map_err(|_| {
+        Error::Usage("cannot read native publisher configuration; restore the matching private configuration and retained token".into())
+    })?;
+    if config.trim() != expected {
+        return Err(Error::Usage("native publisher files disagree; restore the matching private configuration and retained token".into()));
+    }
+    Ok(Credential {
+        token,
+        source: Source::Persisted,
+    })
+}
+
 // Create private credential files at mode 0600, including before their first write.
 fn persist(path: &Path, token: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -506,6 +526,9 @@ mod tests {
     fn a_mint_response_without_a_token_is_refused() {
         struct Empty;
         impl HttpClient for Empty {
+            fn publish_module(&self, _: &str, _: &str, _: &[u8]) -> Result<()> {
+                panic!("publication is not part of this fixture")
+            }
             fn post_json(&self, _url: &str, _bearer: Option<&str>, _body: &str) -> Result<String> {
                 Ok(r#"{"identity":"c200"}"#.to_string())
             }

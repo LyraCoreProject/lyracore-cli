@@ -1,131 +1,147 @@
-//! The two loopback HTTP requests this CLI makes to the SpacetimeDB node itself.
-//!
-//! Everything else the CLI does goes through the `spacetime` binary — deliberately, because the
-//! CLI's config layout is its own business. Two things cannot: minting a **server-issued**
-//! identity (`POST /v1/identity`) and calling `claim_operator` **as that identity**. Neither has a
-//! `spacetime` sub-command that does not first write a token into the contributor's global
-//! `cli.toml`, and rewriting a global credential is not something `lyracore dev up` may do.
-//!
-//! Scope is exactly that: loopback, plaintext, two small JSON requests. There is no HTTPS, no
-//! redirect following, no keep-alive and no dependency — `http://127.0.0.1:3000` is the only
-//! address this ever talks to (`--lan` never moves the database), so a TLS stack would be
-//! unreachable code and a new dependency in a crate that is `cargo install`ed from git on a
-//! contributor's first run.
-//!
-//! ponytail: a hand-written HTTP/1.1 request rather than reqwest/ureq. Ceiling — it speaks only
-//! what these two endpoints answer with (`Connection: close`, and a body it does not have to
-//! frame-decode; see [`json_field`]). Upgrade path: if this ever needs a third endpoint with a
-//! streaming or chunk-critical response, take the dependency.
+//! See docs/commands.md for authenticated loopback requests and Development reload.
 
 use crate::{Error, Result};
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-/// A node that is up answers these instantly; one that is wedged must not hang `dev up` forever.
-const TIMEOUT: Duration = Duration::from_secs(15);
-
 pub trait HttpClient {
-    /// `POST url` with a JSON body, optionally authenticated as `bearer`, returning the response
-    /// body.
-    ///
-    /// `bearer` is a separate argument for the same reason a password is in
-    /// [`ProcessRunner::run_with_secret_stdin`](crate::proc::ProcessRunner::run_with_secret_stdin):
-    /// it can then be kept out of every error this returns, because no error is ever built from
-    /// the whole request.
+    // Keep the bearer separate from the URL and omit it from diagnostics.
     fn post_json(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<String>;
+    fn publish_module(&self, url: &str, bearer: &str, wasm: &[u8]) -> Result<()>;
 }
 
 pub struct LoopbackHttpClient;
 
+impl LoopbackHttpClient {
+    fn request(
+        &self,
+        method: &str,
+        url: &str,
+        bearer: Option<&str>,
+        content_type: &str,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<String> {
+        let authority = url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split('/').next());
+        if !authority
+            .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+            .is_some_and(|address| address.ip().is_loopback() && address.port() != 0)
+        {
+            return Err(Error::Http(
+                "HTTP requests require an explicit loopback address and port".into(),
+            ));
+        }
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_global(Some(timeout))
+            .build()
+            .into();
+        let mut request = ureq::http::Request::builder()
+            .method(method)
+            .uri(url)
+            .header("Content-Type", content_type)
+            .header("Connection", "close");
+        if let Some(bearer) = bearer {
+            request = request.header("Authorization", format!("Bearer {bearer}"));
+        }
+        let request = request
+            .body(body)
+            .map_err(|_| Error::Http("cannot construct loopback request".into()))?;
+        let unknown = if method == "PUT" {
+            "; the update outcome may be unknown"
+        } else {
+            ""
+        };
+        let mut response = agent.run(request).map_err(|error| {
+            let reason = match error {
+                ureq::Error::Io(cause) => format!("{:?}", cause.kind()),
+                ureq::Error::Timeout(_) => "request timed out".into(),
+                _ => "HTTP request failed".into(),
+            };
+            Error::Http(format!(
+                "cannot complete request to {url}: {reason}{unknown}"
+            ))
+        })?;
+        let status = response.status();
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(1024 * 1024)
+            .read_to_string()
+            .map_err(|_| Error::Http(format!("cannot read response from {url}{unknown}")))?;
+        if status.is_success() {
+            return Ok(body);
+        }
+        let detail = if let Some(bearer) = bearer {
+            body.replace(bearer, "[redacted]")
+        } else {
+            body
+        };
+        let outcome = if status.is_server_error() {
+            unknown
+        } else {
+            ""
+        };
+        Err(Error::Http(format!(
+            "{url} answered HTTP {}{outcome}: {}",
+            status.as_u16(),
+            detail.trim()
+        )))
+    }
+}
+
 impl HttpClient for LoopbackHttpClient {
     fn post_json(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<String> {
-        let (authority, path) = split_url(url)?;
-        let address = authority
-            .to_socket_addrs()
-            .map_err(|e| Error::Http(format!("cannot resolve {authority}: {e}")))?
-            .next()
-            .ok_or_else(|| Error::Http(format!("cannot resolve {authority}")))?;
+        self.request(
+            "POST",
+            url,
+            bearer,
+            "application/json",
+            body.as_bytes(),
+            Duration::from_secs(15),
+        )
+    }
 
-        let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)
-            .map_err(|e| Error::Http(format!("cannot reach {url}: {e}")))?;
-        stream.set_read_timeout(Some(TIMEOUT))?;
-        stream.set_write_timeout(Some(TIMEOUT))?;
-
-        // Built as bytes and written once: the Authorization line exists only inside this buffer,
-        // which is never rendered, logged, or put in an error.
-        let mut request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            body.len()
-        );
-        if let Some(bearer) = bearer {
-            request.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
+    fn publish_module(&self, url: &str, bearer: &str, wasm: &[u8]) -> Result<()> {
+        let body = self.request(
+            "PUT",
+            url,
+            Some(bearer),
+            "application/wasm",
+            wasm,
+            Duration::from_secs(180),
+        )?;
+        let reply: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+            Error::Http(
+                "publication returned an invalid response; the update outcome may be unknown"
+                    .into(),
+            )
+        })?;
+        if reply.get("EnvironmentError").is_some() || reply.get("PermissionDenied").is_some() {
+            return Err(Error::Http(format!(
+                "publication refused: {}",
+                body.replace(bearer, "[redacted]")
+            )));
         }
-        request.push_str("\r\n");
-        request.push_str(body);
-
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|e| Error::Http(format!("cannot send to {url}: {e}")))?;
-        stream.flush()?;
-
-        // `Connection: close` means the response ends at EOF, so this needs no framing.
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .map_err(|e| Error::Http(format!("no answer from {url}: {e}")))?;
-        interpret(url, &String::from_utf8_lossy(&response))
+        if !matches!(reply["Success"]["op"].as_str(), Some("created" | "updated")) {
+            return Err(Error::Http(
+                "publication did not confirm success; the update outcome may be unknown".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
-/// Split `http://host:port/path` into the authority and the path.
-fn split_url(url: &str) -> Result<(&str, &str)> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| Error::Http(format!("{url} is not a plaintext http:// URL")))?;
-    match rest.find('/') {
-        Some(slash) => Ok((&rest[..slash], &rest[slash..])),
-        None => Ok((rest, "/")),
-    }
-}
-
-/// Turn a raw HTTP response into a body, or into an error that quotes the node's own complaint.
-fn interpret(url: &str, response: &str) -> Result<String> {
-    let (head, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| Error::Http(format!("{url} answered with a truncated HTTP response")))?;
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .ok_or_else(|| Error::Http(format!("{url} answered without an HTTP status line")))?;
-
-    if (200..300).contains(&status) {
-        return Ok(body.to_string());
-    }
-    // The node's message is the actionable half ("operator already claimed"), so it is quoted —
-    // and it is the node's, not ours: nothing here can contain the credential we sent.
-    Err(Error::Http(format!(
-        "{url} answered HTTP {status}: {}",
-        body.trim().lines().next().unwrap_or("(no detail)")
-    )))
-}
-
-/// Read one string field out of a small JSON object.
-///
-/// Deliberately a scan rather than a parse: it is indifferent to whatever framing the body arrives
-/// in (a chunked response interleaves hex lengths with the JSON), and these two endpoints return a
-/// flat object of strings. A missing field reads as `None`, which callers turn into an actionable
-/// error rather than a bogus credential.
 pub fn json_field(body: &str, field: &str) -> Option<String> {
-    let key = format!("\"{field}\"");
-    let after_key = &body[body.find(&key)? + key.len()..];
-    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
-    let value = after_colon.strip_prefix('"')?;
-    let end = value.find('"')?;
-    Some(value[..end].to_string())
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get(field)?
+        .as_str()
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -133,10 +149,12 @@ pub mod fake {
     //! A recording HTTP client, and a real one-shot responder to exercise the socket path.
 
     use super::*;
+    use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Request {
+        pub method: &'static str,
         pub url: String,
         pub bearer: Option<String>,
         pub body: String,
@@ -194,8 +212,15 @@ pub mod fake {
     }
 
     impl HttpClient for FakeHttp {
+        fn publish_module(&self, url: &str, bearer: &str, wasm: &[u8]) -> Result<()> {
+            let result = self.post_json(url, Some(bearer), &String::from_utf8_lossy(wasm));
+            self.requests.lock().unwrap().last_mut().unwrap().method = "PUT";
+            result.map(|_| ())
+        }
+
         fn post_json(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<String> {
             self.requests.lock().unwrap().push(Request {
+                method: "POST",
                 url: url.to_string(),
                 bearer: bearer.map(str::to_string),
                 body: body.to_string(),
@@ -217,9 +242,6 @@ pub mod fake {
         }
     }
 
-    /// A real HTTP responder on a loopback port of its own, so [`LoopbackHttpClient`] can be
-    /// tested end to end over a socket — without a SpacetimeDB node, and without ever touching
-    /// :3000, which on a developer machine is somebody's live realm.
     pub struct FakeNode {
         pub url: String,
         pub received: Arc<Mutex<String>>,
@@ -229,20 +251,22 @@ pub mod fake {
     impl FakeNode {
         /// Answer exactly one request with `status` and `body`.
         pub fn answering_once(status: &str, body: &str) -> Self {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let received = Arc::new(Mutex::new(String::new()));
-            let sink = received.clone();
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",
                 body.len()
             );
+            Self::raw_response(response)
+        }
+
+        pub fn raw_response(response: String) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let received = Arc::new(Mutex::new(String::new()));
+            let sink = received.clone();
             let handle = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
-                // Read the head, then exactly the declared body. Reading to EOF would deadlock
-                // (the client keeps its half open for the answer), and answering BEFORE draining
-                // the body would reset the connection under the client's feet.
+                // Drain the declared body before replying so closing the socket cannot reset the request.
                 let mut seen = Vec::new();
                 let mut byte = [0_u8; 1];
                 while socket.read(&mut byte).unwrap_or(0) == 1 {
@@ -254,12 +278,16 @@ pub mod fake {
                 let head = String::from_utf8_lossy(&seen).into_owned();
                 let length: usize = head
                     .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value)
+                    })
                     .and_then(|value| value.trim().parse().ok())
                     .unwrap_or(0);
                 let mut body_bytes = vec![0_u8; length];
                 let _ = socket.read_exact(&mut body_bytes);
-                *sink.lock().unwrap() = head;
+                *sink.lock().unwrap() = head + &String::from_utf8_lossy(&body_bytes);
                 let _ = socket.write_all(response.as_bytes());
             });
             Self {
@@ -289,123 +317,187 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_url_splits_into_an_authority_and_a_path() {
-        assert_eq!(
-            split_url("http://127.0.0.1:3000/v1/identity").unwrap(),
-            ("127.0.0.1:3000", "/v1/identity")
-        );
-        assert_eq!(
-            split_url("http://127.0.0.1:3000").unwrap(),
-            ("127.0.0.1:3000", "/")
-        );
-        // The database is loopback plaintext in every mode; an https:// URL here would mean
-        // something upstream got the topology wrong, so it is refused rather than downgraded.
-        assert!(split_url("https://example.com/v1/identity").is_err());
-    }
-
-    #[test]
-    fn a_string_field_is_read_out_of_a_small_json_object() {
-        let body = r#"{"identity":"c200","token":"eyJhbGciOiJFUzI1NiJ9.P.S"}"#;
-        assert_eq!(
-            json_field(body, "token").as_deref(),
-            Some("eyJhbGciOiJFUzI1NiJ9.P.S")
-        );
-        assert_eq!(json_field(body, "identity").as_deref(), Some("c200"));
-        assert_eq!(json_field(body, "absent"), None);
-    }
-
-    #[test]
-    fn a_chunk_framed_body_still_yields_its_fields() {
-        // The reason this is a scan and not a parse: a chunked response interleaves hex lengths
-        // with the JSON, and `serde_json` would reject the whole thing.
-        let chunked = "31\r\n{\"identity\":\"c200\",\"token\":\"eyJ.P.S\"}\r\n0\r\n\r\n";
-        assert_eq!(json_field(chunked, "token").as_deref(), Some("eyJ.P.S"));
-    }
-
-    #[test]
-    fn a_response_without_a_body_or_a_status_is_an_error_not_a_credential() {
-        assert!(interpret("http://node/v1/identity", "").is_err());
-        assert!(interpret("http://node/v1/identity", "garbage\r\n\r\n{}").is_err());
-        assert!(interpret("http://node/v1/identity", "HTTP/1.1 200 OK\r\n\r\n{}").is_ok());
-    }
-
-    #[test]
-    fn a_refusal_quotes_the_nodes_own_message() {
-        let error = interpret(
-            "http://127.0.0.1:3000/v1/database/lyracore/call/claim_operator",
-            "HTTP/1.1 400 Bad Request\r\n\r\noperator already claimed",
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("operator already claimed"),
-            "{error}"
-        );
-        assert!(error.to_string().contains("400"), "{error}");
-    }
-
-    // ---- the socket path, against a responder of our own ----
-
-    #[test]
-    fn the_real_client_posts_json_and_reads_the_body_back() {
-        let node = FakeNode::answering_once("200 OK", r#"{"identity":"c2","token":"eyJ.P.S"}"#);
+    fn authenticated_json_is_framed_and_the_token_stays_out_of_the_url() {
+        let node = FakeNode::answering_once("200 OK", r#"{"token":"example"}"#);
+        let url = format!("{}/v1/identity", node.url);
         let body = LoopbackHttpClient
-            .post_json(&format!("{}/v1/identity", node.url), None, "")
+            .post_json(&url, Some("secret"), "[]")
             .unwrap();
-        assert_eq!(json_field(&body, "token").as_deref(), Some("eyJ.P.S"));
-
-        let request = node.request();
-        assert!(
-            request.starts_with("POST /v1/identity HTTP/1.1\r\n"),
-            "{request}"
-        );
-        assert!(request.contains("Connection: close"), "{request}");
-        // Unauthenticated: minting an identity is precisely the request you have no credential for.
-        assert!(!request.contains("Authorization"), "{request}");
+        assert_eq!(json_field(&body, "token").as_deref(), Some("example"));
+        let request = node.request().to_lowercase();
+        assert!(request.starts_with("post /v1/identity http/1.1\r\n"));
+        assert!(request.contains("authorization: bearer secret\r\n"));
+        assert!(request.ends_with("\r\n\r\n[]"));
+        assert!(!url.contains("secret"));
     }
 
     #[test]
-    fn a_bearer_is_sent_as_a_header_and_never_as_part_of_the_url() {
-        const TOKEN: &str = "eyJ.SECRET.SIG";
-        let node = FakeNode::answering_once("200 OK", "{}");
-        let url = format!("{}/v1/database/lyracore/call/claim_operator", node.url);
+    fn publication_sends_the_whole_module_and_decodes_chunked_confirmation() {
+        let reply = r#"{"Success":{"domain":"lyracore","database_identity":"c200000000000000000000000000000000000000000000000000000000000001","op":"updated"}}"#;
+        let chunks = reply
+            .as_bytes()
+            .chunks(3)
+            .map(|part| {
+                format!(
+                    "{:x}\r\n{}\r\n",
+                    part.len(),
+                    std::str::from_utf8(part).unwrap()
+                )
+            })
+            .collect::<String>();
+        let node = FakeNode::raw_response(format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunks}0\r\n\r\n"));
+        let wasm = vec![b'X'; 34 * 1024 * 1024];
         LoopbackHttpClient
-            .post_json(&url, Some(TOKEN), "[]")
+            .publish_module(
+                &format!(
+                    "{}/v1/database/lyracore?clear=false&policy=Compatible",
+                    node.url
+                ),
+                "secret",
+                &wasm,
+            )
             .unwrap();
-
         let request = node.request();
-        assert!(
-            request.contains(&format!("Authorization: Bearer {TOKEN}\r\n")),
-            "{request}"
-        );
-        // The request line — the part that lands in a proxy log — carries no credential.
-        let request_line = request.lines().next().unwrap();
-        assert!(!request_line.contains(TOKEN), "{request_line}");
-        assert!(!url.contains(TOKEN), "{url}");
+        assert!(request
+            .starts_with("PUT /v1/database/lyracore?clear=false&policy=Compatible HTTP/1.1\r\n"));
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(head
+            .to_lowercase()
+            .contains("content-type: application/wasm\r\n"));
+        assert_eq!(body.as_bytes(), wasm);
     }
 
     #[test]
-    fn an_http_failure_names_the_url_and_carries_no_credential() {
-        const TOKEN: &str = "eyJ.SECRET.SIG";
-        let node = FakeNode::answering_once("401 Unauthorized", "invalid token");
-        let url = format!("{}/v1/database/lyracore/call/claim_operator", node.url);
+    fn creation_confirmation_matches_the_host_reply() {
+        let node = FakeNode::answering_once(
+            "200 OK",
+            r#"{"Success":{"domain":"lyracore","database_identity":"c200000000000000000000000000000000000000000000000000000000000001","op":"created"}}"#,
+        );
+        LoopbackHttpClient
+            .publish_module(
+                &format!("{}/v1/database/lyracore", node.url),
+                "secret",
+                b"wasm",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn publication_does_not_follow_a_redirect_to_another_listener() {
+        let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let node = FakeNode::raw_response(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            destination.local_addr().unwrap(),
+        ));
         let error = LoopbackHttpClient
-            .post_json(&url, Some(TOKEN), "[]")
-            .unwrap_err();
-
-        assert!(error.to_string().contains("401"), "{error}");
-        assert!(
-            !error.to_string().contains(TOKEN),
-            "the credential leaked into an error: {error}"
+            .publish_module(
+                &format!("{}/v1/database/lyracore", node.url),
+                "secret",
+                b"wasm",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("307"));
+        assert_eq!(
+            destination.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
         );
     }
 
     #[test]
-    fn a_node_that_is_not_listening_is_a_clean_error() {
-        // Bind and drop, so the port is one nothing answers on — and it is never :3000.
-        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/v1/identity", dead.local_addr().unwrap());
-        drop(dead);
-        let error = LoopbackHttpClient.post_json(&url, None, "").unwrap_err();
-        assert!(error.to_string().contains("cannot reach"), "{error}");
+    fn publication_requires_a_success_reply() {
+        for (status, body) in [
+            ("400 Bad Request", "incompatible definition"),
+            ("200 OK", "{}"),
+            ("302 Found", "moved"),
+            ("500 Internal Server Error", "failed confirmation"),
+        ] {
+            let node = FakeNode::answering_once(status, body);
+            let result = LoopbackHttpClient.publish_module(
+                &format!("{}/v1/database/lyracore", node.url),
+                "secret",
+                b"wasm",
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("secret"));
+            if status.starts_with("400") {
+                assert!(error.contains("incompatible definition"));
+                assert!(!error.contains("unknown"));
+            } else if status.starts_with("500") || status.starts_with("200") {
+                assert!(error.contains("unknown"));
+            }
+        }
+    }
+
+    #[test]
+    fn lost_response_has_unknown_outcome() {
+        let node = FakeNode::raw_response(String::new());
+        let error = LoopbackHttpClient
+            .publish_module(
+                &format!("{}/v1/database/lyracore", node.url),
+                "secret",
+                b"wasm",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown"));
+        assert!(!error.contains("secret"));
+        assert!(node.request().starts_with("PUT "));
+    }
+
+    #[test]
+    fn a_failed_reducer_is_a_known_refusal() {
+        let node = FakeNode::answering_once("530 Reducer Failed", "operator only");
+        let error = LoopbackHttpClient
+            .post_json(
+                &format!("{}/v1/database/lyracore/call/claim_operator", node.url),
+                Some("secret"),
+                "[]",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("530"));
+        assert!(error.contains("operator only"));
+        assert!(!error.contains("unknown"));
+    }
+
+    #[test]
+    fn transport_errors_keep_the_io_kind_without_request_headers() {
+        let node = FakeNode::raw_response(String::new());
+        let error = LoopbackHttpClient
+            .post_json(&node.url, Some("secret"), "[]")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("UnexpectedEof"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("unknown"));
+    }
+
+    #[test]
+    fn non_loopback_and_named_destinations_are_refused_before_sending() {
+        for url in [
+            "https://127.0.0.1:3000/",
+            "http://example.com:3000/",
+            "http://192.0.2.1:3000/",
+            "http://127.0.0.1:0/",
+        ] {
+            assert!(LoopbackHttpClient
+                .post_json(url, Some("secret"), "")
+                .unwrap_err()
+                .to_string()
+                .contains("loopback"));
+        }
+    }
+
+    #[test]
+    fn error_responses_cannot_echo_the_credential() {
+        let node = FakeNode::answering_once("401 Unauthorized", "bad token secret");
+        let error = LoopbackHttpClient
+            .post_json(&node.url, Some("secret"), "")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("401"));
+        assert!(!error.contains("secret"));
     }
 }

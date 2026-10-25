@@ -1,6 +1,7 @@
 //! See docs/commands.md for local Realm startup and process ownership.
 
 mod native;
+mod watch;
 
 use crate::cmd::{
     account,
@@ -141,7 +142,9 @@ impl DevManager {
         topology: Topology,
     ) -> Result<()> {
         if self.project.has_native_host() {
-            return self.up_native(runner, inspector, http, bind);
+            return self
+                .up_native(runner, inspector, http, bind, native::NativeMode::Normal)
+                .map(|_| ());
         }
         self.project.ensure_dirs()?;
         self.state.database = ProjectLayout::DATABASE.to_string();
@@ -2700,6 +2703,9 @@ mod tests {
         // The node mints happily; it is the CLAIM it refuses.
         struct ClaimRefused;
         impl crate::http::HttpClient for ClaimRefused {
+            fn publish_module(&self, _: &str, _: &str, _: &[u8]) -> Result<()> {
+                panic!("publication is not part of this fixture")
+            }
             fn post_json(&self, url: &str, _bearer: Option<&str>, _body: &str) -> Result<String> {
                 if url.ends_with("/v1/identity") {
                     return Ok(format!(

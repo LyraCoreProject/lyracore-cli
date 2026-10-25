@@ -1,13 +1,153 @@
 use super::*;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeMode {
+    Normal,
+    HotReload,
+}
+
+fn native_jwt_keys(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<PathBuf> {
+    let version = runner
+        .run_and_wait(&CommandSpec::new("openssl").arg("version"))
+        .map_err(|error| Error::PrerequisiteMissing(format!(
+            "could not check OpenSSL: {error}. OpenSSL 3 or newer on PATH is required; see docs/quickstart.md#1-prerequisites in this Core checkout"
+        )))?;
+    let major = version
+        .strip_prefix("OpenSSL ")
+        .and_then(|value| value.split('.').next())
+        .and_then(|value| value.parse::<u32>().ok());
+    if major.is_none_or(|major| major < 3) {
+        return Err(Error::PrerequisiteMissing(format!(
+            "Native Host JWT keys require OpenSSL 3 or newer on PATH; found {}. See docs/quickstart.md#1-prerequisites in this Core checkout",
+            version.trim()
+        )));
+    }
+    let directory = project.state_dir.join("native-jwt");
+    let mut create = fs::DirBuilder::new();
+    create.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        create.mode(0o700);
+    }
+    create.create(&directory)?;
+    if fs::symlink_metadata(&directory)?.file_type().is_symlink() {
+        return Err(Error::State(
+            "native-jwt must be a private directory, not a symlink".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let private = directory.join("id_ecdsa");
+    let public = directory.join("id_ecdsa.pub");
+    let mut exists = [false; 2];
+    for (index, path) in [&private, &public].into_iter().enumerate() {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(Error::State(format!(
+                        "{} must be a regular JWT key file; no keys were replaced",
+                        path.display()
+                    )));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                }
+                exists[index] = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !exists[0] {
+        if exists[1] {
+            return Err(Error::State("Native Host JWT private key is missing while its public key exists; restore the private key instead of replacing the identity".into()));
+        }
+        let private_pem = Zeroizing::new(jwt_openssl(
+            runner,
+            &CommandSpec::new("openssl")
+                .arg("genpkey")
+                .arg("-algorithm")
+                .arg("EC")
+                .arg("-pkeyopt")
+                .arg("ec_paramgen_curve:P-256")
+                .arg("-pkeyopt")
+                .arg("ec_param_enc:named_curve"),
+        )?);
+        persist_native_key(&directory, &private, private_pem.as_bytes())?;
+    }
+    jwt_openssl(
+        runner,
+        &CommandSpec::new("openssl")
+            .arg("pkey")
+            .arg("-in")
+            .arg(private.to_string_lossy())
+            .arg("-check")
+            .arg("-noout"),
+    )?;
+    let derived = jwt_openssl(
+        runner,
+        &CommandSpec::new("openssl")
+            .arg("pkey")
+            .arg("-in")
+            .arg(private.to_string_lossy())
+            .arg("-pubout"),
+    )?;
+    if !exists[1] {
+        persist_native_key(&directory, &public, derived.as_bytes())?;
+    }
+    let retained = jwt_openssl(
+        runner,
+        &CommandSpec::new("openssl")
+            .arg("pkey")
+            .arg("-pubin")
+            .arg("-in")
+            .arg(public.to_string_lossy())
+            .arg("-pubout"),
+    )?;
+    if retained != derived {
+        return Err(Error::State("Native Host JWT public and private keys do not match; restore the matching pair. No keys were replaced".into()));
+    }
+    Ok(directory)
+}
+
+fn jwt_openssl(runner: &dyn ProcessRunner, command: &CommandSpec) -> Result<String> {
+    runner.run_and_wait(command).map_err(|error| {
+        Error::Process(format!(
+            "could not prepare Native Host JWT keys: {error}. No existing keys were replaced"
+        ))
+    })
+}
+
+fn persist_native_key(directory: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(bytes)?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error.into()),
+    }
+}
 
 impl DevManager {
+    /// Returns a credential when watch must initialize the Realm after its first publish.
     pub(super) fn up_native(
         &mut self,
         runner: &dyn ProcessRunner,
         inspector: &dyn ProcessInspector,
         http: &dyn HttpClient,
         bind: ClientBind,
-    ) -> Result<()> {
+        mode: NativeMode,
+    ) -> Result<Option<Credential>> {
         self.project.ensure_dirs()?;
         for component in Component::ALL {
             if let Some(record) = self.state.record(component) {
@@ -34,6 +174,16 @@ impl DevManager {
         if matches!(
             current,
             ComponentStatus::Healthy | ComponentStatus::Starting
+        ) && mode == NativeMode::HotReload
+            && !self.state.native_hot_reload
+        {
+            return Err(Error::Process(
+                "the running Native Host uses a different development mode; run `lyracore dev down` first, then `lyracore dev watch` to enable Development reload".into(),
+            ));
+        }
+        if matches!(
+            current,
+            ComponentStatus::Healthy | ComponentStatus::Starting
         ) && self.bind != bind
         {
             return Err(Error::Process(
@@ -46,7 +196,7 @@ impl DevManager {
         {
             println!("Native Realm is already running.");
             self.print_native_status(runner, inspector);
-            return Ok(());
+            return Ok(None);
         }
         self.bind = bind;
         self.topology = Topology::Single;
@@ -54,6 +204,12 @@ impl DevManager {
         self.state.database = ProjectLayout::DATABASE.into();
         self.state.topology = Topology::Single.as_str().into();
         self.state.native_runtime = true;
+        if !matches!(
+            current,
+            ComponentStatus::Healthy | ComponentStatus::Starting
+        ) {
+            self.state.native_hot_reload = mode == NativeMode::HotReload;
+        }
         self.state.gateway = None;
 
         if !matches!(
@@ -68,6 +224,7 @@ impl DevManager {
                     )));
                 }
             }
+            let jwt_keys = native_jwt_keys(&self.project, runner)?;
             let checkout = self.project.state_dir.join("native-host/SpacetimeDB");
             println!("Building the Native Host...");
             runner.run_streaming(
@@ -83,16 +240,19 @@ impl DevManager {
                     .arg("--build")
                     .cwd(&self.project.root),
             )?;
-            let command = CommandSpec::new(
+            let mut command = CommandSpec::new(
                 checkout
                     .join("target/release/spacetimedb-standalone")
                     .to_string_lossy(),
             )
+            .own_process_group()
             .arg("start")
             .arg("--listen-addr")
             .arg(ProjectLayout::stdb_listen())
             .arg("--data-dir")
             .arg(self.project.state_dir.join("native-data").to_string_lossy())
+            .arg("--jwt-key-dir")
+            .arg(jwt_keys.to_string_lossy())
             .arg("--non-interactive")
             .env("LYRACORE_NATIVE_DATABASE", ProjectLayout::DATABASE)
             .env(
@@ -104,6 +264,11 @@ impl DevManager {
                 ProjectLayout::logon_bind(&self.bind),
             )
             .cwd(&self.project.root);
+            if mode == NativeMode::HotReload {
+                command = command.env("LYRACORE_NATIVE_DEV", "1");
+            } else {
+                command = command.env_remove("LYRACORE_NATIVE_DEV");
+            }
             let record = self.spawn_recorded(Component::Spacetime, &command, runner, inspector)?;
             self.state.spacetime = Some(record);
             self.state.save(&self.project.state_file())?;
@@ -118,8 +283,22 @@ impl DevManager {
         )?;
         // Native Core connections and operator calls must use the Module publisher's identity.
         let credential = crate::token::retain_native_owner(&self.project, credential)?;
+        if mode == NativeMode::HotReload {
+            return Ok(Some(credential));
+        }
         self.publish(runner)?;
-        self.claim_operator(runner, http, &credential)?;
+        self.initialize_native(runner, inspector, http, &credential)?;
+        Ok(None)
+    }
+
+    pub(super) fn initialize_native(
+        &self,
+        runner: &dyn ProcessRunner,
+        inspector: &dyn ProcessInspector,
+        http: &dyn HttpClient,
+        credential: &Credential,
+    ) -> Result<()> {
+        self.claim_operator(runner, http, credential)?;
         for (reducer, arguments) in [
             ("debug_repair_after_publish", vec![]),
             ("install_guid_range", vec![serde_json::json!(0)]),
@@ -128,13 +307,13 @@ impl DevManager {
                 &self.project,
                 runner,
                 http,
-                &credential,
+                credential,
                 ProjectLayout::DATABASE,
                 reducer,
                 &arguments,
             )?;
         }
-        self.provision_realm(runner, http, &credential)?;
+        self.provision_realm(runner, http, credential)?;
         if !inspector.world_ready(&self.bind.host(), ProjectLayout::WORLD_PORT) {
             return Err(Error::Process(format!(
                 "the Native Host did not return a world authentication challenge; check the Module's Operator identity and {}",
@@ -157,6 +336,9 @@ impl DevManager {
     ) {
         let host = self.status_for(Component::Spacetime, inspector);
         println!("Native Host: {host:?}");
+        if self.state.native_hot_reload {
+            println!("Development reload enabled.");
+        }
         for (name, port) in [
             ("logon", ProjectLayout::LOGON_PORT),
             ("world", ProjectLayout::WORLD_PORT),
@@ -208,6 +390,221 @@ mod tests {
     }
 
     #[test]
+    fn real_jwt_bootstrap_generates_a_private_pair() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let directory = native_jwt_keys(&project, &crate::proc::RealProcessRunner).unwrap();
+        assert!(directory.join("id_ecdsa").is_file());
+        assert!(directory.join("id_ecdsa.pub").is_file());
+        let parameters = crate::proc::RealProcessRunner
+            .run_and_wait(
+                &CommandSpec::new("openssl")
+                    .arg("ec")
+                    .arg("-pubin")
+                    .arg("-in")
+                    .arg(directory.join("id_ecdsa.pub").to_string_lossy())
+                    .arg("-param_out"),
+            )
+            .unwrap();
+        assert!(parameters.contains(
+            "-----BEGIN EC PARAMETERS-----\nBggqhkjOPQMBBw==\n-----END EC PARAMETERS-----"
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            for name in ["id_ecdsa", "id_ecdsa.pub"] {
+                assert_eq!(
+                    fs::metadata(directory.join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_reuses_both_keys_on_restart() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let private = Zeroizing::new(fs::read(directory.join("id_ecdsa")).unwrap());
+        let public = fs::read(directory.join("id_ecdsa.pub")).unwrap();
+        native_jwt_keys(&project, &runner).unwrap();
+        assert!(fs::read(directory.join("id_ecdsa")).unwrap() == *private);
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == public);
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_derives_a_missing_public_key_without_rotating_private_key() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let private = Zeroizing::new(fs::read(directory.join("id_ecdsa")).unwrap());
+        let public = fs::read(directory.join("id_ecdsa.pub")).unwrap();
+        fs::remove_file(directory.join("id_ecdsa.pub")).unwrap();
+        native_jwt_keys(&project, &runner).unwrap();
+        assert!(fs::read(directory.join("id_ecdsa")).unwrap() == *private);
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == public);
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_refuses_a_mismatched_pair_without_replacing_either_key() {
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let other_project = self::project(&other);
+        let other_directory = native_jwt_keys(&other_project, &runner).unwrap();
+        let private = Zeroizing::new(fs::read(directory.join("id_ecdsa")).unwrap());
+        let other_public = fs::read(other_directory.join("id_ecdsa.pub")).unwrap();
+        fs::write(directory.join("id_ecdsa.pub"), &other_public).unwrap();
+        let error = native_jwt_keys(&project, &runner).unwrap_err();
+        assert!(error.to_string().contains("do not match"));
+        assert!(fs::read(directory.join("id_ecdsa")).unwrap() == *private);
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == other_public);
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_refuses_corrupt_private_key_without_replacing_it() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let public = fs::read(directory.join("id_ecdsa.pub")).unwrap();
+        fs::write(directory.join("id_ecdsa"), b"invalid private PEM").unwrap();
+        let error = native_jwt_keys(&project, &runner).unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, Error::Process(_)));
+        assert!(message.contains(directory.join("id_ecdsa").to_string_lossy().as_ref()));
+        assert!(message.contains("No existing keys were replaced"));
+        assert!(!message.contains("OpenSSL 3 or newer"));
+        assert!(fs::read(directory.join("id_ecdsa")).unwrap() == b"invalid private PEM");
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == public);
+    }
+
+    #[test]
+    fn real_jwt_bootstrap_refuses_a_public_key_without_its_private_key() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let runner = crate::proc::RealProcessRunner;
+        let directory = native_jwt_keys(&project, &runner).unwrap();
+        let public = fs::read(directory.join("id_ecdsa.pub")).unwrap();
+        fs::remove_file(directory.join("id_ecdsa")).unwrap();
+        let error = native_jwt_keys(&project, &runner).unwrap_err();
+        assert!(error.to_string().contains("restore the private key"));
+        assert!(fs::read(directory.join("id_ecdsa.pub")).unwrap() == public);
+        assert!(!directory.join("id_ecdsa").exists());
+    }
+
+    #[test]
+    fn openssl_failure_stops_native_start_before_build_or_spawn() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new().fail_on("openssl", "not found");
+        let error = dev
+            .up_native(
+                &stack.runner(),
+                &stack.inspector(),
+                &FakeHttp::new(),
+                ClientBind::Loopback,
+                NativeMode::HotReload,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("OpenSSL 3 or newer"));
+        assert!(!stack
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
+    }
+
+    #[test]
+    fn key_generation_failure_does_not_advise_restoring_nonexistent_keys() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let stack = FakeStack::new().fail_on("openssl genpkey", "EC generation unavailable");
+        let error = native_jwt_keys(&project, &stack.runner()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("EC generation unavailable"));
+        assert!(!message.contains("restore"));
+        assert_eq!(
+            fs::read_dir(project.state_dir.join("native-jwt"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn unsupported_openssl_fails_before_creating_keys_or_starting_the_host() {
+        for version in ["LibreSSL 3.3.6", "OpenSSL 1.1.1w", "unknown crypto tool"] {
+            let tmp = TempDir::new().unwrap();
+            let mut dev = DevManager::new(project(&tmp)).unwrap();
+            let stack = FakeStack::new().with_stdout("openssl version", version);
+            let error = dev
+                .up_native(
+                    &stack.runner(),
+                    &stack.inspector(),
+                    &FakeHttp::new(),
+                    ClientBind::Loopback,
+                    NativeMode::HotReload,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("OpenSSL 3 or newer"));
+            assert!(error.to_string().contains(version));
+            assert!(!dev.project.state_dir.join("native-jwt").exists());
+            assert!(!stack
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
+        }
+    }
+
+    #[test]
+    fn native_start_preserves_configured_certificate_authority() {
+        let tmp = TempDir::new().unwrap();
+        let project = project(&tmp);
+        let config = project.state_dir.join("native-data/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let configured = "[certificate-authority]\njwt-priv-key-path = '/existing/private'\njwt-pub-key-path = '/existing/public'\n";
+        fs::write(&config, configured).unwrap();
+        let mut dev = DevManager::new(project).unwrap();
+        let stack = FakeStack::new();
+        dev.up_native(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+            NativeMode::HotReload,
+        )
+        .unwrap();
+        let calls = stack.calls();
+        let host = calls
+            .iter()
+            .find_map(|call| match call {
+                Call::Spawn { spec, .. } => Some(spec),
+                _ => None,
+            })
+            .unwrap();
+        assert!(host.args().windows(2).any(|args| args[0] == "--jwt-key-dir"
+            && args[1] == dev.project.state_dir.join("native-jwt").to_string_lossy()));
+        assert!(!host
+            .args()
+            .iter()
+            .any(|arg| arg == "--jwt-pub-key-path" || arg == "--jwt-priv-key-path"));
+        assert_eq!(fs::read_to_string(config).unwrap(), configured);
+    }
+
+    #[test]
     fn native_up_runs_one_host_and_publishes_one_shard() {
         let tmp = TempDir::new().unwrap();
         let mut dev = DevManager::new(project(&tmp)).unwrap();
@@ -230,6 +627,8 @@ mod tests {
             .collect();
         assert_eq!(spawned.len(), 1);
         assert!(spawned[0].program().ends_with("/spacetimedb-standalone"));
+        assert_eq!(spawned[0].env_value("LYRACORE_NATIVE_DEV"), None);
+        assert!(spawned[0].removes_env("LYRACORE_NATIVE_DEV"));
         assert_eq!(
             spawned[0].env_value("LYRACORE_NATIVE_DATABASE"),
             Some("lyracore")

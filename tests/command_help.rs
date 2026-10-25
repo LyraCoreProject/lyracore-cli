@@ -7,6 +7,7 @@ fn focused_help_needs_no_checkout_and_performs_no_work() {
         vec!["packages", "--help"],
         vec!["import", "--help"],
         vec!["dev", "up", "--help"],
+        vec!["dev", "watch", "--help"],
         vec!["help", "packages", "apply"],
         vec!["update", "--help"],
         vec!["bindings", "--help"],

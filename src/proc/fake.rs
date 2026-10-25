@@ -310,13 +310,14 @@ pub const FAKE_RUST_VERSION: &str = "1.93.0";
 pub const FAKE_SPACETIME_VERSION: &str = "2.7.1";
 pub const FAKE_BUN_VERSION: &str = "1.3.7";
 
-/// Canned stdout for the commands this CLI actually reads output from.
-///
-/// A `FakeStack` models a machine whose `spacetime` CLI is logged in and whose toolchain matches
-/// the checkout, because that is the ordinary case; `fail_on(…)` and `with_stdout(…)` model the
-/// others.
 fn canned_stdout(render: &str) -> String {
-    if render.contains("login show") {
+    if render == "openssl version" {
+        "OpenSSL 3.0.0\n".into()
+    } else if render.starts_with("openssl genpkey ") {
+        "fake native JWT private key\n".into()
+    } else if render.starts_with("openssl pkey ") && render.ends_with(" -pubout") {
+        "fake native JWT public key\n".into()
+    } else if render.contains("login show") {
         format!("You are logged in as fake-identity\nYour auth token (don't share this!) is {FAKE_TOKEN}\n")
     } else if render.starts_with("rustc --version") {
         format!("rustc {FAKE_RUST_VERSION} (0000000 2026-01-01)\n")
