@@ -126,6 +126,9 @@ pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
         check_ports(),
         check_client_data(layout.as_ref().ok()),
     ];
+    if runs_in_wsl() {
+        checks.insert(1, check_checkout_drive(layout.as_ref().ok()));
+    }
     if let Some(project) = layout.as_ref().ok().filter(|p| p.has_native_host()) {
         checks.extend(check_native_tools(project, &RealProcessRunner));
     }
@@ -268,6 +271,33 @@ fn check_rust(project: Option<&ProjectLayout>) -> Check {
              run inside the checkout, so this usually means rustup is not managing this rustc)"
         ),
     )
+}
+
+fn runs_in_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+}
+
+/// WSL mounts Windows drives at `/mnt/<letter>`, where builds are slow and permissions are not kept.
+fn check_checkout_drive(project: Option<&ProjectLayout>) -> Check {
+    let on_windows_drive = project.is_some_and(|project| {
+        let mut parts = project.root.components().skip(1);
+        parts.next().is_some_and(|part| part.as_os_str() == "mnt")
+            && parts.next().is_some_and(|part| {
+                let name = part.as_os_str().as_encoded_bytes();
+                name.len() == 1 && name[0].is_ascii_alphabetic()
+            })
+    });
+    if on_windows_drive {
+        Check::warn(
+            "checkout drive",
+            "this checkout is on a Windows drive; builds there are slow and file permissions do \
+             not work. Clone LyraCore again in your Linux home directory, for example ~/LyraCore; \
+             see docs/windows.md in this Core checkout",
+        )
+    } else {
+        Check::pass("checkout drive", "Linux file system (WSL)")
+    }
 }
 
 fn check_layout(layout: &Result<ProjectLayout>) -> Check {
@@ -711,6 +741,33 @@ mod tests {
         assert!(Version(1, 93, 0) >= Version(1, 93, 0));
         // And the real check never blocks on a checkout it could not read a requirement from.
         assert!(!check_rust(None).is_blocking(), "rustc is present in CI");
+    }
+
+    #[test]
+    fn a_checkout_on_a_windows_drive_warns_without_blocking() {
+        let at = |root: &str| ProjectLayout {
+            root: root.into(),
+            state_dir: Path::new(root).join(".lyracore"),
+            logs_dir: Path::new(root).join(".lyracore/logs"),
+        };
+        for root in ["/mnt/c/Users/me/LyraCore", "/mnt/D/LyraCore"] {
+            let check = check_checkout_drive(Some(&at(root)));
+            let Check::Warn { guidance, .. } = check else {
+                panic!("{root} must warn in WSL");
+            };
+            assert!(guidance.contains("~/LyraCore"), "{guidance}");
+        }
+        for root in [
+            "/home/me/LyraCore",
+            "/mnt/data/LyraCore",
+            "/srv/mnt/c/LyraCore",
+        ] {
+            assert!(matches!(
+                check_checkout_drive(Some(&at(root))),
+                Check::Pass { .. }
+            ));
+        }
+        assert!(!check_checkout_drive(None).is_blocking());
     }
 
     #[test]

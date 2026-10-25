@@ -870,6 +870,29 @@ pub(crate) fn resolve_client_data(
     Ok(canonical)
 }
 
+fn windows_path_hint(raw: &str) -> Option<String> {
+    let (drive, rest) = raw.split_at_checked(2)?;
+    let letter = drive.strip_suffix(':')?.chars().next()?;
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    if !rest.starts_with(['\\', '/']) {
+        return Some(format!(
+            "This looks like a Windows path whose backslashes the shell removed. In WSL, convert \
+             it inside single quotes: \"$(wslpath '{letter}:\\path\\to\\Data')\""
+        ));
+    }
+    let translated = format!(
+        "/mnt/{}{}",
+        letter.to_ascii_lowercase(),
+        rest.replace('\\', "/")
+    );
+    Some(format!(
+        "This is a Windows path. In WSL, Windows drives are under /mnt; use \"{translated}\", \
+         in quotes"
+    ))
+}
+
 /// Does this look like the `Data/` directory of a 1.12.1 client? The printing wrapper around
 /// [`inspect_client_data`] — same checks, same error strings, but the optional-archive notes go
 /// straight to stdout instead of coming back as data.
@@ -891,6 +914,10 @@ fn validate_client_data(path: &Path) -> Result<()> {
 /// terminal.
 pub fn inspect_client_data(path: &Path) -> Result<Vec<String>> {
     if !path.exists() {
+        let raw = path.to_string_lossy();
+        if let Some(hint) = windows_path_hint(&raw) {
+            return Err(Error::Usage(format!("no such directory: {raw}. {hint}")));
+        }
         return Err(Error::Usage(format!(
             "no such directory: {}. Set client-data to your 1.12.1 client's Data/ directory.",
             path.display()
