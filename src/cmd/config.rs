@@ -84,6 +84,28 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_client_data_path_names_its_wsl_path() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        for (raw, expected) in [
+            (
+                r"C:\Games\World of Warcraft\Data",
+                "\"/mnt/c/Games/World of Warcraft/Data\"",
+            ),
+            ("D:/WoW/Data", "\"/mnt/d/WoW/Data\""),
+            ("C:GamesWoWData", "wslpath 'C:\\path\\to\\Data'"),
+        ] {
+            let error = set_client_data(&project, raw).unwrap_err().to_string();
+            assert!(error.contains("no such directory"), "{error}");
+            assert!(error.contains(expected), "{raw}: {error}");
+        }
+        let error = set_client_data(&project, "/games/Data")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("/mnt"), "{error}");
+    }
+
+    #[test]
     fn set_client_data_refuses_a_bad_path_with_the_same_diagnostics_as_import() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
