@@ -1291,9 +1291,10 @@ Three things that fail independently:
   (`docs/danger-zones.md` §3).
 
 `doctor` covers the prerequisites for getting there: the project layout, `rustc` against the
-version this checkout declares, Cargo, SpacetimeDB 2.7.1, the WASM target, and the three ports. It
-asks for a **minimum** version; `preflight` asks for an **exact** match against the pins, because
-one is "can you build this at all" and the other is "is it safe to deploy this".
+version this checkout declares, Cargo, SpacetimeDB 2.7.1, the WASM target, the three ports, and
+OpenSSL 3 or newer for a native checkout. It asks for a **minimum** version; `preflight` asks for
+an **exact** match against the pins, because one is "can you build this at all" and the other is
+"is it safe to deploy this".
 
 `doctor` also reports the **client data** path from `config.json` (§"`config`" above): unset, or set
 to something that no longer validates, is a `⚠` naming the problem and the `config set client-data`

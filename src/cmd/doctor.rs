@@ -481,7 +481,13 @@ mod tests {
         let project = workspace(&tmp);
         std::fs::create_dir(tmp.path().join("native-host")).unwrap();
         std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
-        for banner in ["OpenSSL 3.0.0 7 Sep 2021", "OpenSSL 3.6.5", "OpenSSL 4.0.0"] {
+        for banner in [
+            "OpenSSL 3.0.0 7 Sep 2021",
+            "OpenSSL 3.6.5",
+            "OpenSSL 4.0.0",
+            "OpenSSL 3.6.0-dev",
+            "OpenSSL 3.1.5+quic",
+        ] {
             let stack = FakeStack::new().with_stdout("openssl version", banner);
             assert!(matches!(
                 check_native_openssl(Some(&project), &stack.runner()),
