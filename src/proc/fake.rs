@@ -36,6 +36,7 @@ struct Inner {
     next_pid: u32,
     missing_world_challenge: bool,
     failures: HashMap<String, String>,
+    failure_cures: Vec<(String, String)>,
     /// Canned stdout, keyed by a substring of the rendered command. Overrides the defaults below.
     stdouts: HashMap<String, String>,
     /// A spawned gateway's whole log file, in place of the one derived from its environment. For
@@ -160,6 +161,16 @@ impl FakeStack {
         self
     }
 
+    /// Fails `needle` until a command containing `cure` runs, like a tool that a later step installs.
+    pub fn fail_until(self, needle: &str, message: &str, cure: &str) -> Self {
+        self.0
+            .lock()
+            .unwrap()
+            .failure_cures
+            .push((cure.to_string(), needle.to_string()));
+        self.fail_on(needle, message)
+    }
+
     pub fn runner(&self) -> FakeProcessRunner {
         FakeProcessRunner(self.0.clone())
     }
@@ -203,6 +214,15 @@ impl FakeProcessRunner {
     fn record(&self, call: Call, render: &str) -> Result<()> {
         let mut inner = self.0.lock().unwrap();
         inner.calls.push(call);
+        let cured: Vec<String> = inner
+            .failure_cures
+            .iter()
+            .filter(|(cure, _)| render.contains(cure.as_str()))
+            .map(|(_, needle)| needle.clone())
+            .collect();
+        for needle in cured {
+            inner.failures.remove(&needle);
+        }
         for (needle, message) in &inner.failures {
             if render.contains(needle.as_str()) {
                 return Err(Error::SubprocessFailed {
@@ -322,10 +342,10 @@ fn canned_stdout(render: &str) -> String {
     } else if render == "python3 --version" {
         "Python 3.12.3\n".into()
     } else if let Some(toolchain) = render
-        .strip_prefix("rustc +")
+        .strip_prefix("cargo +")
         .and_then(|rest| rest.strip_suffix(" --version"))
     {
-        format!("rustc {toolchain} (0000000 2026-01-01)\n")
+        format!("cargo {toolchain} (0000000 2026-01-01)\n")
     } else if render.starts_with("rustc --version") {
         format!("rustc {FAKE_RUST_VERSION} (0000000 2026-01-01)\n")
     } else if render.starts_with("spacetime --version") {

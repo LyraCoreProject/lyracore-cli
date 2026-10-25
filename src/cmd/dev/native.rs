@@ -211,7 +211,7 @@ impl DevManager {
                 }
             }
             crate::cmd::doctor::require_python(runner)?;
-            crate::cmd::doctor::require_host_toolchain(&self.project, runner)?;
+            crate::cmd::doctor::ensure_host_toolchain(&self.project, runner)?;
             let jwt_keys = native_jwt_keys(&self.project, runner)?;
             let checkout = self.project.state_dir.join("native-host/SpacetimeDB");
             println!("Building the Native Host...");
@@ -520,31 +520,70 @@ mod tests {
             .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
     }
 
+    fn up(dev: &mut DevManager, stack: &FakeStack) -> Result<Option<crate::token::Credential>> {
+        dev.up_native(
+            &stack.runner(),
+            &stack.inspector(),
+            &FakeHttp::new(),
+            ClientBind::Loopback,
+            NativeMode::HotReload,
+        )
+    }
+
     #[test]
     fn missing_build_tools_stop_native_start_before_keys_or_build() {
-        for (command, expected) in [
-            ("python3 --version", "Install Python 3"),
-            ("rustc +1.97.1", "rustup toolchain install 1.97.1"),
+        for (stack, expected) in [
+            (
+                FakeStack::new().fail_on("python3 --version", "not found"),
+                "Install Python 3",
+            ),
+            (
+                FakeStack::new()
+                    .fail_on("cargo +1.97.1", "no such command: `+1.97.1`")
+                    .fail_on("rustup", "not found"),
+                "needs rustup",
+            ),
+            (
+                FakeStack::new().fail_on("cargo +1.97.1", "toolchain '1.97.1' is not installed"),
+                "still fails",
+            ),
         ] {
             let tmp = TempDir::new().unwrap();
             let mut dev = DevManager::new(project(&tmp)).unwrap();
-            let stack = FakeStack::new().fail_on(command, "not found");
-            let error = dev
-                .up_native(
-                    &stack.runner(),
-                    &stack.inspector(),
-                    &FakeHttp::new(),
-                    ClientBind::Loopback,
-                    NativeMode::HotReload,
-                )
-                .unwrap_err();
+            let error = up(&mut dev, &stack).unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
             assert!(!tmp.path().join(".lyracore/native-jwt").exists());
             assert!(!stack
+                .rendered()
+                .iter()
+                .any(|call| call.contains("prepare-host.py")));
+            assert!(!stack
                 .calls()
                 .iter()
-                .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
+                .any(|call| matches!(call, Call::Spawn { .. })));
         }
+    }
+
+    #[test]
+    fn native_start_installs_a_missing_host_toolchain_with_rustup() {
+        let tmp = TempDir::new().unwrap();
+        let mut dev = DevManager::new(project(&tmp)).unwrap();
+        let stack = FakeStack::new().fail_until(
+            "cargo +1.97.1 --version",
+            "toolchain '1.97.1' is not installed",
+            "rustup toolchain install 1.97.1 --profile minimal",
+        );
+        let _ = up(&mut dev, &stack);
+        let rendered = stack.rendered();
+        let install = rendered
+            .iter()
+            .position(|call| call == "rustup toolchain install 1.97.1 --profile minimal")
+            .expect("startup installs the Host toolchain");
+        let build = rendered
+            .iter()
+            .position(|call| call.contains("prepare-host.py"))
+            .expect("startup builds after the install");
+        assert!(install < build);
     }
 
     #[test]

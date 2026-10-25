@@ -144,8 +144,18 @@ fn check_native_tools(project: &ProjectLayout, runner: &dyn ProcessRunner) -> [C
             Ok(banner) => Check::pass("Python", banner),
             Err(error) => Check::fail("Python", error.to_string()),
         },
-        match require_host_toolchain(project, runner) {
-            Ok(banner) => Check::pass("Host toolchain", banner),
+        match probe_host_toolchain(project, runner) {
+            Ok(HostToolchain::Installed(banner)) => Check::pass("Host toolchain", banner),
+            Ok(HostToolchain::Missing { channel, .. }) if rustup_present(runner) => Check::warn(
+                "Host toolchain",
+                format!(
+                    "Rust {channel} is not installed; `lyracore dev up` installs it with rustup, \
+                     or run `rustup toolchain install {channel} --profile minimal`"
+                ),
+            ),
+            Ok(HostToolchain::Missing { channel, detail }) => {
+                Check::fail("Host toolchain", no_rustup(&channel, &detail))
+            }
             Err(error) => Check::fail("Host toolchain", error.to_string()),
         },
     ]
@@ -164,45 +174,89 @@ pub(crate) fn require_python(runner: &dyn ProcessRunner) -> Result<String> {
         })
 }
 
-/// Fails without downloading when rustup lacks the toolchain in `native-host/rust-toolchain.toml`.
-pub(crate) fn require_host_toolchain(
+pub(crate) enum HostToolchain {
+    Installed(String),
+    Missing { channel: String, detail: String },
+}
+
+/// Probes the `native-host/rust-toolchain.toml` channel the way the build runs it, without a download.
+pub(crate) fn probe_host_toolchain(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
-) -> Result<String> {
+) -> Result<HostToolchain> {
     let path = project
         .root
         .join("native-host")
         .join(ProjectLayout::RUST_TOOLCHAIN);
-    let required = std::fs::read_to_string(&path)
+    let channel = std::fs::read_to_string(&path)
         .ok()
-        .as_deref()
-        .and_then(crate::cmd::preflight::pinned_rust)
+        .and_then(|text| {
+            let line = text
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("channel"))?
+                .to_owned();
+            Some(line.split('"').nth(1)?.to_owned())
+        })
+        .filter(|channel| !channel.is_empty())
         .ok_or_else(|| {
             crate::Error::PrerequisiteMissing(format!(
                 "cannot read the Native Host toolchain `channel` from {}",
                 path.display()
             ))
         })?;
-    let refuse = |detail: String| {
-        crate::Error::PrerequisiteMissing(format!(
-            "the Native Host builds with Rust {required} through rustup: {detail}. Run \
-             `rustup toolchain install {required} --profile minimal`, or install rustup from \
-             https://rustup.rs/ if this Rust does not come from it"
-        ))
+    let probe = CommandSpec::new("cargo")
+        .arg(format!("+{channel}"))
+        .arg("--version")
+        .env("RUSTUP_AUTO_INSTALL", "0");
+    Ok(match runner.run_and_wait(&probe) {
+        Ok(banner) => HostToolchain::Installed(banner.trim().to_owned()),
+        Err(error) => HostToolchain::Missing {
+            channel,
+            detail: error.to_string(),
+        },
+    })
+}
+
+fn rustup_present(runner: &dyn ProcessRunner) -> bool {
+    runner
+        .run_and_wait(&CommandSpec::new("rustup").arg("--version"))
+        .is_ok()
+}
+
+fn no_rustup(channel: &str, detail: &str) -> String {
+    format!(
+        "the Native Host builds with `cargo +{channel}`, which needs rustup ({detail}). Install \
+         rustup from https://rustup.rs/"
+    )
+}
+
+/// Installs a missing Host toolchain explicitly, whatever rustup's auto-install setting is.
+pub(crate) fn ensure_host_toolchain(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+) -> Result<()> {
+    let HostToolchain::Missing { channel, detail } = probe_host_toolchain(project, runner)? else {
+        return Ok(());
     };
-    let banner = runner
-        .run_and_wait(
-            &CommandSpec::new("rustc")
-                .arg(format!("+{required}"))
-                .arg("--version")
-                .env("RUSTUP_AUTO_INSTALL", "0"),
-        )
-        .map_err(|error| refuse(error.to_string()))?;
-    match parse_version(&banner) {
-        Some(found) if found == required => Ok(banner.trim().to_owned()),
-        _ => Err(refuse(format!(
-            "`rustc +{required}` reported {}",
-            banner.trim()
+    if !rustup_present(runner) {
+        return Err(crate::Error::PrerequisiteMissing(no_rustup(
+            &channel, &detail,
+        )));
+    }
+    println!("Installing Rust {channel} for the Native Host...");
+    runner.run_streaming(
+        &CommandSpec::new("rustup")
+            .arg("toolchain")
+            .arg("install")
+            .arg(&channel)
+            .arg("--profile")
+            .arg("minimal"),
+    )?;
+    match probe_host_toolchain(project, runner)? {
+        HostToolchain::Installed(_) => Ok(()),
+        HostToolchain::Missing { detail, .. } => Err(crate::Error::PrerequisiteMissing(format!(
+            "rustup installed Rust {channel}, but `cargo +{channel}` still fails: {detail}"
         ))),
     }
 }
@@ -641,30 +695,37 @@ mod tests {
         assert_eq!(python, Check::pass("Python", "Python 3.12.3"));
         assert!(matches!(
             toolchain,
-            Check::Pass { detail, .. } if detail.starts_with("rustc 1.97.1 ")
+            Check::Pass { detail, .. } if detail.starts_with("cargo 1.97.1 ")
         ));
         assert!(stack
             .rendered()
             .iter()
-            .any(|call| call.contains("rustc +1.97.1 --version")));
+            .any(|call| call.contains("cargo +1.97.1 --version")));
     }
 
     #[test]
-    fn missing_python_or_host_toolchain_blocks_with_the_install_command() {
+    fn missing_python_blocks_with_the_install_command() {
         let tmp = TempDir::new().unwrap();
         let project = native_workspace(&tmp, Some("[toolchain]\nchannel = \"1.97.1\"\n"));
-        let stack = crate::proc::fake::FakeStack::new()
-            .fail_on("python3", "not found")
-            .fail_on("rustc +1.97.1", "toolchain '1.97.1' is not installed");
-        let [python, toolchain] = check_native_tools(&project, &stack.runner());
+        let stack = crate::proc::fake::FakeStack::new().fail_on("python3", "not found");
+        let [python, _] = check_native_tools(&project, &stack.runner());
         let Check::Fail { guidance, .. } = python else {
             panic!("missing python3 must block native startup");
         };
         assert!(guidance.contains("Install Python 3"), "{guidance}");
-        let Check::Fail { guidance, .. } = toolchain else {
-            panic!("a missing Host toolchain must block native startup");
+    }
+
+    #[test]
+    fn a_missing_host_toolchain_warns_when_rustup_can_install_it() {
+        let tmp = TempDir::new().unwrap();
+        let project = native_workspace(&tmp, Some("[toolchain]\nchannel = \"1.97.1\"\n"));
+        let stack = crate::proc::fake::FakeStack::new()
+            .fail_on("cargo +1.97.1", "toolchain '1.97.1' is not installed");
+        let [_, toolchain] = check_native_tools(&project, &stack.runner());
+        let Check::Warn { guidance, .. } = toolchain else {
+            panic!("rustup installs a missing Host toolchain at startup");
         };
-        assert!(guidance.contains("is not installed"), "{guidance}");
+        assert!(guidance.contains("dev up` installs it"), "{guidance}");
         assert!(
             guidance.contains("rustup toolchain install 1.97.1"),
             "{guidance}"
@@ -672,17 +733,34 @@ mod tests {
     }
 
     #[test]
-    fn a_host_toolchain_answering_another_version_blocks() {
+    fn a_host_toolchain_without_rustup_blocks() {
         let tmp = TempDir::new().unwrap();
         let project = native_workspace(&tmp, Some("[toolchain]\nchannel = \"1.97.1\"\n"));
         let stack = crate::proc::fake::FakeStack::new()
-            .with_stdout("rustc +1.97.1", "rustc 1.93.0 (0000000 2026-01-01)");
+            .fail_on("cargo +1.97.1", "no such command: `+1.97.1`")
+            .fail_on("rustup", "not found");
         let [_, toolchain] = check_native_tools(&project, &stack.runner());
-        assert!(toolchain.is_blocking());
+        let Check::Fail { guidance, .. } = toolchain else {
+            panic!("`cargo +1.97.1` cannot work without rustup");
+        };
+        assert!(guidance.contains("needs rustup"), "{guidance}");
+        assert!(guidance.contains("no such command"), "{guidance}");
     }
 
     #[test]
-    fn an_unreadable_host_toolchain_pin_blocks_without_running_rustc() {
+    fn the_host_channel_is_probed_as_written() {
+        let tmp = TempDir::new().unwrap();
+        let project = native_workspace(&tmp, Some("[toolchain]\nchannel = \"1.97\"\n"));
+        let stack = crate::proc::fake::FakeStack::new();
+        check_native_tools(&project, &stack.runner());
+        assert!(stack
+            .rendered()
+            .iter()
+            .any(|call| call.contains("cargo +1.97 --version")));
+    }
+
+    #[test]
+    fn an_unreadable_host_toolchain_pin_blocks_without_running_cargo() {
         for toolchain in [None, Some("[toolchain]\n")] {
             let tmp = TempDir::new().unwrap();
             let project = native_workspace(&tmp, toolchain);
