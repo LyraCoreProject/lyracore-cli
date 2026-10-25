@@ -965,6 +965,10 @@ private key, corrupt key material or a mismatched pair stops startup without rep
 keys. The Host receives this directory through `--jwt-key-dir`; a certificate authority already
 set in `native-data/config.toml` retains precedence.
 
+`doctor` checks the same OpenSSL requirement for native checkouts. A missing command, LibreSSL,
+or an unsupported version is a blocking failure with a link to the installation instructions.
+The check reads the version only; it does not create or change signing keys.
+
 Native state lives in `.lyracore/native-data`; startup creates a new local Realm there. It does
 not merge data from the old Shards. Stop a recorded legacy runtime with `dev down` first. An
 unrelated process on any required port causes startup to stop before publishing. The CLI records

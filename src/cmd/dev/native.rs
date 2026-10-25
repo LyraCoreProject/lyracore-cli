@@ -11,21 +11,7 @@ pub(super) enum NativeMode {
 }
 
 fn native_jwt_keys(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<PathBuf> {
-    let version = runner
-        .run_and_wait(&CommandSpec::new("openssl").arg("version"))
-        .map_err(|error| Error::PrerequisiteMissing(format!(
-            "could not check OpenSSL: {error}. OpenSSL 3 or newer on PATH is required; see docs/quickstart.md#1-prerequisites in this Core checkout"
-        )))?;
-    let major = version
-        .strip_prefix("OpenSSL ")
-        .and_then(|value| value.split('.').next())
-        .and_then(|value| value.parse::<u32>().ok());
-    if major.is_none_or(|major| major < 3) {
-        return Err(Error::PrerequisiteMissing(format!(
-            "Native Host JWT keys require OpenSSL 3 or newer on PATH; found {}. See docs/quickstart.md#1-prerequisites in this Core checkout",
-            version.trim()
-        )));
-    }
+    crate::proc::require_openssl(runner)?;
     let directory = project.state_dir.join("native-jwt");
     let mut create = fs::DirBuilder::new();
     create.recursive(true);
