@@ -469,12 +469,12 @@ impl ProjectLayout {
         self.state_dir.join("state.json")
     }
 
-    /// The coordinator credential this CLI minted from the local node (#297), if it ever had to.
-    ///
-    /// Inside the git-ignored state directory, next to `state.json` — a credential that belongs to
-    /// this checkout's fixture and to nothing else, and that must never become a commit.
     pub fn token_file(&self) -> PathBuf {
-        self.state_dir.join("coordinator-token")
+        self.state_dir.join(if self.has_native_host() {
+            "native-owner-token"
+        } else {
+            "coordinator-token"
+        })
     }
 
     /// Persisted CLI config (`config.rs`) — currently just the 1.12.1 client's `Data/` directory,
@@ -485,6 +485,22 @@ impl ProjectLayout {
 
     pub fn log_file(&self, component: Component) -> PathBuf {
         self.logs_dir.join(format!("{}.log", component.as_str()))
+    }
+
+    pub fn native_cli_config(&self) -> PathBuf {
+        self.state_dir.join("native-cli.toml")
+    }
+
+    pub fn local_topology(&self) -> Result<Topology> {
+        if self.has_native_host() {
+            Ok(Topology::Single)
+        } else {
+            Ok(crate::state::RuntimeState::load(&self.state_file())?.topology())
+        }
+    }
+
+    pub fn has_native_host(&self) -> bool {
+        self.root.join("native-host/prepare-host.py").is_file()
     }
 
     pub fn gateway_bin(&self) -> PathBuf {

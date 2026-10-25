@@ -1,24 +1,6 @@
-//! The local realm lifecycle: `dev up | status | logs | smoke | down`.
-//!
-//! Scope is the local Realm, which since #11 is **sharded by default**: four databases
-//! — the default world shard, the map-1 shard, the instance pool (#108) and realm-core
-//! (`Topology::Sharded`), one per production tier in core `docs/architecture.md` §3.1. `dev up
-//! --single` is the pre-#11 one-database fixture, unchanged down to the hard unset of every
-//! topology variable.
-//!
-//! This is still not the production recipe in `docs/danger-zones.md` §3 — different databases,
-//! loopback only — and no path here reads a topology variable out of the contributor's shell.
-//! [`Topology::apply_env`](crate::project::Topology::apply_env) decides all four, in both modes.
-//!
-//! # The failure this file is shaped around
-//!
-//! A gateway's response to bad topology config is **silent collapse to one database**: a malformed
-//! shard-map rule is logged and dropped, an absent or default-equal `LYRACORE_REALM_CORE` reads as
-//! unconfigured, an empty `LYRACORE_SHARD_MAP` still counts as set. The result starts, binds,
-//! answers its health probe, and serves ONE database while the others sit published, claimed and
-//! unused. So `up` does not stop at exporting the right strings — it reads the realised topology
-//! back out of the gateway's own log ([`DevManager::verify_topology`]), and `status` reports every
-//! database rather than the default one.
+//! See docs/commands.md for local Realm startup and process ownership.
+
+mod native;
 
 use crate::cmd::{
     account,
@@ -137,7 +119,11 @@ impl DevManager {
         component: Component,
         inspector: &dyn ProcessInspector,
     ) -> ComponentStatus {
-        let record = self.state.record(component);
+        let record = self.state.record(if self.state.native_runtime {
+            Component::Spacetime
+        } else {
+            component
+        });
         let live = record.and_then(|r| inspector.identity(r.pid));
         let serving =
             inspector.serving(&component.health_host(&self.bind), component.health_port());
@@ -154,6 +140,9 @@ impl DevManager {
         bind: ClientBind,
         topology: Topology,
     ) -> Result<()> {
+        if self.project.has_native_host() {
+            return self.up_native(runner, inspector, http, bind);
+        }
         self.project.ensure_dirs()?;
         self.state.database = ProjectLayout::DATABASE.to_string();
 
@@ -676,6 +665,14 @@ impl DevManager {
     }
 
     fn print_status(&self, runner: &dyn ProcessRunner, inspector: &dyn ProcessInspector) {
+        if self.state.native_runtime
+            || (self.project.has_native_host()
+                && self.state.spacetime.is_none()
+                && self.state.gateway.is_none())
+        {
+            self.print_native_status(runner, inspector);
+            return;
+        }
         let spacetime = self.status_for(Component::Spacetime, inspector);
         for component in Component::ALL {
             let record = self.state.record(component);
@@ -839,7 +836,11 @@ impl DevManager {
     // ---- logs ----
 
     pub fn logs(&self, component: Option<Component>, all: bool) -> Result<()> {
-        let components = component.map_or_else(|| Component::ALL.to_vec(), |c| vec![c]);
+        let components = if self.state.native_runtime {
+            vec![Component::Spacetime]
+        } else {
+            component.map_or_else(|| Component::ALL.to_vec(), |c| vec![c])
+        };
         for component in components {
             let path = self.project.log_file(component);
             println!("=== {} — {} ===", component.as_str(), path.display());

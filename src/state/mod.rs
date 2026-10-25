@@ -19,6 +19,8 @@ pub struct ProcessRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeState {
     #[serde(default)]
+    pub native_runtime: bool,
+    #[serde(default)]
     pub spacetime: Option<ProcessRecord>,
     #[serde(default)]
     pub gateway: Option<ProcessRecord>,

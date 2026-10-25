@@ -1,31 +1,8 @@
-//! `lyracore publish [DATABASE …]` — deploy the SpacetimeDB module to the LOCAL node, the ONE
-//! correct way.
-//!
-//! This absorbs the server repo's `scripts/publish-module.sh`. Two flags are baked in and one is
-//! unreachable:
-//!
-//! * `--build-options=--features=debug_reducers` — the debug module (`game_debug_readout` and
-//!   friends) is behind that Cargo feature. A plain build omits it, so publish reports a FALSE
-//!   "Removed table" breaking change and aborts. With the feature the build matches the deployed
-//!   (debug) schema, so there is no false alarm.
-//! * `--yes` — SpacetimeDB prompts "All clients will be disconnected" for ANY schema change, even
-//!   an additive END-appended `#[default]` column. It confirms ONLY that disconnect warning; it
-//!   does NOT bypass the data-destructive path. Without it, a non-interactive stdin makes even a
-//!   safe additive migration abort on EOF.
-//! * `-c` / `--delete-data` — the destructive wipe (docs/danger-zones.md §1). It is not baked in,
-//!   and it cannot be passed through: this command's arguments are database NAMES, and anything
-//!   flag-shaped is REFUSED before a single `spacetime` process is started.
-//!
-//! WHY IT TAKES DATABASE NAMES: a schema change needs EVERY shard republished. The original
-//! hardcoded one database, so every other shard was published by hand-typing the raw command — and
-//! the documented form of that dropped `--yes`. That is how two shards were once left behind
-//! missing a table while the others were current, which the gateway reported only as "realm-core
-//! unreachable — LOGONS WILL BE REFUSED". Passing them all in one command is what makes "all of
-//! them" checkable instead of remembered.
+//! See docs/commands.md for publish targets, credentials and migration checks.
 
 use crate::cmd::import;
 use crate::cmd::preflight;
-use crate::proc::{CommandSpec, ProcessRunner};
+use crate::proc::{CommandSpec, ProcessInspector, ProcessRunner};
 use crate::project::{Component, ProjectLayout, Topology};
 use crate::state::RuntimeState;
 use crate::{Error, Result};
@@ -90,9 +67,7 @@ pub fn validate_database(verb: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate the database names given on the command line. Empty means "none named" — `run` then
-/// resolves that against the persisted topology once it has a [`ProjectLayout`] to read; parsing
-/// happens before the project is discovered, so it cannot make that call itself.
+/// Empty names select the runtime defaults in `run`; see docs/commands.md.
 pub fn databases(args: &[String]) -> Result<Vec<String>> {
     for name in args {
         validate_database(VERB, name)?;
@@ -100,15 +75,24 @@ pub fn databases(args: &[String]) -> Result<Vec<String>> {
     Ok(args.to_vec())
 }
 
-/// What a bare `lyracore publish` means: every database in the topology `dev up` and `dev status`
-/// already treat as the truth, in the same order — a schema change must reach all of them, not just
-/// the one the fixture happened to seed first.
-///
-/// No active recorded fixture (a fresh clone, one that has never run `dev up`, or one after
-/// `dev down`) uses `Topology::Sharded`, not the last topology left in diagnostic state. A
-/// contributor who has not brought the stack up still gets a publish that matches what their next
-/// `dev up` will build.
+pub fn validate_native_server(server: &str) -> Result<()> {
+    let valid = server
+        .strip_prefix("http://")
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| address.ip().is_loopback() && address.port() != 0);
+    if !valid {
+        return Err(Error::Usage(
+            "native publishing requires an explicit loopback HTTP address and nonzero port".into(),
+        ));
+    }
+    Ok(())
+}
+
+// See docs/commands.md for default publish targets during local runtime changes.
 fn recorded_databases(project: &ProjectLayout) -> Result<Vec<String>> {
+    if project.has_native_host() {
+        return Ok(vec![ProjectLayout::DATABASE.to_string()]);
+    }
     let state = RuntimeState::load(&project.state_file())?;
     // `dev down` deliberately keeps diagnostic state such as the last topology, but without a
     // recorded gateway there is no active fixture for that topology to describe. In that case the
@@ -133,15 +117,33 @@ fn database_list(databases: &[String]) -> String {
     }
 }
 
-/// The ONE correct publish invocation.
 pub fn publish_command(project: &ProjectLayout, database: &str) -> Result<CommandSpec> {
+    let server = if project.has_native_host() {
+        ProjectLayout::stdb_uri()
+    } else {
+        ProjectLayout::STDB_SERVER.into()
+    };
+    publish_command_to(project, database, &server)
+}
+
+fn publish_command_to(
+    project: &ProjectLayout,
+    database: &str,
+    server: &str,
+) -> Result<CommandSpec> {
     validate_database(VERB, database)?;
-    Ok(preflight::module_command(project, "spacetime")
+    let mut command = preflight::module_command(project, "spacetime");
+    if project.has_native_host() {
+        require_native_configuration(project, server)?;
+        command = command
+            .arg("--config-path")
+            .arg(project.native_cli_config().to_string_lossy());
+    }
+    Ok(command
         .arg("publish")
         .arg("-s")
-        .arg(ProjectLayout::STDB_SERVER)
+        .arg(server)
         .arg("-p")
-        // Absolute, so `lyracore` publishes this checkout's module from any subdirectory of it.
         .arg(project.module_dir().to_string_lossy().to_string())
         .arg(format!(
             "--build-options={}",
@@ -149,6 +151,53 @@ pub fn publish_command(project: &ProjectLayout, database: &str) -> Result<Comman
         ))
         .arg("--yes")
         .arg(database))
+}
+
+fn require_native_configuration(project: &ProjectLayout, server: &str) -> Result<()> {
+    validate_native_server(server)?;
+    if !project.native_cli_config().is_file() {
+        return Err(Error::Usage("native publishing requires its private publisher configuration; run `lyracore dev up` to prepare it".into()));
+    }
+    let state = RuntimeState::load(&project.state_file())?;
+    let port = server
+        .strip_prefix("http://")
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .map(|address| address.port());
+    if port == Some(ProjectLayout::STDB_PORT)
+        && (state.gateway.is_some() || (!state.native_runtime && state.spacetime.is_some()))
+    {
+        return Err(Error::Usage("native publishing cannot target the recorded legacy runtime; stop it with `lyracore dev down` and start a native Realm first".into()));
+    }
+    if port == Some(ProjectLayout::STDB_PORT)
+        && (!state.native_runtime || state.spacetime.is_none())
+    {
+        return Err(Error::Usage("native publishing on port 3000 requires a recorded Native Host; run `lyracore dev up` first".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_native_host(
+    project: &ProjectLayout,
+    inspector: &dyn ProcessInspector,
+    target: &str,
+) -> Result<()> {
+    if project.has_native_host() {
+        require_native_configuration(project, target)?;
+        let address: std::net::SocketAddr = target
+            .strip_prefix("http://")
+            .and_then(|address| address.parse().ok())
+            .ok_or_else(|| Error::Usage("invalid native publish address".into()))?;
+        if address.port() == ProjectLayout::STDB_PORT {
+            let state = RuntimeState::load(&project.state_file())?;
+            let live = state.spacetime.as_ref().is_some_and(|record| {
+                inspector.identity(record.pid).as_deref() == Some(record.identity.as_str())
+            });
+            if !live || !inspector.serving(&address.ip().to_string(), address.port()) {
+                return Err(Error::Usage("native publishing on port 3000 requires the recorded Native Host to be running; run `lyracore dev up` first".into()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn describe_command(database: &str) -> CommandSpec {
@@ -280,16 +329,23 @@ pub(crate) fn require_loot_roll_upgrade_ready(
     Ok(())
 }
 
-/// Publish to each database in turn, stopping at the first failure.
-///
-/// Fail-fast is deliberate: a half-published realm is the state the gateway reports as an unrelated
-/// mid-session hang, so continuing past a failure would bury the one line that explains it.
+/// Stops at the first failed publish and reports completed and unattempted targets.
 pub fn run(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
+    inspector: &dyn ProcessInspector,
     databases: &[String],
     skip_preflight: bool,
+    server: Option<&str>,
 ) -> Result<()> {
+    if let Some(server) = server {
+        validate_native_server(server)?;
+        if !project.has_native_host() {
+            return Err(Error::Usage(
+                "publish --server requires a native checkout".into(),
+            ));
+        }
+    }
     let databases = if databases.is_empty() {
         recorded_databases(project)?
     } else {
@@ -299,20 +355,33 @@ pub fn run(
         validate_database(VERB, database)?;
     }
 
+    let commands = databases
+        .iter()
+        .map(|database| match server {
+            Some(server) => publish_command_to(project, database, server),
+            None => publish_command(project, database),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let target = server
+        .map(str::to_owned)
+        .unwrap_or_else(ProjectLayout::stdb_uri);
+    require_native_host(project, inspector, &target)?;
+
     if skip_preflight {
-        println!(
-            "· skipping preflight (--skip-preflight): binding preparation and Loot Roll upgrade checks still run."
-        );
+        println!("· skipping preflight (--skip-preflight)");
     } else {
         preflight::run(project, runner)?;
     }
 
-    require_loot_roll_upgrade_ready(project, runner, &databases)?;
+    if !project.has_native_host() {
+        require_loot_roll_upgrade_ready(project, runner, &databases)?;
+    }
 
-    for (index, database) in databases.iter().enumerate() {
+    for (index, (database, command)) in databases.iter().zip(&commands).enumerate() {
         println!();
         println!("==> publishing to {database}");
-        if let Err(error) = runner.run_streaming(&publish_command(project, database)?) {
+        if let Err(error) = runner.run_streaming(command) {
             return Err(Error::Process(format!(
                 "{error}\n  publish stopped at: {database}\n  completed: {}\n  not attempted: {}",
                 database_list(&databases[..index]),
@@ -323,7 +392,7 @@ pub fn run(
 
     println!();
     println!("published to: {}", databases.join(" "));
-    if databases == [ProjectLayout::DATABASE] {
+    if !project.has_native_host() && databases == [ProjectLayout::DATABASE] {
         println!(
             "NOTE: only {}. A SCHEMA change must be published to every shard of a sharded realm, \
              or the gateway",
@@ -334,23 +403,31 @@ pub fn run(
     Ok(())
 }
 
-/// Publish one preflighted Shard and repair its schedules before other activation steps.
-/// The caller must gate all targets with preflight and the Loot Roll upgrade check first.
+/// Call after preflight and applicable migration checks; publish and repair precede activation.
 pub(crate) fn publish_and_repair(
     project: &ProjectLayout,
     runner: &dyn ProcessRunner,
+    inspector: &dyn ProcessInspector,
     database: &str,
 ) -> Result<()> {
+    require_native_host(project, inspector, &ProjectLayout::stdb_uri())?;
     runner
         .run_streaming(&publish_command(project, database)?)
         .map_err(|error| {
             Error::Process(format!("Module publish failed at '{database}': {error}"))
         })?;
-    runner.run_and_wait(&import::call_command(project, database, "debug_repair_after_publish"))
-        .map_err(|error| Error::Process(format!(
+    let repair = import::call_command(project, database, "debug_repair_after_publish");
+    runner.run_and_wait(&repair).map_err(|error| {
+        let command = std::iter::once(repair.program())
+            .chain(repair.args().iter().map(String::as_str))
+            .map(|arg| super::packages::shell_quote(std::path::Path::new(arg)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Error::Process(format!(
             "'{database}' was published, but schedule repair failed: {error}\n  \
-             Repair it with `spacetime call -s local {database} debug_repair_after_publish` before retrying."
-        )))?;
+             Repair schedules with: {command}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -359,6 +436,270 @@ mod tests {
     use super::*;
     use crate::proc::fake::FakeStack;
     use tempfile::TempDir;
+
+    #[test]
+    fn native_repair_advice_preserves_shell_metacharacters_as_one_argument() {
+        let tmp = tempfile::Builder::new()
+            .prefix("native user's $(printf bad) ")
+            .tempdir()
+            .unwrap();
+        let project = healthy(&tmp);
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        std::fs::create_dir_all(&project.state_dir).unwrap();
+        std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'").unwrap();
+        RuntimeState {
+            native_runtime: true,
+            spacetime: Some(crate::state::ProcessRecord {
+                pid: 42,
+                identity: "native host".into(),
+            }),
+            ..Default::default()
+        }
+        .save(&project.state_file())
+        .unwrap();
+        let stack = FakeStack::new()
+            .with_process(42, "native host")
+            .with_port(3000)
+            .fail_on("debug_repair_after_publish", "operator only");
+        let error = publish_and_repair(&project, &stack.runner(), &stack.inspector(), "lyracore")
+            .unwrap_err()
+            .to_string();
+        let command = error.split_once("Repair schedules with: ").unwrap().1;
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -- {command}; printf '%s\\0' \"$@\""))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let arguments = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            vec![
+                b"spacetime".as_slice(),
+                b"--config-path",
+                project.native_cli_config().to_str().unwrap().as_bytes(),
+                b"call",
+                b"--server",
+                b"http://127.0.0.1:3000",
+                b"lyracore",
+                b"debug_repair_after_publish",
+                b"",
+            ]
+        );
+    }
+
+    #[test]
+    fn native_publish_uses_the_selected_node_and_private_publisher() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        std::fs::create_dir_all(&project.state_dir).unwrap();
+        std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'").unwrap();
+        let stack = FakeStack::new();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            Some("http://127.0.0.1:13000"),
+        )
+        .unwrap();
+        let commands = stack.rendered();
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(
+            commands[0].contains("publish -s http://127.0.0.1:13000"),
+            "{commands:?}"
+        );
+        assert!(commands[0].contains(&format!(
+            "--config-path {}",
+            project.native_cli_config().display()
+        )));
+        assert!(commands[0].ends_with("--yes lyracore"));
+    }
+
+    #[test]
+    fn native_default_and_explicit_publish_refuse_missing_credentials_and_legacy_state() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        let stack = FakeStack::new();
+        let mut state = RuntimeState {
+            spacetime: Some(crate::state::ProcessRecord {
+                pid: 42,
+                identity: "legacy".into(),
+            }),
+            topology: "sharded".into(),
+            ..Default::default()
+        };
+        state.save(&project.state_file()).unwrap();
+        for target in [
+            None,
+            Some("http://127.0.0.1:3000"),
+            Some("http://[::1]:3000"),
+            Some("http://127.0.0.1:13000"),
+        ] {
+            let error = run(
+                &project,
+                &stack.runner(),
+                &stack.inspector(),
+                &[],
+                false,
+                target,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("private publisher configuration"),
+                "{error}"
+            );
+        }
+        assert!(publish_command(&project, "lyracore").is_err());
+        std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'").unwrap();
+        for target in [
+            None,
+            Some("http://127.0.0.1:3000"),
+            Some("http://[::1]:3000"),
+        ] {
+            let error = run(
+                &project,
+                &stack.runner(),
+                &stack.inspector(),
+                &[],
+                false,
+                target,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("recorded legacy runtime"),
+                "{error}"
+            );
+        }
+        assert!(publish_command(&project, "lyracore").is_err());
+        assert!(stack.rendered().is_empty());
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            Some("http://127.0.0.1:13000"),
+        )
+        .unwrap();
+        state.native_runtime = true;
+        state.spacetime.as_mut().unwrap().identity = "native host".into();
+        let stack = stack.with_process(42, "native host").with_port(3000);
+        state.save(&project.state_file()).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
+        let commands = stack.rendered();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[1].contains("publish -s http://127.0.0.1:3000"));
+        assert!(commands
+            .iter()
+            .all(|command| command.contains("--config-path")));
+    }
+
+    #[test]
+    fn native_default_target_requires_its_live_record_even_when_another_node_answers() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        std::fs::create_dir_all(&project.state_dir).unwrap();
+        std::fs::write(project.native_cli_config(), "spacetimedb_token = 'fixture'").unwrap();
+        let stack = FakeStack::new()
+            .with_port(3000)
+            .with_process(99, "other native host");
+        for record in [
+            None,
+            Some(crate::state::ProcessRecord {
+                pid: 42,
+                identity: "exited native host".into(),
+            }),
+            Some(crate::state::ProcessRecord {
+                pid: 99,
+                identity: "reused pid".into(),
+            }),
+        ] {
+            RuntimeState {
+                native_runtime: true,
+                spacetime: record,
+                ..Default::default()
+            }
+            .save(&project.state_file())
+            .unwrap();
+            for server in [None, Some("http://127.0.0.1:3000")] {
+                let error = run(
+                    &project,
+                    &stack.runner(),
+                    &stack.inspector(),
+                    &[],
+                    false,
+                    server,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("requires"), "{error}");
+                assert!(stack.rendered().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn native_target_requires_a_native_checkout_and_private_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let project = healthy(&tmp);
+        let stack = FakeStack::new();
+        assert!(run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            Some("http://127.0.0.1:13000")
+        )
+        .is_err());
+        std::fs::create_dir_all(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        assert!(run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            Some("http://127.0.0.1:13000")
+        )
+        .is_err());
+        assert!(stack.rendered().is_empty());
+    }
+
+    #[test]
+    fn native_target_refuses_non_loopback_and_ambiguous_addresses() {
+        for target in [
+            "local",
+            "http://localhost:13000",
+            "https://127.0.0.1:13000",
+            "http://127.0.0.1:0",
+            "http://159.69.88.70:13000",
+            "http://user:secret@127.0.0.1:13000",
+            "http://127.0.0.1:13000/path",
+        ] {
+            assert!(validate_native_server(target).is_err(), "{target}");
+        }
+        assert!(validate_native_server("http://127.0.0.1:13000").is_ok());
+        assert!(validate_native_server("http://[::1]:13000").is_ok());
+    }
 
     fn project(tmp: &TempDir) -> ProjectLayout {
         std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
@@ -540,7 +881,15 @@ mod tests {
         let stack = clean_old_schema_stack();
         let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
 
-        run(&project, &stack.runner(), &wanted, true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &wanted,
+            true,
+            None,
+        )
+        .unwrap();
 
         let rendered = stack.rendered();
         let first_publish = rendered
@@ -572,8 +921,10 @@ mod tests {
         let error = run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &names(&["lyracore", "--delete-data"]),
             true,
+            None,
         )
         .unwrap_err();
 
@@ -595,8 +946,10 @@ mod tests {
             let error = run(
                 &project,
                 &stack.runner(),
+                &stack.inspector(),
                 &names(&["lyracore", "realm-core"]),
                 true,
+                None,
             )
             .unwrap_err();
 
@@ -626,7 +979,15 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             let project = loot_receipt_upgrade(&tmp);
 
-            let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+            let error = run(
+                &project,
+                &stack.runner(),
+                &stack.inspector(),
+                &names(&["lyracore"]),
+                true,
+                None,
+            )
+            .unwrap_err();
 
             assert!(
                 error.to_string().contains("Nothing was published"),
@@ -656,7 +1017,15 @@ mod tests {
             .with_stdout("spacetime describe", &decoy)
             .with_stdout("FROM game_loot_roll WHERE", " n\n 1\n");
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("active or staging Loot Rolls"),
@@ -677,7 +1046,15 @@ mod tests {
             &schema(&[LOOT_RECEIPT_TABLE, LOOT_RECEIPT_TABLE]),
         );
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("more than once"), "{error}");
         assert!(!stack
@@ -693,7 +1070,15 @@ mod tests {
         let stack =
             FakeStack::new().with_stdout("spacetime describe", &schema(&[LOOT_RECEIPT_TABLE]));
 
-        run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap();
 
         assert!(!stack
             .rendered()
@@ -725,8 +1110,10 @@ mod tests {
         run(
             &project,
             &stack.runner(),
+            &stack.inspector(),
             &names(&["lyracore", "realm-core"]),
             true,
+            None,
         )
         .unwrap();
 
@@ -763,7 +1150,15 @@ mod tests {
             .fail_on("cargo check", "preflight must be skipped")
             .with_stdout("FROM game_loot_roll WHERE", " n\n 1\n");
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("active or staging Loot Rolls"),
@@ -785,7 +1180,15 @@ mod tests {
         let project = healthy(&tmp);
         let stack = FakeStack::new().fail_on("spacetime describe", "must not inspect live state");
 
-        run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             stack
@@ -802,7 +1205,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = healthy(&tmp);
         let stack = FakeStack::new().fail_on("spacetime generate", "bad Module");
-        assert!(run(&project, &stack.runner(), &names(&["lyracore"]), true).is_err());
+        assert!(run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None
+        )
+        .is_err());
         assert!(!stack
             .rendered()
             .iter()
@@ -831,7 +1242,15 @@ mod tests {
         record_active_topology(&project, Topology::Sharded);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -858,7 +1277,15 @@ mod tests {
         record_active_topology(&project, Topology::Single);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -880,7 +1307,15 @@ mod tests {
         let project = healthy(&tmp);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -907,7 +1342,15 @@ mod tests {
         state.save(&project.state_file()).unwrap();
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &[], true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -924,7 +1367,15 @@ mod tests {
         record_active_topology(&project, Topology::Sharded);
         let stack = FakeStack::new();
 
-        run(&project, &stack.runner(), &names(&["realm-core"]), true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["realm-core"]),
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -940,7 +1391,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let stack = FakeStack::new();
         let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
-        run(&healthy(&tmp), &stack.runner(), &wanted, true).unwrap();
+        run(
+            &healthy(&tmp),
+            &stack.runner(),
+            &stack.inspector(),
+            &wanted,
+            true,
+            None,
+        )
+        .unwrap();
 
         let published: Vec<String> = stack
             .rendered()
@@ -964,7 +1423,15 @@ mod tests {
         let stack = FakeStack::new().fail_on("lyracore-world-1", "migration rejected");
         let wanted = names(&["lyracore", "lyracore-world-1", "realm-core"]);
 
-        let error = run(&healthy(&tmp), &stack.runner(), &wanted, true).unwrap_err();
+        let error = run(
+            &healthy(&tmp),
+            &stack.runner(),
+            &stack.inspector(),
+            &wanted,
+            true,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error.exit_code(), crate::error::EXIT_FAILURE);
         let message = error.to_string();
         assert!(
@@ -988,7 +1455,15 @@ mod tests {
 
         let stack = FakeStack::new();
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), false).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("Nothing was published"),
             "{error}"
@@ -1022,7 +1497,15 @@ mod tests {
         .unwrap();
         let stack = FakeStack::new();
 
-        let error = run(&project, &stack.runner(), &names(&["lyracore"]), false).unwrap_err();
+        let error = run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            false,
+            None,
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("Nothing was published"),
@@ -1045,8 +1528,10 @@ mod tests {
         run(
             &healthy(&tmp),
             &stack.runner(),
+            &stack.inspector(),
             &names(&["lyracore"]),
             false,
+            None,
         )
         .unwrap();
 
@@ -1068,7 +1553,15 @@ mod tests {
         let project = healthy(&tmp);
         // A Module build preflight would refuse.
         let stack = FakeStack::new().fail_on("cargo check", "invalid native build");
-        run(&project, &stack.runner(), &names(&["lyracore"]), true).unwrap();
+        run(
+            &project,
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore"]),
+            true,
+            None,
+        )
+        .unwrap();
         assert!(
             stack
                 .rendered()

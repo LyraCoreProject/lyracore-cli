@@ -49,13 +49,11 @@ use review::TrustReview;
 use stamp::ProvenanceStamp;
 use std::path::{Path, PathBuf};
 
-/// Every database of the recorded development topology — what a `packages` verb means when no Shard
-/// is named, and exactly how `publish` resolves the same absence.
-///
-/// A checkout that has never run `dev up` has recorded nothing, and the default fixture is sharded.
-/// This is deliberately the only topology source these verbs have: there is no path here that
-/// infers a production Realm's Shard list.
+/// Native checkouts select one Shard; legacy checkouts use their recorded development topology.
 pub(crate) fn recorded_databases(project: &ProjectLayout) -> Result<Vec<String>> {
+    if project.has_native_host() {
+        return Ok(vec![ProjectLayout::DATABASE.to_owned()]);
+    }
     let state = RuntimeState::load(&project.state_file())?;
     let topology = if state.record(Component::Gateway).is_some() {
         state.topology()

@@ -21,7 +21,8 @@ commit pinned in `.lyracore-cli-rev`. You do not need to clone this CLI reposito
 ```
 
 Core's installer also supplies a global `lyracore` launcher that works from checkout subdirectories.
-The local realm uses four databases by default; `dev up --single` selects one. Import your world
+Core checkouts with `native-host/prepare-host.py` run one Native Host and one Shard. Older Core
+checkouts retain the four-Shard runtime, with `dev up --single` selecting one. Import your world
 content before play. Stop the processes owned by the CLI with `lyracore dev down`.
 
 ## Find a command

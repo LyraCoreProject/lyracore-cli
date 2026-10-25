@@ -74,11 +74,14 @@ fn run(command: Command) -> Result<i32> {
         Command::Publish {
             databases,
             skip_preflight,
+            server,
         } => cmd::publish::run(
             &ProjectLayout::discover()?,
             &runner,
+            &inspector,
             &databases,
             skip_preflight,
+            server.as_deref(),
         )
         .map(|_| EXIT_OK),
         Command::DevUp { bind, topology } => {
@@ -134,7 +137,7 @@ fn run(command: Command) -> Result<i32> {
         .map(|_| EXIT_OK),
         Command::AccountCreate { user, source } => {
             let project = ProjectLayout::discover()?;
-            cmd::account::create(&project, &user, source, &runner).map(|_| EXIT_OK)
+            cmd::account::create(&project, &user, source, &runner, &http).map(|_| EXIT_OK)
         }
         Command::ConfigShow => cmd::config::show(&ProjectLayout::discover()?).map(|_| EXIT_OK),
         Command::ConfigSetClientData { path } => {
@@ -191,6 +194,7 @@ fn run(command: Command) -> Result<i32> {
         Command::PackagesApply(options) => cmd::packages::apply::run(
             &ProjectLayout::discover()?,
             &runner,
+            &inspector,
             &cmd::import::TtyPrompt::packages_apply(),
             &options,
         )
