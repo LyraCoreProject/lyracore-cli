@@ -210,6 +210,8 @@ impl DevManager {
                     )));
                 }
             }
+            crate::cmd::doctor::require_python(runner)?;
+            crate::cmd::doctor::require_host_toolchain(&self.project, runner)?;
             let jwt_keys = native_jwt_keys(&self.project, runner)?;
             let checkout = self.project.state_dir.join("native-host/SpacetimeDB");
             println!("Building the Native Host...");
@@ -372,6 +374,11 @@ mod tests {
         std::fs::create_dir_all(root.join("scripts")).unwrap();
         std::fs::create_dir_all(root.join("native-host")).unwrap();
         std::fs::write(root.join("native-host/prepare-host.py"), "").unwrap();
+        std::fs::write(
+            root.join("native-host/rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.97.1\"\n",
+        )
+        .unwrap();
         ProjectLayout::from_root(root).unwrap()
     }
 
@@ -511,6 +518,33 @@ mod tests {
             .calls()
             .iter()
             .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
+    }
+
+    #[test]
+    fn missing_build_tools_stop_native_start_before_keys_or_build() {
+        for (command, expected) in [
+            ("python3 --version", "Install Python 3"),
+            ("rustc +1.97.1", "rustup toolchain install 1.97.1"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut dev = DevManager::new(project(&tmp)).unwrap();
+            let stack = FakeStack::new().fail_on(command, "not found");
+            let error = dev
+                .up_native(
+                    &stack.runner(),
+                    &stack.inspector(),
+                    &FakeHttp::new(),
+                    ClientBind::Loopback,
+                    NativeMode::HotReload,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!tmp.path().join(".lyracore/native-jwt").exists());
+            assert!(!stack
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Spawn { .. } | Call::Stream(_))));
+        }
     }
 
     #[test]

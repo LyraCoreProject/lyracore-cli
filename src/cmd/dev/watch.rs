@@ -486,6 +486,11 @@ mod tests {
             .unwrap();
             fs::create_dir_all(root.join("native-host")).unwrap();
             fs::write(root.join("native-host/prepare-host.py"), "").unwrap();
+            fs::write(
+                root.join("native-host/rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"1.97.1\"\n",
+            )
+            .unwrap();
             fs::write(root.join("native-host/dev-reload.patch"), "patch").unwrap();
             let project = ProjectLayout::from_root(root).unwrap();
             let stack = FakeStack::new()

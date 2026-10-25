@@ -5,7 +5,7 @@
 
 use crate::cmd::import;
 use crate::config::Config;
-use crate::proc::{require_openssl, ProcessRunner, RealProcessRunner};
+use crate::proc::{require_openssl, CommandSpec, ProcessRunner, RealProcessRunner};
 use crate::project::ProjectLayout;
 use crate::Result;
 use std::path::Path;
@@ -126,10 +126,82 @@ pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
         check_ports(),
         check_client_data(layout.as_ref().ok()),
     ];
+    if let Some(project) = layout.as_ref().ok().filter(|p| p.has_native_host()) {
+        checks.extend(check_native_tools(project, &RealProcessRunner));
+    }
     if let Some(check) = check_native_openssl(layout.as_ref().ok(), &RealProcessRunner) {
         checks.push(check);
     }
     checks
+}
+
+fn check_native_tools(project: &ProjectLayout, runner: &dyn ProcessRunner) -> [Check; 2] {
+    [
+        match require_python(runner) {
+            Ok(banner) => Check::pass("Python", banner),
+            Err(error) => Check::fail("Python", error.to_string()),
+        },
+        match require_host_toolchain(project, runner) {
+            Ok(banner) => Check::pass("Host toolchain", banner),
+            Err(error) => Check::fail("Host toolchain", error.to_string()),
+        },
+    ]
+}
+
+pub(crate) fn require_python(runner: &dyn ProcessRunner) -> Result<String> {
+    runner
+        .run_and_wait(&CommandSpec::new("python3").arg("--version"))
+        .map(|banner| banner.trim().to_owned())
+        .map_err(|error| {
+            crate::Error::PrerequisiteMissing(format!(
+                "the Native Host build runs native-host/prepare-host.py with python3, which \
+                 failed: {error}. Install Python 3; see docs/quickstart.md#1-prerequisites in \
+                 this Core checkout"
+            ))
+        })
+}
+
+/// Fails without downloading when rustup lacks the toolchain in `native-host/rust-toolchain.toml`.
+pub(crate) fn require_host_toolchain(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+) -> Result<String> {
+    let path = project
+        .root
+        .join("native-host")
+        .join(ProjectLayout::RUST_TOOLCHAIN);
+    let required = std::fs::read_to_string(&path)
+        .ok()
+        .as_deref()
+        .and_then(crate::cmd::preflight::pinned_rust)
+        .ok_or_else(|| {
+            crate::Error::PrerequisiteMissing(format!(
+                "cannot read the Native Host toolchain `channel` from {}",
+                path.display()
+            ))
+        })?;
+    let refuse = |detail: String| {
+        crate::Error::PrerequisiteMissing(format!(
+            "the Native Host builds with Rust {required} through rustup: {detail}. Run \
+             `rustup toolchain install {required} --profile minimal`, or install rustup from \
+             https://rustup.rs/ if this Rust does not come from it"
+        ))
+    };
+    let banner = runner
+        .run_and_wait(
+            &CommandSpec::new("rustc")
+                .arg(format!("+{required}"))
+                .arg("--version")
+                .env("RUSTUP_AUTO_INSTALL", "0"),
+        )
+        .map_err(|error| refuse(error.to_string()))?;
+    match parse_version(&banner) {
+        Some(found) if found == required => Ok(banner.trim().to_owned()),
+        _ => Err(refuse(format!(
+            "`rustc +{required}` reported {}",
+            banner.trim()
+        ))),
+    }
 }
 
 fn check_native_openssl(
@@ -514,6 +586,87 @@ mod tests {
             .unwrap()
             .is_blocking());
         assert!(!project.state_dir.join("native-jwt").exists());
+    }
+
+    fn native_workspace(tmp: &TempDir, toolchain: Option<&str>) -> ProjectLayout {
+        let project = workspace(tmp);
+        std::fs::create_dir(tmp.path().join("native-host")).unwrap();
+        std::fs::write(tmp.path().join("native-host/prepare-host.py"), "").unwrap();
+        if let Some(toolchain) = toolchain {
+            std::fs::write(
+                tmp.path().join("native-host/rust-toolchain.toml"),
+                toolchain,
+            )
+            .unwrap();
+        }
+        project
+    }
+
+    #[test]
+    fn native_tools_pass_with_python_and_the_pinned_host_toolchain() {
+        let tmp = TempDir::new().unwrap();
+        let project = native_workspace(&tmp, Some("[toolchain]\nchannel = \"1.97.1\"\n"));
+        let stack = crate::proc::fake::FakeStack::new();
+        let [python, toolchain] = check_native_tools(&project, &stack.runner());
+        assert_eq!(python, Check::pass("Python", "Python 3.12.3"));
+        assert!(matches!(
+            toolchain,
+            Check::Pass { detail, .. } if detail.starts_with("rustc 1.97.1 ")
+        ));
+        assert!(stack
+            .rendered()
+            .iter()
+            .any(|call| call.contains("rustc +1.97.1 --version")));
+    }
+
+    #[test]
+    fn missing_python_or_host_toolchain_blocks_with_the_install_command() {
+        let tmp = TempDir::new().unwrap();
+        let project = native_workspace(&tmp, Some("[toolchain]\nchannel = \"1.97.1\"\n"));
+        let stack = crate::proc::fake::FakeStack::new()
+            .fail_on("python3", "not found")
+            .fail_on("rustc +1.97.1", "toolchain '1.97.1' is not installed");
+        let [python, toolchain] = check_native_tools(&project, &stack.runner());
+        let Check::Fail { guidance, .. } = python else {
+            panic!("missing python3 must block native startup");
+        };
+        assert!(guidance.contains("Install Python 3"), "{guidance}");
+        let Check::Fail { guidance, .. } = toolchain else {
+            panic!("a missing Host toolchain must block native startup");
+        };
+        assert!(guidance.contains("is not installed"), "{guidance}");
+        assert!(
+            guidance.contains("rustup toolchain install 1.97.1"),
+            "{guidance}"
+        );
+    }
+
+    #[test]
+    fn a_host_toolchain_answering_another_version_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let project = native_workspace(&tmp, Some("[toolchain]\nchannel = \"1.97.1\"\n"));
+        let stack = crate::proc::fake::FakeStack::new()
+            .with_stdout("rustc +1.97.1", "rustc 1.93.0 (0000000 2026-01-01)");
+        let [_, toolchain] = check_native_tools(&project, &stack.runner());
+        assert!(toolchain.is_blocking());
+    }
+
+    #[test]
+    fn an_unreadable_host_toolchain_pin_blocks_without_running_rustc() {
+        for toolchain in [None, Some("[toolchain]\n")] {
+            let tmp = TempDir::new().unwrap();
+            let project = native_workspace(&tmp, toolchain);
+            let stack = crate::proc::fake::FakeStack::new();
+            let [_, check] = check_native_tools(&project, &stack.runner());
+            let Check::Fail { guidance, .. } = check else {
+                panic!("an unreadable pin must block native startup");
+            };
+            assert!(guidance.contains("rust-toolchain.toml"), "{guidance}");
+            assert!(!stack
+                .rendered()
+                .iter()
+                .any(|call| call.starts_with("rustc")));
+        }
     }
 
     #[test]

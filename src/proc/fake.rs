@@ -319,6 +319,13 @@ fn canned_stdout(render: &str) -> String {
         "fake native JWT public key\n".into()
     } else if render.contains("login show") {
         format!("You are logged in as fake-identity\nYour auth token (don't share this!) is {FAKE_TOKEN}\n")
+    } else if render == "python3 --version" {
+        "Python 3.12.3\n".into()
+    } else if let Some(toolchain) = render
+        .strip_prefix("rustc +")
+        .and_then(|rest| rest.strip_suffix(" --version"))
+    {
+        format!("rustc {toolchain} (0000000 2026-01-01)\n")
     } else if render.starts_with("rustc --version") {
         format!("rustc {FAKE_RUST_VERSION} (0000000 2026-01-01)\n")
     } else if render.starts_with("spacetime --version") {
