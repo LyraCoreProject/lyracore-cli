@@ -71,6 +71,9 @@ fn run(command: Command) -> Result<i32> {
         Command::Preflight => {
             cmd::preflight::run(&ProjectLayout::discover()?, &runner).map(|_| EXIT_OK)
         }
+        Command::Sql { query } => {
+            cmd::sql::run(&ProjectLayout::discover()?, &runner, &query).map(|_| EXIT_OK)
+        }
         Command::Publish {
             databases,
             skip_preflight,

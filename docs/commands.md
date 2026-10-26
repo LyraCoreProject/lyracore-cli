@@ -54,6 +54,7 @@ lyracore dev smoke ACCOUNT CHARACTER [--password-stdin]
 lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
 lyracore character gm NAME true|false
+lyracore sql QUERY
 lyracore import [--accept] [--client-data PATH] [--profile-shard PROFILE=SHARD ...]
 lyracore import world [--accept] [--client-data PATH] [--profile-shard PROFILE=SHARD ...]
 lyracore import check [--profile-shard PROFILE=SHARD ...]
@@ -1273,6 +1274,24 @@ remedy `account create` gives for the same problem.
 Characters live on **world shards**, never realm-core, so it walks the shards in topology order
 (just `lyracore` under `--single`) and calls each in turn, stopping at the first one that has a
 player by that name. A miss on every shard is reported once, aggregated, rather than once per shard.
+
+## `sql` — read and edit the local Realm's database
+
+```bash
+./lyracore sql "SELECT * FROM game_creature_template WHERE entry = 6"
+```
+
+Runs one SQL statement on the local Realm's database (`lyracore`) and prints SpacetimeDB's output.
+It runs as the publisher identity that `dev up` keeps in `.lyracore/native-cli.toml`. SpacetimeDB
+lets only that identity read private tables or run `INSERT`, `UPDATE` and `DELETE`, so a plain
+`spacetime sql` call is refused for those.
+
+Changes go straight to the live local database. Nothing asks for confirmation and nothing undoes a
+change. Take a copy of the data first if you may want it back.
+
+If the checkout has no publisher configuration, the command refuses and names `dev up`. If
+SpacetimeDB does not answer, the error points at `dev status`. The exit code is `1` when
+SpacetimeDB reports a failure, for example a malformed query.
 
 ## What `dev status` verifies
 
