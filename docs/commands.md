@@ -128,10 +128,11 @@ The sharded destination plan is fixed:
 | `lyracore-instances` | `instances` | whole map 36 with required WMO geometry, no open-world terrain or navigation pass |
 
 The single topology uses `alliance-single`, the union of those bounded continent slices and maps 36 and 369.
-Every importer child names its destination and loopback SpacetimeDB endpoint. The full
-Spell.dbc catalogue already supplies caster spells, so Verification derives every referenced
-caster spell from `game_creature_cast` and `game_creature_spell` instead of maintaining an
-independent allowlist.
+Every importer child names its destination and loopback SpacetimeDB endpoint. The world-content
+mode loads the full Spell.dbc catalogue before the world AI, because the Module refuses EventAI
+relay definitions that name a missing spell. That catalogue already supplies caster spells, so
+Verification derives every referenced caster spell from `game_creature_cast` and
+`game_creature_spell` instead of maintaining an independent allowlist.
 
 If a mode fails, later modes and later destinations do not start. The error names the destination,
 profile and mode. Fix the cause and rerun the full command. Import families use clear-and-reload, so

@@ -1058,7 +1058,7 @@ fn world_etl_commands(
         .arg("--apply");
 
     let mut commands = vec![(
-        "world content (creatures, quests, loot, vendors, gameobjects)",
+        "world content (spells, creatures, quests, loot, vendors, gameobjects)",
         "The dump families are clear+reload — a failed run leaves the target partially loaded; \
          re-run after fixing the cause. `no spawns matched the profile` means the canonical \
          profile does not fit the pinned dump; verify its dump-derived scope in the importer.",
@@ -1119,16 +1119,6 @@ fn world_etl_commands(
                 .arg("--dbc")
                 .arg(&data)
                 .arg("--talents")
-                .arg("--apply"),
-        ),
-        (
-            "full Spell.dbc import (every non-zero row)",
-            "Reads dbc.MPQ. The long tail lands as scripted no-ops by design; a parse failure \
-             here is a client-build problem, not that.",
-            importer_command(project, database)
-                .arg("--dbc")
-                .arg(&data)
-                .arg("--spells")
                 .arg("--apply"),
         ),
     ]);
@@ -2480,7 +2470,7 @@ pub(crate) mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let data = client_data(&tmp);
-        let stack = healthy().fail_on("--spells --apply", "Spell catalogue parse failed");
+        let stack = healthy().fail_on("--talents --apply", "Talent catalogue parse failed");
         run_world(
             &project,
             &stack.runner(),
@@ -2957,7 +2947,7 @@ pub(crate) mod tests {
         }));
         assert!(!rendered.iter().any(|command| command.contains("--terrain")));
         assert!(!rendered.iter().any(|command| command.contains("--nav")));
-        for mode in ["--vmap", "--talents", "--spells"] {
+        for mode in ["--vmap", "--talents"] {
             assert!(rendered.iter().any(|command| command.contains(mode)));
         }
         assert!(!rendered
@@ -3118,7 +3108,6 @@ pub(crate) mod tests {
             format!("{importer} --db {db} --server {server} --vmap {data} --world-profile alliance-single --apply"),
             format!("{importer} --db {db} --server {server} --dbc {data} --taxi-mounts {DUMP_PATH} --apply"),
             format!("{importer} --db {db} --server {server} --dbc {data} --talents --apply"),
-            format!("{importer} --db {db} --server {server} --dbc {data} --spells --apply"),
         ];
         let got: Vec<String> = rendered(&stack)
             .into_iter()
@@ -3128,7 +3117,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_flow_orders_floors_pull_build_etl_spells_repair_assertions() {
+    fn the_flow_orders_floors_pull_build_etl_repair_assertions() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let data = client_data(&tmp);
@@ -3154,7 +3143,6 @@ pub(crate) mod tests {
             "--nav",
             "--vmap",
             "--talents",
-            "--spells --apply",
             "debug_repair_after_publish",
             "arm_all_pools",
             "spacetime sql",
@@ -3414,7 +3402,7 @@ pub(crate) mod tests {
             assert!(
                 shard_imports
                     .iter()
-                    .any(|command| command.contains("--spells")),
+                    .any(|command| command.contains("--dump") && command.contains("--dbc")),
                 "{shard}"
             );
         }
@@ -3730,9 +3718,9 @@ pub(crate) mod tests {
             ),
             ("--terrain", "self-check bail", "terrain", "--nav"),
             (
-                "--spells --apply",
-                "client spell parse failed",
-                "full Spell.dbc",
+                "--talents --apply",
+                "client talent parse failed",
+                "real talent trees",
                 "debug_repair_after_publish",
             ),
         ] {
