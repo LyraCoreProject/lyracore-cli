@@ -12,6 +12,7 @@ pub mod packages;
 pub mod preflight;
 pub mod production;
 pub mod publish;
+pub mod sql;
 pub mod update;
 
 use crate::project::{ClientBind, Component, Topology};
@@ -26,6 +27,9 @@ pub use help::{USAGE, USAGE_ALL};
 pub enum Command {
     Doctor,
     Preflight,
+    Sql {
+        query: String,
+    },
     Bindings {
         check: bool,
     },
@@ -146,6 +150,10 @@ impl Command {
             ["bindings"] => Ok(Command::Bindings { check: false }),
             ["bindings", "--check"] => Ok(Command::Bindings { check: true }),
             ["bindings", ..] => Err(Error::Usage("usage: lyracore bindings [--check]".into())),
+            ["sql", query] if !query.trim().is_empty() => Ok(Command::Sql {
+                query: (*query).to_string(),
+            }),
+            ["sql", ..] => Err(Error::Usage("usage: lyracore sql QUERY".into())),
             ["preflight"] => Ok(Command::Preflight),
             ["preflight", other, ..] => Err(Error::Usage(format!(
                 "`preflight` takes no arguments (got '{other}')"
@@ -1167,6 +1175,19 @@ mod tests {
         ] {
             assert!(parse(command).is_err(), "{command}");
         }
+    }
+
+    #[test]
+    fn sql_takes_exactly_one_non_empty_query() {
+        assert_eq!(
+            Command::parse(&["sql".into(), "SELECT 1".into()]).unwrap(),
+            Command::Sql {
+                query: "SELECT 1".into()
+            }
+        );
+        assert!(Command::parse(&["sql".into()]).is_err());
+        assert!(Command::parse(&["sql".into(), " ".into()]).is_err());
+        assert!(Command::parse(&["sql".into(), "SELECT".into(), "1".into()]).is_err());
     }
 
     #[test]
