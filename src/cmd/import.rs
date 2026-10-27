@@ -2185,7 +2185,7 @@ fn assert_floors(
             .collect();
         a.chk(
             "FLOOR_DEADMINES_NAMED_LOOT",
-            "Deadmines named drops (Cruel Barb ~5191 + Smite's Mighty Hammer ~5196) [V]",
+            "Deadmines named drops (Cruel Barb ~5191 + Smite's Reaver ~5196) [V]",
             named_loot.len() as i64,
         )?;
     }
