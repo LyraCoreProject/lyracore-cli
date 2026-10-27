@@ -63,7 +63,7 @@ pub fn sync(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<()> {
     Ok(())
 }
 
-fn configured_client_data(project: &ProjectLayout, raw: &str) -> Result<PathBuf> {
+pub(crate) fn configured_client_data(project: &ProjectLayout, raw: &str) -> Result<PathBuf> {
     let configured = Path::new(raw);
     // Config normally contains the canonical path written by `config set`, but older or manually
     // edited files may be relative. Stored paths are checkout config, so resolve those from the

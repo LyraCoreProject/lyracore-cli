@@ -396,6 +396,9 @@ impl ProjectLayout {
     pub const HARNESS_SMOKE_SEAM: &'static str = "adapters/lyracore/wire.sh";
     pub const HARNESS_CLIENT_BIN: &'static str = "vanilla-wire";
 
+    /// The pinned Meld commit `lyracore editor` builds and runs.
+    pub const EDITOR_PIN: &'static str = ".lyracore-editor-rev";
+
     // The database is loopback in every mode. Only the two client-facing ports follow the
     // `ClientBind` chosen by `dev up [--lan IP]`.
     pub const STDB_PORT: u16 = 3000;
@@ -605,6 +608,14 @@ impl ProjectLayout {
     /// harness checkout can never appear in the server repo's `git status`.
     pub fn harness_cache(&self) -> PathBuf {
         self.state_dir.join("wire-harness")
+    }
+
+    pub fn editor_pin(&self) -> PathBuf {
+        self.root.join(Self::EDITOR_PIN)
+    }
+
+    pub fn editor_install(&self, rev: &str) -> PathBuf {
+        self.state_dir.join("editor").join(rev)
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {

@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod dev;
 pub mod doctor;
+pub mod editor;
 mod gateway_log;
 pub mod import;
 mod logs;
@@ -30,6 +31,7 @@ pub enum Command {
     Sql {
         query: String,
     },
+    Editor,
     Bindings {
         check: bool,
     },
@@ -154,6 +156,10 @@ impl Command {
                 query: (*query).to_string(),
             }),
             ["sql", ..] => Err(Error::Usage("usage: lyracore sql QUERY".into())),
+            ["editor"] => Ok(Command::Editor),
+            ["editor", other, ..] => Err(Error::Usage(format!(
+                "`editor` takes no arguments (got '{other}')"
+            ))),
             ["preflight"] => Ok(Command::Preflight),
             ["preflight", other, ..] => Err(Error::Usage(format!(
                 "`preflight` takes no arguments (got '{other}')"
@@ -1188,6 +1194,12 @@ mod tests {
         assert!(Command::parse(&["sql".into()]).is_err());
         assert!(Command::parse(&["sql".into(), " ".into()]).is_err());
         assert!(Command::parse(&["sql".into(), "SELECT".into(), "1".into()]).is_err());
+    }
+
+    #[test]
+    fn editor_takes_no_arguments() {
+        assert_eq!(parse("editor").unwrap(), Command::Editor);
+        assert!(parse("editor --wow /games").is_err());
     }
 
     #[test]

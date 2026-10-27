@@ -49,6 +49,7 @@ commands! {
     "account create", "account create USER [--password-stdin]", "Provision an Account using a hidden password prompt or one stdin line; never a password argument.";
     "character gm", "character gm NAME true|false", "Grant or revoke GM commands on the world shard holding the Character.";
     "sql", "sql QUERY", "Run SQL on the local Realm's database as its publisher. Reads private tables and changes rows in the live database.";
+    "editor", "editor", "Run the Meld world editor against the local Native Host. Builds the commit pinned in .lyracore-editor-rev on first use; needs git, Go, Bun and Wails.";
     "import", "import [--accept] [--client-data PATH] [--profile-shard PROFILE=SHARD ...]", "Alias for import world. Import content before play from public game data and your own client archives.";
     "import world", "import world [--accept] [--client-data PATH] [--profile-shard PROFILE=SHARD ...]", "Import Eastern Kingdoms and Kalimdor content plus instances. --accept answers consent. Explicit profiles require a complete assignment; otherwise use the development topology.";
     "import check", "import check [--profile-shard PROFILE=SHARD ...]", "Check content readiness at the import destinations without changing their content.";
