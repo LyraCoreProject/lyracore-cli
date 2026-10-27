@@ -673,6 +673,9 @@ Each Shard completes its publish and schedule repair, when needed, before applyi
 Only then does the command continue to the next Shard:
 
 - The spell Import Family reimports vmangos `spell_template`, then applies the enabled Package Deltas.
+  Apply and `--check` require each stamped world Import Family to have the selected snapshot's
+  `game_import_meta.source_sha`. On a classic-db Realm, complete `lyracore import` first, then
+  rebuild Spatial Claims against the new Import Revision before applying Packages.
 - The script Import Family reconciles `game_script` to the enabled Script Artifacts in one
   transaction. A script-only run needs no base import or Module publish.
 

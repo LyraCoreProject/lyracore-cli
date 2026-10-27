@@ -3147,7 +3147,6 @@ pub(crate) mod tests {
         .unwrap();
 
         let calls = rendered(&stack);
-        // The floors are read FIRST — a drifted manifest must fail before the half-hour clone.
         let order = [
             "import-manifest.sh",
             "pull-vmangos.py",
@@ -3506,7 +3505,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_bad_client_path_is_refused_before_the_licence_notice_is_even_answered() {
-        // A typo in --client-data must not cost somebody a half-hour clone first.
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let stack = healthy();
@@ -4015,7 +4013,6 @@ pub(crate) mod tests {
         .to_string();
         assert!(error.contains("FLOOR_NAV_CHUNKS"), "{error}");
         assert!(error.contains("import-manifest.sh"), "{error}");
-        // Only the sourcing ran: no pull, no ETL, no consented half-hour wasted first.
         assert_eq!(stack.calls().len(), 1, "{:?}", rendered(&stack));
     }
 
