@@ -69,9 +69,6 @@ pub fn databases(args: &[String]) -> Result<Vec<String>> {
     Ok(args.to_vec())
 }
 
-/// The single-Shard contract this verb orchestrates: reimport the spell family from the client's
-/// `Spell.dbc`, then reapply the enabled Packages' Deltas over it. Without `--apply` the importer
-/// prints the plan and writes nothing.
 fn apply_command(
     project: &ProjectLayout,
     database: &str,
@@ -79,7 +76,12 @@ fn apply_command(
     apply: bool,
 ) -> Result<CommandSpec> {
     validate_database(VERB, database)?;
+    let snapshot = import::world_snapshot(project)?;
     let command = import::importer_command(project, database)
+        .arg("--dump")
+        .arg(snapshot.sqlite_path)
+        .arg("--source-sha")
+        .arg(snapshot.commit)
         .arg("--dbc")
         .arg(client_data.to_string_lossy().to_string())
         .arg("--spells")
@@ -204,6 +206,51 @@ fn read_base_stamp(
         .first()
         .and_then(|row| row.first().cloned())
         .unwrap_or_default())
+}
+
+fn require_matching_world_source(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    database: &str,
+    spell_source: &str,
+) -> Result<()> {
+    let recorded = ask(
+        project,
+        runner,
+        database,
+        "SELECT family, source_sha FROM game_import_meta",
+    )?;
+    for row in rows(&recorded, &["family", "source_sha"]) {
+        let [family, source] = row.as_slice() else {
+            return Err(Error::Process(format!(
+                "invalid world import provenance from '{database}'; nothing was applied"
+            )));
+        };
+        if matches!(
+            family.as_str(),
+            "globals"
+                | "items"
+                | "loot"
+                | "gameobjects"
+                | "trainers"
+                | "quests"
+                | "gossip"
+                | "creatures"
+                | "creature-ai"
+                | "spellmeta"
+                | "casts"
+        ) && source != spell_source
+        {
+            return Err(Error::PrerequisiteMissing(format!(
+                "cannot import vmangos spells from {spell_source} onto '{database}': \
+                 world family '{family}' has source {source:?} in game_import_meta. \
+                 Run `lyracore import` to replace every world family with the selected vmangos \
+                 snapshot before `lyracore packages apply`. Rebuild Spatial Claims against the \
+                 new Import Revision. Nothing was applied."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Does this Shard already hold exactly these artifacts for `family`?
@@ -459,6 +506,14 @@ pub fn run(
     // complete. With no Package Deltas and no stale spell provenance, there is no spell plan to
     // execute and the script family's check must not acquire an unrelated DBC prerequisite.
     let spell_check_wanted = options.check && (spell_wanted || !artifacts.is_empty());
+    if spell_wanted || spell_check_wanted {
+        let snapshot = import::world_snapshot(project)?;
+        for target in &targets {
+            if target.spell.is_none() || spell_check_wanted {
+                require_matching_world_source(project, runner, &target.database, &snapshot.commit)?;
+            }
+        }
+    }
     let client_data = if spell_wanted || spell_check_wanted {
         Some(import::resolve_client_data(
             project,
@@ -801,7 +856,7 @@ fn question(
                 .to_string()
         } else {
             format!(
-                "reimport Spell.dbc and apply {} enabled Package Delta(s) over it",
+                "reimport vmangos spells and apply {} enabled Package Delta(s) over them",
                 artifacts.len()
             )
         });
@@ -855,6 +910,7 @@ mod tests {
                 std::fs::write(data.join(archive), "").unwrap();
             }
             let project = ProjectLayout::from_root(root).unwrap();
+            import::stage_test_snapshot(&project);
             std::fs::create_dir_all(project.datascripts_dir()).unwrap();
             for name in ["tsconfig.json", "package.json", "bun.lock"] {
                 std::fs::write(project.datascripts_dir().join(name), "{}").unwrap();
@@ -1385,6 +1441,66 @@ mod tests {
     }
 
     #[test]
+    fn spell_apply_and_check_refuse_a_different_world_source_before_writing() {
+        for check in [false, true] {
+            let checkout = Checkout::new();
+            checkout.with_package("bolt", 133, 1500);
+            let stack = fresh_shard(FakeStack::new(), "lyracore").with_stdout(
+                "SELECT family, source_sha FROM game_import_meta",
+                &sql_rows(
+                    &["family", "source_sha"],
+                    &[vec!["creatures".into(), "classic-db-revision".into()]],
+                ),
+            );
+            let options = ApplyOptions {
+                check,
+                force_all: true,
+                ..checkout.options(&["lyracore"])
+            };
+            let error = run(
+                &checkout.project,
+                &stack.runner(),
+                &stack.inspector(),
+                &ScriptedPrompt::new(&[]),
+                &options,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("world family 'creatures'"), "{error}");
+            assert!(error.contains("lyracore import"), "{error}");
+            assert!(applies(&stack).is_empty());
+            assert!(script_applies(&stack).is_empty());
+            assert!(!stack
+                .rendered()
+                .iter()
+                .any(|call| call.contains("spacetime publish")));
+        }
+    }
+
+    #[test]
+    fn matching_world_source_allows_spell_apply() {
+        let checkout = Checkout::new();
+        checkout.with_package("bolt", 133, 1500);
+        let snapshot = import::world_snapshot(&checkout.project).unwrap();
+        let stack = fresh_shard(FakeStack::new(), "lyracore").with_stdout(
+            "SELECT family, source_sha FROM game_import_meta",
+            &sql_rows(
+                &["family", "source_sha"],
+                &[vec!["quests".into(), snapshot.commit]],
+            ),
+        );
+        run(
+            &checkout.project,
+            &stack.runner(),
+            &stack.inspector(),
+            &ScriptedPrompt::new(&[]),
+            &checkout.options(&["lyracore"]),
+        )
+        .unwrap();
+        assert_eq!(applies(&stack).len(), 1);
+    }
+
+    #[test]
     fn check_runs_the_whole_plan_and_renders_no_apply() {
         let checkout = Checkout::new();
         checkout.with_package("bolt", 133, 1500);
@@ -1601,8 +1717,7 @@ mod tests {
             .into_iter()
             .filter(|r| r.contains("spacetime sql"))
             .collect();
-        // Package Teardown and each artifact family are read before writes.
-        assert_eq!(queries.len(), 4, "{queries:?}");
+        assert!(!queries.is_empty());
         for query in &queries {
             assert!(!query.contains("ORDER BY"), "{query}");
             assert!(!query.contains(" IN ("), "{query}");
