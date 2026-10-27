@@ -1312,7 +1312,7 @@ SpacetimeDB reports a failure, for example a malformed query.
 ./lyracore editor
 ```
 
-Starts [Meld](https://github.com/Mathih13/Meld), a 1.12 world editor, connected to the local Native
+Starts [Meld](https://github.com/LyraCoreProject/Meld), a 1.12 world editor, connected to the local Native
 Host. Spawn edits go live through the Module's operator reducers. The command runs Meld in the
 foreground; close the window or press Ctrl+C to stop it.
 

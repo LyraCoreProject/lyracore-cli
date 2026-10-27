@@ -7,7 +7,7 @@ use crate::project::ProjectLayout;
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 
-const MELD_REPOSITORY: &str = "https://github.com/Mathih13/Meld.git";
+const MELD_REPOSITORY: &str = "https://github.com/LyraCoreProject/Meld.git";
 
 #[cfg(target_os = "macos")]
 const MELD_BINARY: &str = "build/bin/Meld.app/Contents/MacOS/Meld";
@@ -419,7 +419,7 @@ mod tests {
             vec![
                 "git init --quiet",
                 &format!(
-                    "git fetch --quiet --depth 1 -- https://github.com/Mathih13/Meld.git {REV}"
+                    "git fetch --quiet --depth 1 -- https://github.com/LyraCoreProject/Meld.git {REV}"
                 ),
                 "git checkout --detach FETCH_HEAD",
                 &format!("wails build{}", tags()),
