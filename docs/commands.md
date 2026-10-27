@@ -105,16 +105,24 @@ the same path `publish` took before it was absorbed into Rust. A checkout withou
 
 **The consent notice is printed in full before any network access, client archive read, or database
 write.** The CLI may first check that a supplied path and its required filenames exist; it does not
-open those archives. The notice names cmangos' `classic-db` and its GPL-3.0 licence,
-states that the content describes Blizzard's copyrighted game world and that this project never
-distributes it or anything built from it, and states that the DBC half comes from the user's own
-1.12.1 client. Only a typed `yes` or `--accept` proceeds; anything else exits 2 having run nothing.
+open those archives. The notice names GPL-2.0 migrations from `vmangos/core` applied over base data from
+`brotalnia/database`, which has no license file. It states that the content describes Blizzard's
+copyrighted game world and that LyraCore never distributes it or databases built from it. The
+Operator supplies their own 1.12.1 client and is responsible for rights to those files. Only a typed `yes` or `--accept` proceeds; anything else exits 2 having run nothing.
 There is no terminal-less default: `import` with no TTY and no `--accept` refuses.
 
-The command has three setup stages: fetch and checksum the pinned dump, resolve the client `Data/`
+The command has three setup stages: fetch the current `db_latest` SQLite asset and verify its GitHub digest, resolve the client `Data/`
 directory, and build `lyracore-importer`. Each content destination then has three fail-fast stages:
 run its importer modes, re-arm its schedules and gather pools, and run profile-aware Verification.
 That is six displayed stages under `--single` and twelve on the sharded fixture.
+
+The fetch runs `python3 importer/scripts/pull-vmangos.py`. Its
+`.import/vmangos/current.json` report supplies the SQLite path and actual commit to every
+source-backed import. `vmangos.lock` records the accepted commit and migration fingerprint.
+A newer snapshot must pass the importer's column and approved-value Source Profile gate;
+counts are reported but do not gate it. The same SQLite snapshot supplies Package spell
+reimports and the Datascript Base Snapshot. Run `import` before those commands if no
+fetch report exists. No source SQL is executed.
 
 Server-issued Operator credentials reach importer subprocesses through a temporary SpacetimeDB
 CLI config with owner-only permissions. The CLI removes that config when the import ends. The
@@ -130,7 +138,7 @@ The sharded destination plan is fixed:
 
 The single topology uses `alliance-single`, the union of those bounded continent slices and maps 36 and 369.
 Every importer child names its destination and loopback SpacetimeDB endpoint. The world-content
-mode loads the full Spell.dbc catalogue before the world AI, because the Module refuses EventAI
+mode loads the vmangos spell catalogue before the world AI, because the Module refuses EventAI
 relay definitions that name a missing spell. That catalogue already supplies caster spells, so
 Verification derives every referenced caster spell from `game_creature_cast` and
 `game_creature_spell` instead of maintaining an independent allowlist.
@@ -664,7 +672,7 @@ artifact provenance does not track compiled Rust. Disable a Rust Package through
 Each Shard completes its publish and schedule repair, when needed, before applying artifacts.
 Only then does the command continue to the next Shard:
 
-- The spell Import Family reimports `Spell.dbc`, then applies the enabled Package Deltas.
+- The spell Import Family reimports vmangos `spell_template`, then applies the enabled Package Deltas.
 - The script Import Family reconciles `game_script` to the enabled Script Artifacts in one
   transaction. A script-only run needs no base import or Module publish.
 

@@ -227,9 +227,9 @@ fn verify_base_snapshot(project: &ProjectLayout, packages: &[String]) -> Result<
     }
     Err(Error::PrerequisiteMissing(format!(
         "no Base Snapshot at {snapshot}. {n} enabled Package(s) carry a Datascript ({names}), and \
-         a Datascript reads its base spell data only from it. Build one first, from a 1.12.1 \
-         client's Data/ directory (the one containing dbc.MPQ and terrain.MPQ):\n  \
-         ./{importer_bin} --dbc <client Data/ dir> --spell-snapshot {snapshot}\nNothing was run.",
+         a Datascript reads its base spell data only from it. Build one first, from the fetched vmangos SQLite snapshot and your 1.12.1 \
+         client's Data/ directory:\n  \
+         ./{importer_bin} --dump <vmangos SQLite from .import/vmangos/current.json> --dbc <client Data/ dir> --spell-snapshot {snapshot}\nNothing was run.",
         snapshot = snapshot.display(),
         n = packages.len(),
         names = packages.join(", "),

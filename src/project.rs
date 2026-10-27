@@ -331,7 +331,7 @@ impl ProjectLayout {
     /// non-default box, a second continent) until the Rust flow has proven parity on a fresh
     /// provision, and this CLI deliberately does not address it.
     pub const IMPORTER_SCRIPTS_DIR: &'static str = "importer/scripts";
-    pub const PULL_CLASSIC_DB_SCRIPT: &'static str = "importer/scripts/pull-classic-db.sh";
+    pub const PULL_VMANGOS_SCRIPT: &'static str = "importer/scripts/pull-vmangos.py";
     /// The FLOOR_* count minimums the post-import assertions compare against. A DATA file the
     /// core repo tunes per dump — the CLI sources it fresh on every run rather than baking the
     /// numbers in, so retuning a floor never needs a CLI release.
@@ -585,8 +585,8 @@ impl ProjectLayout {
         self.root.join(Self::IMPORTER_SCRIPTS_DIR)
     }
 
-    pub fn pull_classic_db_script(&self) -> PathBuf {
-        self.root.join(Self::PULL_CLASSIC_DB_SCRIPT)
+    pub fn pull_vmangos_script(&self) -> PathBuf {
+        self.root.join(Self::PULL_VMANGOS_SCRIPT)
     }
 
     pub fn import_manifest_script(&self) -> PathBuf {

@@ -5,7 +5,14 @@ use tempfile::TempDir;
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null"])
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.name=CLI test",
+            "-c",
+            "user.email=cli@example.invalid",
+        ])
         .args(args)
         .current_dir(root)
         .output()
@@ -30,8 +37,6 @@ impl Checkout {
         let root = this.tmp.path();
         git(root, &["init", "-q", "-b", "main", "origin"]);
         let origin = root.join("origin");
-        git(&origin, &["config", "user.name", "CLI test"]);
-        git(&origin, &["config", "user.email", "cli@example.invalid"]);
         std::fs::write(origin.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(origin.join(".gitignore"), "ignored.txt\n").unwrap();
         git(&origin, &["add", "."]);
@@ -40,11 +45,6 @@ impl Checkout {
             &["-c", "commit.gpgsign=false", "commit", "-qm", "initial"],
         );
         git(root, &["clone", "-q", "origin", "work"]);
-        git(&root.join("work"), &["config", "user.name", "CLI test"]);
-        git(
-            &root.join("work"),
-            &["config", "user.email", "cli@example.invalid"],
-        );
         this
     }
 

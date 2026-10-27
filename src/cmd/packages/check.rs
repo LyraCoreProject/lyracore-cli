@@ -81,9 +81,12 @@ pub(crate) fn prepare(
     if rebuild {
         if !datascripts.is_empty() && !project.base_snapshot_file().is_file() {
             let data = import::resolve_client_data(project, prompt, client_data)?;
+            let snapshot = import::world_snapshot(project)?;
             runner.run_streaming(&import::build_importer_command(project))?;
             runner.run_streaming(
                 &CommandSpec::new(project.importer_bin().display().to_string())
+                    .arg("--dump")
+                    .arg(snapshot.sqlite_path)
                     .arg("--dbc")
                     .arg(data.display().to_string())
                     .arg("--spell-snapshot")

@@ -69,9 +69,6 @@ pub fn databases(args: &[String]) -> Result<Vec<String>> {
     Ok(args.to_vec())
 }
 
-/// The single-Shard contract this verb orchestrates: reimport the spell family from the client's
-/// `Spell.dbc`, then reapply the enabled Packages' Deltas over it. Without `--apply` the importer
-/// prints the plan and writes nothing.
 fn apply_command(
     project: &ProjectLayout,
     database: &str,
@@ -79,7 +76,12 @@ fn apply_command(
     apply: bool,
 ) -> Result<CommandSpec> {
     validate_database(VERB, database)?;
+    let snapshot = import::world_snapshot(project)?;
     let command = import::importer_command(project, database)
+        .arg("--dump")
+        .arg(snapshot.sqlite_path)
+        .arg("--source-sha")
+        .arg(snapshot.commit)
         .arg("--dbc")
         .arg(client_data.to_string_lossy().to_string())
         .arg("--spells")
@@ -801,7 +803,7 @@ fn question(
                 .to_string()
         } else {
             format!(
-                "reimport Spell.dbc and apply {} enabled Package Delta(s) over it",
+                "reimport vmangos spells and apply {} enabled Package Delta(s) over them",
                 artifacts.len()
             )
         });
@@ -855,6 +857,7 @@ mod tests {
                 std::fs::write(data.join(archive), "").unwrap();
             }
             let project = ProjectLayout::from_root(root).unwrap();
+            import::stage_test_snapshot(&project);
             std::fs::create_dir_all(project.datascripts_dir()).unwrap();
             for name in ["tsconfig.json", "package.json", "bun.lock"] {
                 std::fs::write(project.datascripts_dir().join(name), "{}").unwrap();
