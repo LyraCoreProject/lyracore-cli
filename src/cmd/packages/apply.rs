@@ -1717,7 +1717,7 @@ mod tests {
             .into_iter()
             .filter(|r| r.contains("spacetime sql"))
             .collect();
-        assert!(!queries.is_empty());
+        assert_eq!(queries.len(), 5, "{queries:?}");
         for query in &queries {
             assert!(!query.contains("ORDER BY"), "{query}");
             assert!(!query.contains(" IN ("), "{query}");
