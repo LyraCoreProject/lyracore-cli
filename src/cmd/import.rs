@@ -1,41 +1,4 @@
-//! `lyracore import [world|vmaps]` — build the real world.
-//!
-//! A fresh checkout publishes a FIXTURE: a handful of demo creatures, one quest, enough to prove
-//! the stack is wired up. The Alliance early-game corridors, their loot/vendor/trainer tables,
-//! terrain heightmaps and navigation grids are not in this repository and never will be. They are
-//! RECONSTRUCTED on your machine, from two sources that are yours to obtain and not ours to
-//! redistribute:
-//!
-//!   1. cmangos' `classic-db` world database (GPL-3.0), pulled from cmangos' own public repository
-//!      at a commit this repo pins.
-//!   2. YOUR 1.12.1 client's DBC/terrain/model archives, read out of the `Data/` directory of a
-//!      client you already own.
-//!
-//! So `import world` asks for CONSENT before it does anything at all, and the consent text says
-//! exactly that. Nothing is fetched, read or written before the operator says yes (or passes
-//! `--accept`, for a scripted run).
-//!
-//! TWO VERBS, ONE BOUNDARY (#104; the operator decision is CLI = orchestration, core = machinery):
-//!
-//! - `import world` (bare `import` is the same command) is the Rust port of the orchestration that
-//!   used to live in `importer/scripts/import-world.sh`: the DUMP/DBC staging, the importer-binary
-//!   mode ordering, and the FLOOR_* manifest assertions. Every mode still SHELLS OUT to the pinned
-//!   `lyracore-importer` binary — this CLI gains no MPQ/DBC parsing and no module-schema crate
-//!   coupling; the queries below are the same textual `spacetime sql` probes the bash ran.
-//!   `import-world.sh` itself is not retired: it remains the by-hand path for a custom legacy scope
-//!   or one canonical profile, while the CLI owns the complete Realm topology plan.
-//! - `import vmaps` drives the importer's `--vmap` mode (exact model/WMO collision triangles →
-//!   `game_vmap_chunk`) per world shard. It reads only YOUR client's archives — nothing is fetched
-//!   from the network — so it carries no consent gate.
-//!
-//! What still shells to bash, on purpose: `pull-classic-db.sh` (the pinned, checksum-verified dump
-//! fetch, with its lockfile discipline). `import-manifest.sh` is sourced, not
-//! run: it is a data file of floors the core repo tunes per dump, read fresh on every import so a
-//! retuned floor never needs a CLI release.
-//!
-//! HOW MANY STAGES: the pull, the client, the importer build, then the modes + the re-arm + the
-//! floors per content destination: six on `dev up --single`, twelve on the sharded fixture. See
-//! [`import_destinations`].
+//! World-source fetch, consent, import modes and profile-specific content checks.
 
 use crate::cmd::dev::call_as_operator;
 use crate::http::HttpClient;
@@ -150,34 +113,23 @@ impl Prompt for TtyPrompt {
     }
 }
 
-/// The consent interstitial. Printed in full, every time, before anything else happens.
 pub const CONSENT: &str = "\
-────────────────────────────────────────────────────────────────────────────────
- lyracore import — reconstructing the world on THIS machine
+ lyracore import — build world data on this machine
 
- LyraCore ships a game server. It does not ship a game world, and this command
- does not download one from us. It assembles one here, from two sources:
+ This command downloads the current SQLite snapshot from vmangos/core.
+ Its GPL-2.0 migrations are applied on top of base data from
+ brotalnia/database, which has no license file. The data describes Blizzard
+ Entertainment's copyrighted game world. LyraCore does not host this data:
+ we never distribute it or databases built from it.
 
-   1. cmangos' `classic-db` — a community-maintained vanilla world database,
-      licensed GPL-3.0, pulled directly from cmangos' own public GitHub
-      repository at a commit pinned in importer/scripts/classic-db.lock.
-      Its CONTENT describes Blizzard Entertainment's copyrighted game world:
-      creature names and stats, quest text, item tables, spawn coordinates.
-      cmangos offers it as non-commercial fair-use demo content. It is not
-      ours, we do not host it, and we never distribute it or anything built
-      from it.
+ You must supply your own World of Warcraft 1.12.1 (build 5875) client.
+ Its Data/ archives supply terrain, models and the client tables vmangos
+ does not replace. LyraCore does not supply a client or rights to its files.
 
-   2. YOUR OWN World of Warcraft 1.12.1 (build 5875) client. The spell, talent,
-      area, faction and terrain data come out of that client's Data/ archives,
-      read directly off your disk. We do not supply a client, and this command
-      cannot work without one you already own.
+ The result is a local database. Publishing, hosting or redistributing it
+ is your decision and responsibility.
 
- What this produces is a local database on your machine. Publishing, hosting or
- redistributing that database is your decision and your responsibility — it is
- not something this project does or endorses.
-
- Nothing has been fetched or read yet.
-────────────────────────────────────────────────────────────────────────────────
+ No source data has been fetched or read yet.
 ";
 
 const CONSENT_QUESTION: &str = "Proceed? Type 'yes' to continue: ";
@@ -200,9 +152,57 @@ const OPTIONAL_ARCHIVES: [&str; 2] = ["model.MPQ", "wmo.MPQ"];
 /// inside the first stage.
 const POST_VANILLA_ARCHIVES: [&str; 2] = ["common.MPQ", "expansion.MPQ"];
 
-/// Where `pull-classic-db.sh` assembles the dump — its documented output, and `--dump`'s input.
-/// Relative on purpose: every child runs from the checkout root, exactly like the bash flow.
-const DUMP_PATH: &str = ".import/classic-db-full.sql";
+pub(crate) const SOURCE_REPORT: &str = ".import/vmangos/current.json";
+
+#[derive(serde::Deserialize)]
+pub(crate) struct WorldSnapshot {
+    pub(crate) sqlite_path: String,
+    pub(crate) commit: String,
+}
+
+pub(crate) fn world_snapshot(project: &ProjectLayout) -> Result<WorldSnapshot> {
+    let path = project.root.join(SOURCE_REPORT);
+    let read = || -> std::result::Result<WorldSnapshot, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_slice(&std::fs::read(&path)?)?)
+    };
+    let snapshot = read().map_err(|error| {
+        Error::PrerequisiteMissing(format!(
+            "cannot read {}: {error}. Run `lyracore import` to fetch the World Source.",
+            path.display()
+        ))
+    })?;
+    if snapshot.commit.len() != 40
+        || !snapshot.commit.bytes().all(|b| b.is_ascii_hexdigit())
+        || !project.root.join(&snapshot.sqlite_path).is_file()
+    {
+        return Err(Error::PrerequisiteMissing(format!(
+            "invalid snapshot path {} or commit in {}. Run `lyracore import` to fetch it again.",
+            snapshot.sqlite_path,
+            path.display()
+        )));
+    }
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+const DUMP_PATH: &str = ".import/vmangos/fixture.sqlite";
+#[cfg(test)]
+const SOURCE_COMMIT: &str = "0123456789012345678901234567890123456789";
+
+#[cfg(test)]
+pub(crate) fn stage_test_snapshot(project: &ProjectLayout) {
+    std::fs::create_dir_all(project.root.join(".import/vmangos")).unwrap();
+    std::fs::write(project.root.join(DUMP_PATH), b"fixture").unwrap();
+    std::fs::write(
+        project.root.join(SOURCE_REPORT),
+        serde_json::to_vec(&serde_json::json!({
+            "sqlite_path": DUMP_PATH, "commit": SOURCE_COMMIT,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WorldProfile {
     AllianceEastern,
@@ -308,10 +308,7 @@ pub fn run_world(
     prompt: &dyn Prompt,
     options: &ImportOptions,
 ) -> Result<()> {
-    // An explicitly-passed --client-data is checked BEFORE the consent text, because a typo in it
-    // is a usage mistake and there is no reason to make somebody read a licence notice and then a
-    // half-hour clone before hearing about it. This is validation of an argument, not the
-    // "locate the client" stage — that still happens in order, below.
+    // This checks filenames only; archive reads and the fetch require consent.
     if let Some(raw) = &options.client_data {
         validate_client_data(Path::new(raw))?;
     }
@@ -321,7 +318,7 @@ pub fn run_world(
     consent(prompt, options.accept)?;
 
     for script in [
-        project.pull_classic_db_script(),
+        project.pull_vmangos_script(),
         project.import_manifest_script(),
     ] {
         if !script.exists() {
@@ -334,51 +331,29 @@ pub fn run_world(
         }
     }
 
-    // The floors come FIRST, before anything expensive: a manifest that has drifted away from the
-    // checks below must fail here, not after the half-hour clone and the tens-of-minutes ETL —
-    // and never as an assertion that silently stopped existing.
-    let floors = load_floors(project, runner)?;
-    floors.require(&CONSUMED_FLOORS)?;
-    println!(
-        "   floors: {} minimums from {}",
-        CONSUMED_FLOORS.len(),
-        ProjectLayout::IMPORT_MANIFEST_SCRIPT
-    );
+    let mut floors = BTreeMap::new();
+    for destination in &destinations {
+        let profile = destination.profile.name();
+        let selected = load_floors(project, runner, profile)?;
+        selected.require(&CONSUMED_FLOORS)?;
+        floors.insert(profile, selected);
+    }
 
     let credential = crate::token::resolve_existing(runner, &project.token_file())?;
     let owner_config = temporary_owner_config(&credential)?;
 
-    // Three fixed stages, then the modes + the re-arm + the floors per destination.
     let total = 3 + 3 * destinations.len() as u8;
 
-    // ---- stage 1: the world database dump -----------------------------------------------------
-    stage(
-        1,
-        total,
-        "pulling cmangos/classic-db (pinned commit, checksum-verified)",
-    );
+    stage(1, total, "fetching the current vmangos SQLite snapshot");
     runner.run_streaming(&pull_command(project)).map_err(|e| {
         stage_failure(
-            "pulling classic-db",
-            "Check network access to github.com. To deliberately track upstream master instead of \
-             the pinned commit, run it yourself:\n    \
-             CLASSIC_DB_REF=master bash importer/scripts/pull-classic-db.sh --skip-verify\n  A \
-             CHECKSUM MISMATCH is not a network problem: it means the pinned commit no longer \
-             produces the dump this repo recorded. Do not import that file until you know why.",
+            "fetching vmangos",
+            "Check GitHub access and the fetch report. A digest mismatch refuses extraction; \
+             do not bypass it. The importer checks the Source Profile before applying data.",
             e,
         )
     })?;
-    // The DUMP staging assertion: the pull's documented output is the ETL's input, and "the pull
-    // said OK but wrote somewhere else" must fail here, not as an importer error mid-stage-4.
-    let dump = project.root.join(DUMP_PATH);
-    if !dump.exists() {
-        return Err(Error::Process(format!(
-            "the classic-db pull reported success but left no dump at {} — that path is \
-             pull-classic-db.sh's documented output and the world ETL's input. Re-run the script \
-             by hand and see which path it printed.",
-            dump.display()
-        )));
-    }
+    world_snapshot(project)?;
 
     // ---- stage 2: the client ------------------------------------------------------------------
     stage(2, total, "locating your 1.12.1 client data");
@@ -440,7 +415,7 @@ pub fn run_world(
         } else if destination.profile == WorldProfile::Instances {
             println!("   instance-only profile: open-world terrain and navigation are skipped.");
         }
-        for (what, advice, command) in world_etl_commands(project, &client_data, destination) {
+        for (what, advice, command) in world_etl_commands(project, &client_data, destination)? {
             println!();
             println!("   -> {what}");
             let command = with_owner_config(command, owner_config.as_ref());
@@ -483,7 +458,7 @@ pub fn run_world(
             runner,
             database,
             destination.profile,
-            &floors,
+            &floors[profile],
             owner_config.as_ref().map(|file| file.path()),
         )
         .map_err(|error| {
@@ -518,7 +493,7 @@ pub fn run_world(
     println!(
         "import complete. Every selected World Shard and Instance Pool passed the content checks."
     );
-    println!("Nothing produced here is redistributable — see the notice this command opened with.");
+    println!("LyraCore does not distribute the imported data. See the consent notice for its source status.");
     Ok(())
 }
 
@@ -990,19 +965,10 @@ pub fn inspect_client_data(path: &Path) -> Result<Vec<String>> {
     Ok(notes)
 }
 
-// ---- the invocations ------------------------------------------------------------------------
-
-/// Every child runs from the CHECKOUT ROOT: the scripts and the importer resolve `.import/`,
-/// `target/debug/…` and each other relative to it, and `lyracore` is usable from any subdirectory
-/// of a checkout.
-fn from_root(project: &ProjectLayout, script: PathBuf) -> CommandSpec {
-    CommandSpec::new("bash")
-        .arg(script.to_string_lossy().to_string())
-        .cwd(project.root.clone())
-}
-
 fn pull_command(project: &ProjectLayout) -> CommandSpec {
-    from_root(project, project.pull_classic_db_script())
+    CommandSpec::new("python3")
+        .arg(project.pull_vmangos_script().display().to_string())
+        .cwd(project.root.clone())
 }
 
 /// Shared with `cmd/client.rs`: `client sync` builds the same pinned importer binary before
@@ -1036,21 +1002,20 @@ pub(crate) fn importer_command(project: &ProjectLayout, database: &str) -> Comma
         .cwd(project.root.clone())
 }
 
-/// The world ETL: the importer's modes, in `import-world.sh`'s order, each with the advice its
-/// failure needs. One list so the ordering is a fact in one place — the ordering IS the port.
-///
-/// Stream each mode and stop on failure before completing the destination import.
 fn world_etl_commands(
     project: &ProjectLayout,
     client_data: &Path,
     destination: &ImportDestination,
-) -> Vec<(&'static str, &'static str, CommandSpec)> {
+) -> Result<Vec<(&'static str, &'static str, CommandSpec)>> {
+    let snapshot = world_snapshot(project)?;
     let data = client_data.to_string_lossy().to_string();
     let database = destination.shard.as_str();
     let profile = destination.profile;
     let dump = importer_command(project, database)
         .arg("--dump")
-        .arg(DUMP_PATH)
+        .arg(&snapshot.sqlite_path)
+        .arg("--source-sha")
+        .arg(&snapshot.commit)
         .arg("--dbc")
         .arg(&data)
         .arg("--world-profile")
@@ -1109,7 +1074,9 @@ fn world_etl_commands(
                 .arg("--dbc")
                 .arg(&data)
                 .arg("--taxi-mounts")
-                .arg(DUMP_PATH)
+                .arg(&snapshot.sqlite_path)
+                .arg("--source-sha")
+                .arg(&snapshot.commit)
                 .arg("--apply"),
         ),
         (
@@ -1122,7 +1089,7 @@ fn world_etl_commands(
                 .arg("--apply"),
         ),
     ]);
-    commands
+    Ok(commands)
 }
 
 /// Native calls use the private publisher; every call names the local HTTP node.
@@ -1246,8 +1213,8 @@ const CONSUMED_FLOORS: [&str; 63] = [
     "FLOOR_IMP_FIREBOLT_SPELL",
     "FLOOR_DEFIAS_CASTER_CAST_ROW",
     "FLOOR_ROTATION_ROWS",
-    "FLOOR_GEOMANCER_ROTATION_NUKE",
-    "FLOOR_FROST_ARMOR_ROTATION",
+    "FLOOR_GEOMANCER_CAST_ROW",
+    "FLOOR_KNUCKLEDUSTER_ROTATION",
     "FLOOR_AREAS",
     "FLOOR_AREA_TRIGGERS",
     "FLOOR_GRAVEYARDS",
@@ -1301,13 +1268,10 @@ impl Floors {
     }
 }
 
-/// Dump every `FLOOR_*` the sourced manifest defines, one `KEY=value` per line. Sourced through
-/// bash rather than parsed in Rust because the manifest IS shell — its `[ "${SLICE:-0}" = 1 ]`
-/// override block re-points floors for non-canonical runs, and a line-parser would read those
-/// override values as the canonical ones.
+// Sourcing evaluates the profile overrides before returning FLOOR_* values.
 const FLOOR_DUMP_SNIPPET: &str = r#"set -u; source "$1" >/dev/null || exit 1; for v in "${!FLOOR_@}"; do printf '%s=%s\n' "$v" "${!v}"; done"#;
 
-fn floors_command(project: &ProjectLayout) -> CommandSpec {
+fn floors_command(project: &ProjectLayout, profile: &str) -> CommandSpec {
     CommandSpec::new("bash")
         .arg("-c")
         .arg(FLOOR_DUMP_SNIPPET)
@@ -1318,22 +1282,27 @@ fn floors_command(project: &ProjectLayout) -> CommandSpec {
                 .to_string_lossy()
                 .to_string(),
         )
-        // Canonical profiles are bounded slices, so use the manifest's conservative slice floors.
-        // Named corridor checks below provide the stronger profile-specific evidence.
         .env("MAP", "0")
         .env("SLICE", "1")
+        .env("WORLD_PROFILE", profile)
         .cwd(project.root.clone())
 }
 
-fn load_floors(project: &ProjectLayout, runner: &dyn ProcessRunner) -> Result<Floors> {
-    let output = runner.run_and_wait(&floors_command(project)).map_err(|e| {
-        stage_failure(
-            "reading the import floors",
-            "importer/scripts/import-manifest.sh is a KEY=value data file and must stay \
+fn load_floors(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    profile: &str,
+) -> Result<Floors> {
+    let output = runner
+        .run_and_wait(&floors_command(project, profile))
+        .map_err(|e| {
+            stage_failure(
+                "reading the import floors",
+                "importer/scripts/import-manifest.sh is a KEY=value data file and must stay \
              `source`able — see its header.",
-            e,
-        )
-    })?;
+                e,
+            )
+        })?;
     let mut floors = BTreeMap::new();
     for line in output.lines() {
         let line = line.trim();
@@ -2068,7 +2037,7 @@ fn assert_floors(
     }
     a.chk_count(
         "FLOOR_SPELL_TOTAL",
-        "total game_spell rows (full Spell.dbc import)",
+        "total game_spell rows (vmangos spell catalogue)",
         "SELECT spell_id FROM game_spell",
         RowMatch::Numeric,
     )?;
@@ -2087,7 +2056,7 @@ fn assert_floors(
     a.chk_count(
         "FLOOR_GEOMANCER_CAST_SPELL",
         "476 Geomancer cast spell present",
-        "SELECT spell_id FROM game_spell WHERE spell_id=133",
+        "SELECT spell_id FROM game_spell WHERE spell_id=20793",
         RowMatch::Numeric,
     )?;
     a.chk_count(
@@ -2111,8 +2080,8 @@ fn assert_floors(
         )?;
         a.chk_count(
             "FLOOR_DEFIAS_CASTER_CAST_ROW",
-            "Defias caster cast row (Pillager 589?/Conjurer 449? [V])",
-            "SELECT creature_entry FROM game_creature_cast WHERE creature_entry=589 OR creature_entry=449",
+            "Defias Pillager Fireball cast row",
+            "SELECT creature_entry FROM game_creature_cast WHERE creature_entry=589 AND spell_id=19816",
             RowMatch::Numeric,
         )?;
         a.chk_count(
@@ -2122,15 +2091,15 @@ fn assert_floors(
             RowMatch::Numeric,
         )?;
         a.chk_count(
-            "FLOOR_GEOMANCER_ROTATION_NUKE",
-            "476 Geomancer rotation nuke row",
-            "SELECT id FROM game_creature_spell WHERE creature_entry=476 AND condition=0",
+            "FLOOR_GEOMANCER_CAST_ROW",
+            "476 Geomancer Fireball cast row",
+            "SELECT spell_id FROM game_creature_cast WHERE creature_entry=476 AND spell_id=20793",
             RowMatch::Numeric,
         )?;
         a.chk_count(
-            "FLOOR_FROST_ARMOR_ROTATION",
-            "474/476 Frost Armor rotation row",
-            "SELECT id FROM game_creature_spell WHERE spell_id=12544",
+            "FLOOR_KNUCKLEDUSTER_ROTATION",
+            "449 Knuckleduster Pummel rotation row",
+            "SELECT id FROM game_creature_spell WHERE creature_entry=449 AND spell_id=12555",
             RowMatch::Numeric,
         )?;
     }
@@ -2155,7 +2124,7 @@ fn assert_floors(
     )?;
     a.chk_count(
         "FLOOR_TAXI_NODES",
-        "taxi nodes imported from TaxiNodes.dbc",
+        "taxi nodes imported from vmangos",
         "SELECT id FROM game_taxi_node WHERE id < 5090000",
         RowMatch::Numeric,
     )?;
@@ -2216,7 +2185,7 @@ fn assert_floors(
             .collect();
         a.chk(
             "FLOOR_DEADMINES_NAMED_LOOT",
-            "Deadmines named drops (Cruel Barb ~5191 + Smite's Mighty Hammer ~5196) [V]",
+            "Deadmines named drops (Cruel Barb ~5191 + Smite's Reaver ~5196) [V]",
             named_loot.len() as i64,
         )?;
     }
@@ -2297,19 +2266,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// A checkout with the import tooling present: the two driven scripts, the floors manifest,
-    /// and the staged dump the (fake) pull would have assembled.
     fn checkout(tmp: &TempDir) -> ProjectLayout {
         std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         let dir = tmp.path().join(ProjectLayout::IMPORTER_SCRIPTS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["pull-classic-db.sh", "import-manifest.sh"] {
+        for name in ["pull-vmangos.py", "import-manifest.sh"] {
             std::fs::write(dir.join(name), "#!/usr/bin/env bash\n").unwrap();
         }
-        let import_dir = tmp.path().join(".import");
-        std::fs::create_dir_all(&import_dir).unwrap();
-        std::fs::write(import_dir.join("classic-db-full.sql"), "-- dump\n").unwrap();
-        ProjectLayout::from_root(tmp.path()).unwrap()
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+        stage_test_snapshot(&project);
+        project
     }
 
     /// A directory that passes for a 1.12.1 client's Data/.
@@ -2939,6 +2905,7 @@ pub(crate) mod tests {
             },
         );
         let rendered: Vec<String> = pool
+            .unwrap()
             .iter()
             .map(|(_, _, command)| command.render())
             .collect();
@@ -2978,6 +2945,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 commands
+                    .unwrap()
                     .iter()
                     .any(|(_, _, command)| command.args().iter().any(|arg| arg == "--vmap")),
                 expected,
@@ -3013,11 +2981,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn source_commands_use_the_downloaded_commit_and_refuse_broken_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let data = client_data(&tmp);
+        let destination = ImportDestination {
+            shard: "world".into(),
+            profile: WorldProfile::AllianceSingle,
+        };
+        let actual = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        std::fs::write(
+            project.root.join(SOURCE_REPORT),
+            serde_json::json!({
+                "sqlite_path": DUMP_PATH, "commit": actual,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let commands = world_etl_commands(&project, &data, &destination).unwrap();
+        let source_commands: Vec<_> = commands
+            .iter()
+            .filter(|(_, _, command)| {
+                command
+                    .args()
+                    .iter()
+                    .any(|arg| arg == "--dump" || arg == "--taxi-mounts")
+            })
+            .collect();
+        assert_eq!(source_commands.len(), 2);
+        for (_, _, command) in source_commands {
+            assert!(command
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["--source-sha", actual]));
+        }
+        for report in [
+            "{}",
+            "invalid",
+            "{\"sqlite_path\":\"missing\",\"commit\":\"short\"}",
+        ] {
+            std::fs::write(project.root.join(SOURCE_REPORT), report).unwrap();
+            assert!(world_etl_commands(&project, &data, &destination).is_err());
+        }
+    }
+
+    #[test]
     fn the_notice_names_the_source_its_licence_and_who_supplies_the_client() {
         for needle in [
-            "classic-db",
-            "cmangos",
-            "GPL-3.0",
+            "vmangos/core",
+            "brotalnia/database",
+            "no license file",
+            "GPL-2.0",
             "Blizzard",
             "copyrighted",
             "1.12.1",
@@ -3101,12 +3115,12 @@ pub(crate) mod tests {
         let server = ProjectLayout::stdb_uri();
         let expected = vec![
             format!(
-                "{importer} --db {db} --server {server} --dump {DUMP_PATH} --dbc {data} --world-profile alliance-single --apply"
+                "{importer} --db {db} --server {server} --dump {DUMP_PATH} --source-sha {SOURCE_COMMIT} --dbc {data} --world-profile alliance-single --apply"
             ),
             format!("{importer} --db {db} --server {server} --terrain {data} --world-profile alliance-single --apply"),
             format!("{importer} --db {db} --server {server} --nav {data} --world-profile alliance-single --apply"),
             format!("{importer} --db {db} --server {server} --vmap {data} --world-profile alliance-single --apply"),
-            format!("{importer} --db {db} --server {server} --dbc {data} --taxi-mounts {DUMP_PATH} --apply"),
+            format!("{importer} --db {db} --server {server} --dbc {data} --taxi-mounts {DUMP_PATH} --source-sha {SOURCE_COMMIT} --apply"),
             format!("{importer} --db {db} --server {server} --dbc {data} --talents --apply"),
         ];
         let got: Vec<String> = rendered(&stack)
@@ -3133,10 +3147,9 @@ pub(crate) mod tests {
         .unwrap();
 
         let calls = rendered(&stack);
-        // The floors are read FIRST — a drifted manifest must fail before the half-hour clone.
         let order = [
             "import-manifest.sh",
-            "pull-classic-db.sh",
+            "pull-vmangos.py",
             "cargo build",
             "--dump",
             "--terrain",
@@ -3239,7 +3252,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_scripts_are_addressed_by_their_shipped_paths_and_run_through_bash() {
+    fn the_fetch_uses_python_and_the_manifest_is_sourced_per_profile() {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let data = client_data(&tmp);
@@ -3264,11 +3277,11 @@ pub(crate) mod tests {
             .collect();
         let spec = specs
             .iter()
-            .find(|s| s.render().contains("pull-classic-db.sh"))
-            .expect("pull-classic-db.sh never ran");
-        assert_eq!(spec.program(), "bash");
+            .find(|s| s.render().contains("pull-vmangos.py"))
+            .expect("pull-vmangos.py never ran");
+        assert_eq!(spec.program(), "python3");
         assert!(
-            spec.args()[0].ends_with(ProjectLayout::PULL_CLASSIC_DB_SCRIPT),
+            spec.args()[0].ends_with(ProjectLayout::PULL_VMANGOS_SCRIPT),
             "{}",
             spec.render()
         );
@@ -3279,9 +3292,18 @@ pub(crate) mod tests {
             .expect("the floors were never read");
         assert_eq!(floors.program(), "bash");
         assert_eq!(floors.args()[0], "-c");
-        // Canonical profiles use conservative slice floors plus named corridor checks.
         assert_eq!(floors.env_value("MAP"), Some("0"));
         assert_eq!(floors.env_value("SLICE"), Some("1"));
+        assert_eq!(floors.env_value("WORLD_PROFILE"), Some("alliance-eastern"));
+        let profiles: Vec<_> = specs
+            .iter()
+            .filter(|s| s.render().contains("import-manifest.sh"))
+            .map(|s| s.env_value("WORLD_PROFILE").unwrap())
+            .collect();
+        assert_eq!(
+            profiles,
+            ["alliance-eastern", "alliance-kalimdor", "instances"]
+        );
     }
 
     #[test]
@@ -3426,7 +3448,7 @@ pub(crate) mod tests {
 
         let calls = rendered(&stack);
         assert!(
-            !calls[pos(&calls, "pull-classic-db.sh")].contains("--skip-verify"),
+            !calls[pos(&calls, "pull-vmangos.py")].contains("--skip-verify"),
             "the pinned-commit checksum is the drift guard; the flow must not disable it"
         );
     }
@@ -3483,7 +3505,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_bad_client_path_is_refused_before_the_licence_notice_is_even_answered() {
-        // A typo in --client-data must not cost somebody a half-hour clone first.
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         let stack = healthy();
@@ -3711,9 +3732,9 @@ pub(crate) mod tests {
         // (what fails, its own words, what the error must name, a mode that must never start)
         for (needle, child_says, names, never_started) in [
             (
-                "pull-classic-db.sh",
+                "pull-vmangos.py",
                 "sha256 MISMATCH",
-                "pulling classic-db",
+                "fetching vmangos",
                 "--dump",
             ),
             ("--terrain", "self-check bail", "terrain", "--nav"),
@@ -3802,7 +3823,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_checkout_without_the_import_tooling_says_so_before_consent_is_spent() {
-        for missing in ["pull-classic-db.sh", "import-manifest.sh"] {
+        for missing in ["pull-vmangos.py", "import-manifest.sh"] {
             let tmp = TempDir::new().unwrap();
             let project = checkout(&tmp);
             std::fs::remove_file(
@@ -3992,7 +4013,6 @@ pub(crate) mod tests {
         .to_string();
         assert!(error.contains("FLOOR_NAV_CHUNKS"), "{error}");
         assert!(error.contains("import-manifest.sh"), "{error}");
-        // Only the sourcing ran: no pull, no ETL, no consented half-hour wasted first.
         assert_eq!(stack.calls().len(), 1, "{:?}", rendered(&stack));
     }
 
