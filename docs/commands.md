@@ -55,6 +55,7 @@ lyracore dev down [--forget]
 lyracore account create USER [--password-stdin]
 lyracore character gm NAME true|false
 lyracore sql QUERY
+lyracore editor
 lyracore import [--accept] [--client-data PATH] [--profile-shard PROFILE=SHARD ...]
 lyracore import world [--accept] [--client-data PATH] [--profile-shard PROFILE=SHARD ...]
 lyracore import check [--profile-shard PROFILE=SHARD ...]
@@ -1304,6 +1305,35 @@ change. Take a copy of the data first if you may want it back.
 If the checkout has no publisher configuration, the command refuses and names `dev up`. If
 SpacetimeDB does not answer, the error points at `dev status`. The exit code is `1` when
 SpacetimeDB reports a failure, for example a malformed query.
+
+## `editor`
+
+```bash
+./lyracore editor
+```
+
+Starts [Meld](https://github.com/LyraCoreProject/Meld), a 1.12 world editor, connected to the local Native
+Host. Spawn edits go live through the Module's operator reducers. The command runs Meld in the
+foreground; close the window or press Ctrl+C to stop it.
+
+`.lyracore-editor-rev` in this checkout holds the Meld commit to run, one 40-character lowercase hex
+SHA. The first run for a commit fetches it over anonymous HTTPS and builds it with `wails build`
+into `.lyracore/editor/<rev>/`. That build takes a few minutes and needs `git`, `go`, `bun` and
+`wails`. The CLI looks for `wails` on PATH, then in `$HOME/go/bin`. Later runs reuse the build. An
+interrupted build leaves nothing that counts as installed.
+
+The Native Host must be running, so start it with `lyracore dev up` first. Meld reads four
+variables:
+
+| Variable | Value |
+|---|---|
+| `MELD_LYRACORE_URL` | `http://127.0.0.1:3000` |
+| `MELD_LYRACORE_DATABASE` | `lyracore` |
+| `MELD_LYRACORE_TOKEN_FILE` | the absolute path of `.lyracore/native-owner-token`, the owner token `dev up` keeps |
+| `MELD_WOW_PATH` | the client folder holding the configured client-data `Data/` folder |
+
+The token stays in its file. The CLI passes the file's path, never the token itself.
+`MELD_WOW_PATH` is unset when no client-data path is configured.
 
 ## What `dev status` verifies
 

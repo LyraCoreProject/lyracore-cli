@@ -74,6 +74,16 @@ fn run(command: Command) -> Result<i32> {
         Command::Sql { query } => {
             cmd::sql::run(&ProjectLayout::discover()?, &runner, &query).map(|_| EXIT_OK)
         }
+        Command::Editor => {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            cmd::editor::run(
+                &ProjectLayout::discover()?,
+                &runner,
+                &inspector,
+                home.as_deref(),
+            )
+            .map(|_| EXIT_OK)
+        }
         Command::Publish {
             databases,
             skip_preflight,

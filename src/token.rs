@@ -163,10 +163,7 @@ pub(crate) fn retain_native_owner(
 
 pub(crate) fn native_owner(project: &crate::project::ProjectLayout) -> Result<Credential> {
     let token = read_store(&project.token_file()).ok_or_else(|| {
-        Error::Usage(
-            "Development reload requires its retained publisher; run `lyracore dev up` first"
-                .into(),
-        )
+        Error::Usage("no retained Native Host owner token; run `lyracore dev up` first".into())
     })?;
     let expected = format!("spacetimedb_token = {}", serde_json::to_string(&token)?);
     let config = std::fs::read_to_string(project.native_cli_config()).map_err(|_| {
