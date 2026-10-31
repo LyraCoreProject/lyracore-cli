@@ -4,6 +4,7 @@
 //! warning: informative, but not a reason to fail a script that only wanted the report.
 
 use crate::cmd::import;
+use crate::cmd::preflight::pinned_spacetimedb;
 use crate::config::Config;
 use crate::proc::{require_openssl, CommandSpec, ProcessRunner, RealProcessRunner};
 use crate::project::ProjectLayout;
@@ -11,11 +12,9 @@ use crate::Result;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// The SpacetimeDB version LyraCore is pinned to. `doctor` asks it as a **floor** (`>=`) — it only
-/// answers "can you get `dev up` off the ground"; `preflight` is the one that demands an EXACT match,
-/// and it reads the pin out of the checkout's own `module/Cargo.toml` rather than from this constant.
-/// Keep this in step with that pin (LyraCore's `module/Cargo.toml` + `gateway/Cargo.toml`).
-pub const REQUIRED_SPACETIME: Version = Version(2, 7, 1);
+/// The SpacetimeDB floor (`>=`) when no checkout is found. Inside a checkout, `doctor` reads the
+/// floor from `module/Cargo.toml`; `preflight` demands an exact match with that pin.
+pub const REQUIRED_SPACETIME: Version = Version(2, 14, 0);
 
 /// Read the exact Bun runtime verified by this checkout. Do not interpret ranges: Package
 /// builds and their identities must agree on one runtime without consulting the installed Bun.
@@ -119,7 +118,7 @@ pub fn run(layout: &Result<ProjectLayout>) -> Vec<Check> {
             "cargo",
             "Cargo ships with Rust — see https://rustup.rs/",
         ),
-        check_spacetime(),
+        check_spacetime(layout.as_ref().ok()),
         check_bun(layout.as_ref().ok()),
         check_wasm_target(),
         check_wasm_opt(),
@@ -368,29 +367,34 @@ fn check_tool(label: &str, program: &str, guidance: &str) -> Check {
     }
 }
 
-fn check_spacetime() -> Check {
+fn check_spacetime(project: Option<&ProjectLayout>) -> Check {
+    let required = project
+        .and_then(|p| std::fs::read_to_string(p.module_manifest()).ok())
+        .as_deref()
+        .and_then(pinned_spacetimedb)
+        .unwrap_or(REQUIRED_SPACETIME);
     let Some(text) = version_output("spacetime", &["--version"]) else {
         return Check::fail(
             "SpacetimeDB",
             format!(
-                "`spacetime` not found — install {REQUIRED_SPACETIME} from https://spacetimedb.com/install"
+                "`spacetime` not found — install {required} from https://spacetimedb.com/install"
             ),
         );
     };
     match parse_version(&text) {
-        Some(found) if found >= REQUIRED_SPACETIME => {
-            Check::pass("SpacetimeDB", format!("{found} (requires {REQUIRED_SPACETIME})"))
+        Some(found) if found >= required => {
+            Check::pass("SpacetimeDB", format!("{found} (requires {required})"))
         }
         Some(found) => Check::fail(
             "SpacetimeDB",
             format!(
-                "found {found}, but {REQUIRED_SPACETIME} is required — upgrade with \
+                "found {found}, but {required} is required — upgrade with \
                  `spacetime version upgrade` (or reinstall from https://spacetimedb.com/install)"
             ),
         ),
         None => Check::warn(
             "SpacetimeDB",
-            format!("could not read a version from `spacetime --version`; expected {REQUIRED_SPACETIME}"),
+            format!("could not read a version from `spacetime --version`; expected {required}"),
         ),
     }
 }
@@ -789,11 +793,11 @@ mod tests {
 
     #[test]
     fn the_required_spacetimedb_version_is_enforced_in_the_right_direction() {
-        assert!(Version(2, 7, 1) >= REQUIRED_SPACETIME);
-        assert!(Version(2, 7, 2) >= REQUIRED_SPACETIME);
+        assert!(Version(2, 14, 0) >= REQUIRED_SPACETIME);
+        assert!(Version(2, 14, 1) >= REQUIRED_SPACETIME);
         assert!(Version(3, 0, 0) >= REQUIRED_SPACETIME);
-        assert!(Version(2, 7, 0) < REQUIRED_SPACETIME);
-        assert!(Version(2, 5, 0) < REQUIRED_SPACETIME);
+        assert!(Version(2, 13, 9) < REQUIRED_SPACETIME);
+        assert!(Version(2, 7, 1) < REQUIRED_SPACETIME);
         assert!(Version(1, 9, 9) < REQUIRED_SPACETIME);
     }
 
