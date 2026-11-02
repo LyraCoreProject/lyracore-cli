@@ -7,6 +7,7 @@ use crate::project::{ClientBind, Component, Topology};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 /// A PID plus the identity that proves it is still the same process (see `proc::inspect`).
@@ -55,11 +56,15 @@ impl RuntimeState {
             .map_err(|e| Error::State(format!("{} is corrupt: {e}", path.display())))
     }
 
+    /// Replace the file only with a complete, synced successor, so a crash leaves the old state
+    /// or the new one and never a truncated file.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let parent = path.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
         Ok(())
     }
 
@@ -109,6 +114,34 @@ mod tests {
         state.save(&path).unwrap();
 
         assert_eq!(RuntimeState::load(&path).unwrap(), state);
+    }
+
+    #[test]
+    fn save_leaves_only_the_state_file_in_its_directory() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        fs::write(&path, "old").unwrap();
+        RuntimeState::default().save(&path).unwrap();
+        let names = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["state.json"]);
+        assert_eq!(RuntimeState::load(&path).unwrap(), RuntimeState::default());
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_temporary_file_behind() {
+        let tmp = TempDir::new().unwrap();
+        // A directory at the destination makes the final rename fail after the temp file exists.
+        let blocked = tmp.path().join("blocked");
+        fs::create_dir_all(blocked.join("state.json")).unwrap();
+        assert!(RuntimeState::default()
+            .save(&blocked.join("state.json"))
+            .is_err());
+        assert_eq!(RuntimeState::load(&path).unwrap(), state);
+        assert!(blocked.join("state.json").is_dir());
+        assert_eq!(fs::read_dir(&blocked).unwrap().count(), 1);
     }
 
     #[test]

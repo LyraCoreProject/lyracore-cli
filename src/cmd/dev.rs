@@ -103,16 +103,33 @@ pub struct DevManager {
 impl DevManager {
     pub fn new(project: ProjectLayout) -> Result<Self> {
         let state = RuntimeState::load(&project.state_file())?;
+        Ok(Self::with_state(project, state))
+    }
+
+    /// For `dev down --forget`, which exists to recover from bad state: a state file that cannot
+    /// be read is treated as empty, and `down` rewrites it.
+    pub fn new_forgetting(project: ProjectLayout) -> Self {
+        let path = project.state_file();
+        let state = RuntimeState::load(&path).unwrap_or_else(|error| {
+            println!(
+                "· {error}; forgetting it. Any process it recorded keeps running and is not stopped."
+            );
+            RuntimeState::default()
+        });
+        Self::with_state(project, state)
+    }
+
+    fn with_state(project: ProjectLayout, state: RuntimeState) -> Self {
         let bind = state.bind();
         let topology = state.topology();
-        Ok(Self {
+        Self {
             project,
             state,
             bind,
             topology,
             verify_timeout: TOPOLOGY_VERIFY_TIMEOUT,
             gateway_log_start: 0,
-        })
+        }
     }
 
     fn status_for(
@@ -1248,6 +1265,25 @@ mod tests {
         dev.down(&stack.runner(), &stack.inspector(), true).unwrap();
         assert!(stack.terminated().is_empty());
         assert!(dev.state.record(Component::Gateway).is_none());
+    }
+
+    #[test]
+    fn down_forget_recovers_from_a_truncated_state_file() {
+        let tmp = TempDir::new().unwrap();
+        let state_file = project(&tmp).state_file();
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        std::fs::write(&state_file, r#"{"spacetime":"#).unwrap();
+        assert!(DevManager::new(project(&tmp)).is_err());
+
+        let mut dev = DevManager::new_forgetting(project(&tmp));
+        let stack = FakeStack::new();
+        dev.down(&stack.runner(), &stack.inspector(), true).unwrap();
+
+        assert_eq!(
+            RuntimeState::load(&state_file).unwrap(),
+            RuntimeState::default()
+        );
+        DevManager::new(project(&tmp)).unwrap();
     }
 
     #[test]
