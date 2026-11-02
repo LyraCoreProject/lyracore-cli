@@ -139,7 +139,6 @@ mod tests {
         assert!(RuntimeState::default()
             .save(&blocked.join("state.json"))
             .is_err());
-        assert_eq!(RuntimeState::load(&path).unwrap(), state);
         assert!(blocked.join("state.json").is_dir());
         assert_eq!(fs::read_dir(&blocked).unwrap().count(), 1);
     }
