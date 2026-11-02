@@ -130,7 +130,12 @@ fn run(command: Command) -> Result<i32> {
             dev.logs(component, all).map(|_| EXIT_OK)
         }
         Command::DevDown { forget } => {
-            let mut dev = cmd::dev::DevManager::new(ProjectLayout::discover()?)?;
+            let project = ProjectLayout::discover()?;
+            let mut dev = if forget {
+                cmd::dev::DevManager::new_forgetting(project)
+            } else {
+                cmd::dev::DevManager::new(project)?
+            };
             dev.down(&runner, &inspector, forget).map(|_| EXIT_OK)
         }
         Command::ImportCheck { profile_shards } => {
