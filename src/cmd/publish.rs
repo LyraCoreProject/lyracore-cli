@@ -388,6 +388,13 @@ pub fn run(
                 database_list(&databases[index + 1..])
             )));
         }
+        if let Err(error) = repair_after_publish(project, runner, database, &target) {
+            return Err(Error::Process(format!(
+                "{error}\n  publish stopped at: {database}\n  completed: {}\n  not attempted: {}",
+                database_list(&databases[..index]),
+                database_list(&databases[index + 1..])
+            )));
+        }
     }
 
     println!();
@@ -416,7 +423,17 @@ pub(crate) fn publish_and_repair(
         .map_err(|error| {
             Error::Process(format!("Module publish failed at '{database}': {error}"))
         })?;
-    let repair = import::call_command(project, database, "debug_repair_after_publish");
+    repair_after_publish(project, runner, database, &ProjectLayout::stdb_uri())
+}
+
+/// A republish does not re-arm the schedules or re-seed the fixtures, so every publish needs this.
+fn repair_after_publish(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    database: &str,
+    server: &str,
+) -> Result<()> {
+    let repair = import::call_command_to(project, server, database, "debug_repair_after_publish");
     runner.run_and_wait(&repair).map_err(|error| {
         let command = std::iter::once(repair.program())
             .chain(repair.args().iter().map(String::as_str))
@@ -508,10 +525,14 @@ mod tests {
         )
         .unwrap();
         let commands = stack.rendered();
-        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(commands.len(), 2, "{commands:?}");
         assert!(
             commands[0].contains("publish -s http://127.0.0.1:13000"),
             "{commands:?}"
+        );
+        assert!(
+            commands[1].contains("call --server http://127.0.0.1:13000 lyracore debug_repair"),
+            "the repair must reach the same node: {commands:?}"
         );
         assert!(commands[0].contains(&format!(
             "--config-path {}",
@@ -604,8 +625,8 @@ mod tests {
         )
         .unwrap();
         let commands = stack.rendered();
-        assert_eq!(commands.len(), 2);
-        assert!(commands[1].contains("publish -s http://127.0.0.1:3000"));
+        assert_eq!(commands.len(), 4);
+        assert!(commands[2].contains("publish -s http://127.0.0.1:3000"));
         assert!(commands
             .iter()
             .all(|command| command.contains("--config-path")));
@@ -1519,6 +1540,50 @@ mod tests {
             "a stale artifact must publish nothing: {:?}",
             stack.rendered()
         );
+    }
+
+    #[test]
+    fn publish_repairs_schedules_on_every_published_database() {
+        let tmp = TempDir::new().unwrap();
+        let stack = FakeStack::new();
+        run(
+            &healthy(&tmp),
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore", "lyracore-2"]),
+            true,
+            None,
+        )
+        .unwrap();
+        let rendered = stack.rendered();
+        let steps = rendered
+            .iter()
+            .filter(|r| r.contains("spacetime publish") || r.contains("debug_repair_after_publish"))
+            .map(|r| (r.contains("publish "), r.contains("lyracore-2")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            steps,
+            [(true, false), (false, false), (true, true), (false, true)],
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn failed_repair_fails_publish_and_names_the_remaining_databases() {
+        let tmp = TempDir::new().unwrap();
+        let stack = FakeStack::new().fail_on("debug_repair_after_publish", "operator only");
+        let error = run(
+            &healthy(&tmp),
+            &stack.runner(),
+            &stack.inspector(),
+            &names(&["lyracore", "lyracore-2"]),
+            true,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("schedule repair failed"), "{error}");
+        assert!(error.contains("not attempted: lyracore-2"), "{error}");
     }
 
     #[test]
