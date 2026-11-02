@@ -1094,6 +1094,16 @@ fn world_etl_commands(
 
 /// Native calls use the private publisher; every call names the local HTTP node.
 pub(crate) fn call_command(project: &ProjectLayout, database: &str, reducer: &str) -> CommandSpec {
+    call_command_to(project, &ProjectLayout::stdb_uri(), database, reducer)
+}
+
+/// [`call_command`] against an explicit node, for `publish --server`.
+pub(crate) fn call_command_to(
+    project: &ProjectLayout,
+    server: &str,
+    database: &str,
+    reducer: &str,
+) -> CommandSpec {
     let mut command = CommandSpec::new("spacetime");
     if project.has_native_host() {
         command = command
@@ -1103,7 +1113,7 @@ pub(crate) fn call_command(project: &ProjectLayout, database: &str, reducer: &st
     command
         .arg("call")
         .arg("--server")
-        .arg(ProjectLayout::stdb_uri())
+        .arg(server)
         .arg(database)
         .arg(reducer)
         .cwd(project.root.clone())
